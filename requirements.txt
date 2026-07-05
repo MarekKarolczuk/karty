@@ -1,0 +1,9 @@
+PyQt6>=6.6
+google-genai>=1.0
+Pillow>=10.0
+python-dotenv>=1.0
+numpy>=1.26
+opencv-python>=4.9
+requests>=2.31
+reportlab>=4.0
+# dev (tylko do scripts/wyciagnij_fonty.py): fonttools, brotli

@@ -1,0 +1,35 @@
+# === Sekrety / klucze API — NIGDY na repo ===
+.env
+.env.*
+!.env.example
+dane_do_api.md
+
+# === Dane użytkownika / stan lokalny ===
+projekt.json
+styles.json
+zdjecia/
+output/
+arkusz_druku.pdf
+Przykladowe_karty_fajne_ale_nie_spojne/
+tla_kart/rewers_stary_*.png
+
+# === Generowane / cache ===
+assets/masks/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# === Środowiska wirtualne / IDE / narzędzia ===
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.claude/
+.cursor/
+*.lnk
+
+# === System ===
+Thumbs.db
+.DS_Store
+desktop.ini
