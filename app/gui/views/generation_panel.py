@@ -194,7 +194,12 @@ class GenerationPanel(QWidget):
     # --- silnik ---------------------------------------------------------------
     def refresh_engine(self) -> None:
         model = config.current_model()
-        self.engine_label.setText(model["label"])
+        provider = config.active_provider_label()
+        # skrót backendu (np. „Vertex AI") dołączony do nazwy modelu
+        backend = provider.split(" · ")[0].replace("Google ", "") if provider else ""
+        text = f"{model['label']} · {backend}" if backend else model["label"]
+        self.engine_label.setText(text)
+        self.engine_label.setToolTip(provider or "Brak skonfigurowanego API")
         self.engine_label.setStyleSheet("font-size: 13px;")
 
     # --- kolejka ----------------------------------------------------------------

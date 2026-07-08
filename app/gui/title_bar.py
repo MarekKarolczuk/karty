@@ -4,16 +4,39 @@ rozmiaru należą teraz do natywnej ramki systemu. Można też chwycić i przeci
 okno za ten pasek (startSystemMove), a dwuklik maksymalizuje."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from app import config
 from app.gui.animations import PulseDot
 from app.gui import theme
 
 HEIGHT = 52
 
 
+class _ClickableWidget(QWidget):
+    """Widget reagujący na kliknięcie (pigułka API → Ustawienia). Sam obsługuje
+    LMB, więc klik nie wywoła przeciągania okna z paska tytułu."""
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):  # noqa: N802 (API Qt)
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class TitleBar(QWidget):
+    settings_requested = pyqtSignal()
+
     def __init__(self, window):
         super().__init__(window)
         self._window = window
@@ -44,8 +67,11 @@ class TitleBar(QWidget):
 
         layout.addStretch(1)
 
-        api_pill = QWidget()
+        api_pill = _ClickableWidget()
         api_pill.setObjectName("apiPill")
+        api_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        api_pill.setToolTip("Kliknij, aby otworzyć Ustawienia (klucze API / Vertex)")
+        api_pill.clicked.connect(self.settings_requested.emit)
         api_layout = QHBoxLayout(api_pill)
         api_layout.setContentsMargins(12, 4, 12, 4)
         api_layout.setSpacing(6)
@@ -58,9 +84,16 @@ class TitleBar(QWidget):
 
     # --- API -------------------------------------------------------------------
     def refresh_api_status(self, connected: bool) -> None:
-        from app.gui import theme as _theme
-        self.api_dot.set_color(_theme.GREEN if connected else _theme.GOLD)
-        self.api_label.setText("API połączone" if connected else "brak klucza API")
+        self.api_dot.set_color(theme.GREEN if connected else theme.GOLD)
+        provider = config.active_provider_label()
+        if connected and provider:
+            # skrócona etykieta: „Vertex AI" / „AI Studio" + status
+            short = provider.split(" · ")[0].replace("Google ", "")
+            self.api_label.setText(f"{short} · połączono")
+            self.api_label.setToolTip(provider)
+        else:
+            self.api_label.setText("API niepodłączone")
+            self.api_label.setToolTip("Skonfiguruj klucz API lub Vertex w Ustawieniach")
 
     def _toggle_maximize(self) -> None:
         if self._window.isMaximized():

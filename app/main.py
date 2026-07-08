@@ -11,7 +11,7 @@ from app.gui.main_window import MainWindow
 
 
 def main() -> None:
-    style_store.load()   # edytowalne style AI (styles.json)
+    style_store.load()   # biblioteki presetów stylu (Style/) + migracja
     app = QApplication(sys.argv)
     theme.apply(app)
     app.setWindowIcon(theme.app_icon())

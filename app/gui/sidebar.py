@@ -11,12 +11,12 @@ from PyQt6.QtWidgets import (
 from app.gui import theme
 
 VIEWS = [
-    ("◈", "Ekran roboczy"),
-    ("▣", "Galeria zdjęć"),
-    ("▦", "Talie"),
-    ("❖", "Tła i rewersy"),
-    ("⚙", "Ustawienia i style"),
-    ("⇲", "Eksport"),
+    ("◈", "Ekran roboczy", "Przypisz zdjęcia do kart i wygeneruj talię"),
+    ("▣", "Galeria zdjęć", "Wgraj i zarządzaj zdjęciami wejściowymi"),
+    ("▦", "Talie", "Podgląd wygenerowanych kart, historia i warianty"),
+    ("❖", "Style", "Style postaci i teł, prompty, generacja teł przodu i rewersu"),
+    ("⚙", "Ustawienia i style", "Klucze API / Vertex, model, styl i format"),
+    ("⇲", "Eksport", "Pobierz talię do druku (PDF) lub jako paczkę do gry"),
 ]
 
 
@@ -35,6 +35,8 @@ class Sidebar(QWidget):
 
         new_deck = QPushButton("＋  Nowa talia")
         new_deck.setObjectName("newDeckBtn")
+        new_deck.setToolTip("Czyści przypisania zdjęć i kadrowanie. "
+                            "Wygenerowane pliki w output/ zostają na dysku.")
         new_deck.setCursor(Qt.CursorShape.PointingHandCursor)
         new_deck.clicked.connect(self.new_deck_clicked.emit)
         layout.addWidget(new_deck)
@@ -47,7 +49,7 @@ class Sidebar(QWidget):
         self._group.setExclusive(True)
         self.nav_buttons: list[QPushButton] = []
         self._badges: list[QLabel] = []
-        for i, (icon, label) in enumerate(VIEWS):
+        for i, (icon, label, tip) in enumerate(VIEWS):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -56,6 +58,7 @@ class Sidebar(QWidget):
             btn = QPushButton(f"{icon}   {label}")
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
+            btn.setToolTip(tip)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self._group.addButton(btn, i)
             row_layout.addWidget(btn, stretch=1)

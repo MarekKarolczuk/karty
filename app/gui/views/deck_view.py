@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app import config
+from app.core import style_store
 from app.core.models import Suit
 from app.gui.card_grid import CardGrid
 from app.gui.views import view_header
@@ -128,6 +129,16 @@ class DeckView(QWidget):
             self.grids[suit] = grid
             self._rows[suit] = row
 
+        self.empty_state = QLabel(
+            "Jeszcze brak wygenerowanych kart.\n"
+            "Przejdź na Ekran roboczy (◈), przypisz zdjęcia do kart "
+            "i kliknij ⚡ Generuj talię."
+        )
+        self.empty_state.setObjectName("mutedInfo")
+        self.empty_state.setWordWrap(True)
+        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        host_layout.addWidget(self.empty_state)
+
         hint = QLabel("klik = powiększ kartę (lightbox)   •   "
                       "prawy przycisk = opcje / usuwanie plików")
         hint.setObjectName("hint")
@@ -205,6 +216,12 @@ class DeckView(QWidget):
                     chosen = resolver(suit.nazwa, value)
                     if chosen is not None and slot.generated_path != chosen:
                         slot.set_generated(chosen)
+        # pusty stan siatki: brak jakiejkolwiek wygenerowanej karty
+        any_generated = any(
+            slot.generated_path is not None
+            for grid in self.grids.values() for slot in grid.slots.values()
+        )
+        self.empty_state.setVisible(not any_generated)
         if self.sections.currentIndex() == 1:
             self.refresh_history()
 
@@ -225,10 +242,12 @@ class DeckView(QWidget):
         if config.OUTPUT_DIR.exists():
             files += [p for p in config.OUTPUT_DIR.iterdir()
                       if p.suffix.lower() in config.IMAGE_EXTS]
-        if config.TLA_DIR.exists():
-            files += list(config.TLA_DIR.glob("rewers_stary_*.png"))
-            if config.BACK_PATH.exists():
-                files.append(config.BACK_PATH)
+        back_dir = style_store.preset_dir("rewers")
+        if back_dir.is_dir():
+            files += list(back_dir.glob("rewers_stary_*.png"))
+        back = style_store.back_path()
+        if back.exists():
+            files.append(back)
         for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
             stamp = datetime.fromtimestamp(path.stat().st_mtime)
             item = QListWidgetItem(

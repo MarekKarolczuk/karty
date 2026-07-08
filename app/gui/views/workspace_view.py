@@ -192,6 +192,8 @@ class WorkspaceView(QWidget):
         top.addWidget(self.mask_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         self.generate_btn = QPushButton("⚡  Generuj talię")
         self.generate_btn.setObjectName("generateBtn")
+        self.generate_btn.setToolTip("Generuje wszystkie przypisane karty (Ctrl+G)")
+        self.generate_btn.setShortcut("Ctrl+G")
         self.generate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.generate_btn.clicked.connect(self.generate_deck_clicked.emit)
         top.addWidget(self.generate_btn, alignment=Qt.AlignmentFlag.AlignBottom)
@@ -231,6 +233,10 @@ class WorkspaceView(QWidget):
         center_layout.addLayout(card_header)
 
         self.preview = PreviewPane()
+        self.preview.setToolTip(
+            "Upuść zdjęcie = podmiana na wybranej karcie  ·  "
+            "przeciągnij / kółko myszy = kadruj (tryb Hybrydowy)"
+        )
         self.preview.photo_dropped.connect(self.preview_photo_dropped.emit)
         self.preview.pan_delta.connect(self._on_preview_pan)
         self.preview.zoom_delta.connect(self._on_preview_zoom)

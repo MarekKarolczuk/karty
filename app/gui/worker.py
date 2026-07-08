@@ -139,6 +139,36 @@ class BackWorker(QThread):
                 self.failed.emit(str(exc))
 
 
+class SampleWorker(QThread):
+    """Generuje pojedynczą kartę PODGLĄDU (zakładka Style) — bez zapisu do output/."""
+
+    done = pyqtSignal(object)   # PIL.Image.Image
+    failed = pyqtSignal(str)
+
+    def __init__(self, spec: CardSpec, parent=None):
+        super().__init__(parent)
+        self.spec = spec
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        from app.api.stability_client import StabilityAborted
+        try:
+            img = generator.generate_sample(self.spec)
+            if not self._cancelled:
+                self.done.emit(img)
+        except StabilityAborted:
+            if not self._cancelled:
+                self.failed.emit("Anulowano podgląd")
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+
+
 class ExportWorker(QThread):
     """Eksport talii (PDF/ZIP/atlas) w tle — bez wywołań API."""
 

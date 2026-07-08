@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 from app import config
 from app.api import gemini_client, stability_client
-from app.core import compositor, masks, prompts
+from app.core import compositor, masks, prompts, style_store
 from app.core.models import CardSpec, GenMode, Suit
 
 # Kolaż/maska wysyłane do API — 1536 px wystarcza inpaintingowi, a tniemy
@@ -79,31 +79,41 @@ def _popout_card(spec: CardSpec, template_size: tuple[int, int]) -> Image.Image:
     return compositor.draw_corners(result, spec)
 
 
-def generate_card(spec: CardSpec) -> Path:
-    """Generuje jedną kartę i zapisuje do output/. Zwraca ścieżkę pliku."""
+def _build_card(spec: CardSpec) -> Image.Image:
+    """Buduje obraz karty (bez zapisu) — wspólny rdzeń generate_card/generate_sample."""
     if spec.photo_path is None:
         raise ValueError(f"Karta {spec.label} nie ma przypisanego zdjęcia")
 
     template = Image.open(spec.suit.template_path).convert("RGB")
 
     if spec.mode is GenMode.HYBRID:   # tryb pop-out
-        card = _popout_card(spec, template.size)
-    else:  # GenMode.FULL_AI — wymaga dwóch obrazów wejściowych, tylko Gemini
-        if _fake_api():
-            card = compositor.compose_card(spec, _fake_illustration(spec.photo_path))
-        elif _provider() != "gemini":
-            raise ValueError(
-                "Tryb Pełne AI wymaga modelu Gemini (Stability przyjmuje jeden "
-                "obraz wejściowy) — przełącz model albo użyj trybu pop-out"
-            )
-        else:
-            prompt = prompts.full_card_prompt(
-                spec.value, spec.suit.symbol, prompts.SUIT_NAME_EN[spec.suit.nazwa]
-            )
-            card = gemini_client.compose_full_card(template, spec.photo_path, prompt)
+        return _popout_card(spec, template.size)
+    # GenMode.FULL_AI — wymaga dwóch obrazów wejściowych, tylko Gemini
+    if _fake_api():
+        return compositor.compose_card(spec, _fake_illustration(spec.photo_path))
+    if _provider() != "gemini":
+        raise ValueError(
+            "Tryb Pełne AI wymaga modelu Gemini (Stability przyjmuje jeden "
+            "obraz wejściowy) — przełącz model albo użyj trybu pop-out"
+        )
+    prompt = prompts.full_card_prompt(
+        spec.value, spec.suit.symbol, prompts.SUIT_NAME_EN[spec.suit.nazwa]
+    )
+    return gemini_client.compose_full_card(template, spec.photo_path, prompt)
 
+
+def generate_card(spec: CardSpec) -> Path:
+    """Generuje jedną kartę i zapisuje do output/. Zwraca ścieżkę pliku."""
+    card = _build_card(spec)
+    template = Image.open(spec.suit.template_path).convert("RGB")
     compositor.save_card(card, spec, template.size)
     return spec.output_path
+
+
+def generate_sample(spec: CardSpec) -> Image.Image:
+    """Generuje pojedynczą kartę PODGLĄDU — zwraca obraz, NIE zapisuje do output/
+    (nie zaśmieca historii ani wariantów)."""
+    return _build_card(spec)
 
 
 def _fit_card_ratio(img: Image.Image, landscape: bool = False) -> Image.Image:
@@ -117,7 +127,8 @@ def _fit_card_ratio(img: Image.Image, landscape: bool = False) -> Image.Image:
 
 
 def generate_template(suit: Suit, prompt: str | None = None) -> Path:
-    """Generuje nowe tło (szablon) i zapisuje do tla_kart/.
+    """Generuje nowe tło (szablon) i zapisuje do folderu AKTYWNEGO presetu
+    teł przodu (Style/tla_przodu/<preset>/).
 
     prompt=None → domyślny prompt grawerski per kolor; podanie własnego
     (np. z zakładki „Tła i rewersy") pozwala sterować stylem paczki."""
@@ -144,7 +155,9 @@ def generate_template(suit: Suit, prompt: str | None = None) -> Path:
     img = _fit_card_ratio(img)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = config.TLA_DIR / f"{suit.nazwa} ai {stamp}.png"
+    target_dir = style_store.front_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"{suit.nazwa} ai {stamp}.png"
     img.save(path)
     return path
 
@@ -152,7 +165,8 @@ def generate_template(suit: Suit, prompt: str | None = None) -> Path:
 def generate_back(prompt: str | None = None,
                   source_photo: Path | None = None,
                   orientation: str = "portrait") -> Path:
-    """Generuje wspólny rewers talii i zapisuje jako tla_kart/rewers.png.
+    """Generuje wspólny rewers talii i zapisuje jako rewers.png w folderze
+    AKTYWNEGO presetu rewersu (Style/rewers/<preset>/).
 
     source_photo != None → tryb image-to-image (rewers inspirowany zdjęciem);
     orientation: "portrait" | "landscape" (poziomy rewers jest zapisywany
@@ -181,9 +195,11 @@ def generate_back(prompt: str | None = None,
         img = gemini_client.generate_image(contents)
     img = _fit_card_ratio(img, landscape=(orientation == "landscape"))
 
-    if config.BACK_PATH.exists():
+    back = style_store.back_path()
+    back.parent.mkdir(parents=True, exist_ok=True)
+    if back.exists():
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = config.BACK_PATH.with_name(f"rewers_stary_{stamp}.png")
-        config.BACK_PATH.rename(backup)
-    img.save(config.BACK_PATH)
-    return config.BACK_PATH
+        backup = back.with_name(f"rewers_stary_{stamp}.png")
+        back.rename(backup)
+    img.save(back)
+    return back

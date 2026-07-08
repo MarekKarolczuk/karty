@@ -9,14 +9,18 @@ from PyQt6.QtWidgets import (
 )
 
 from app import config
+from app.core import style_store
 from app.gui.views import view_header
 
 
 class ExportView(QWidget):
     export_clicked = pyqtSignal(str)   # "pdf" | "files" | "zip" | "atlas" | "sprite"
+    options_changed = pyqtSignal()     # zmiana opcji → zapis do projekt.json
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._ready_done = 0   # liczba gotowych kart (blokada pustego eksportu)
+        self._loading = False  # blokuje options_changed podczas apply_settings
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(10)
@@ -140,7 +144,50 @@ class ExportView(QWidget):
         progress_row.addWidget(self.progress)
         layout.addLayout(progress_row)
 
+        # każda zmiana opcji eksportu → sygnał zapisu (trwałość między sesjami)
+        for btn in (self.radio_pdf, self.radio_files, self.radio_zip,
+                    self.radio_sprite, self.radio_tts):
+            btn.toggled.connect(self._emit_options_changed)
+        for chk in (self.bleed_check, self.marks_check, self.backs_check,
+                    self.narrow_check, self.small_check):
+            chk.toggled.connect(self._emit_options_changed)
+
         self._refresh_format_hint()
+
+    def _emit_options_changed(self, _checked: bool = False) -> None:
+        if not self._loading:
+            self.options_changed.emit()
+
+    def settings(self) -> dict:
+        """Stan opcji eksportu do zapisania w projekt.json."""
+        return {
+            "print_kind": "files" if self.radio_files.isChecked() else "pdf",
+            "game_kind": ("sprite" if self.radio_sprite.isChecked()
+                          else "atlas" if self.radio_tts.isChecked() else "zip"),
+            "bleed": self.bleed_check.isChecked(),
+            "marks": self.marks_check.isChecked(),
+            "backs": self.backs_check.isChecked(),
+            "narrow": self.narrow_check.isChecked(),
+            "small": self.small_check.isChecked(),
+        }
+
+    def apply_settings(self, data: dict) -> None:
+        """Odtwarza opcje eksportu z projekt.json (bez emitowania zapisu)."""
+        if not isinstance(data, dict):
+            return
+        self._loading = True
+        (self.radio_files if data.get("print_kind") == "files"
+         else self.radio_pdf).setChecked(True)
+        game = data.get("game_kind")
+        (self.radio_sprite if game == "sprite"
+         else self.radio_tts if game == "atlas"
+         else self.radio_zip).setChecked(True)
+        self.bleed_check.setChecked(bool(data.get("bleed", True)))
+        self.marks_check.setChecked(bool(data.get("marks", True)))
+        self.backs_check.setChecked(bool(data.get("backs", True)))
+        self.narrow_check.setChecked(bool(data.get("narrow", False)))
+        self.small_check.setChecked(bool(data.get("small", False)))
+        self._loading = False
 
     def showEvent(self, event):  # noqa: N802 (API Qt)
         self._refresh_format_hint()
@@ -152,12 +199,25 @@ class ExportView(QWidget):
                                  "(format zmienisz w Ustawieniach)")
 
     # --- emisje -----------------------------------------------------------------------
+    def _guard_ready(self) -> bool:
+        """Nie eksportuj pustej talii — czytelny komunikat zamiast pliku z pustkami."""
+        if self._ready_done <= 0:
+            self.set_export_status(
+                "Brak gotowych kart do eksportu — najpierw wygeneruj talię "
+                "na Ekranie roboczym.", finished=True)
+            return False
+        return True
+
     def _emit_print_export(self) -> None:
+        if not self._guard_ready():
+            return
         self.export_clicked.emit(
             "pdf" if self.radio_pdf.isChecked() else "files"
         )
 
     def _emit_game_export(self) -> None:
+        if not self._guard_ready():
+            return
         if self.radio_zip.isChecked():
             self.export_clicked.emit("zip")
         elif self.radio_sprite.isChecked():
@@ -170,13 +230,15 @@ class ExportView(QWidget):
         return 2 if self.narrow_check.isChecked() else 3
 
     def set_ready_info(self, done: int, total: int) -> None:
-        if done == total and config.BACK_PATH.exists():
+        self._ready_done = done
+        has_back = style_store.back_path().exists()
+        if done == total and has_back:
             self.ready_label.setText(f"✔  {total} karty + rewers gotowe")
             state = "ok"
         else:
             self.ready_label.setText(
                 f"{done}/{total} kart gotowych"
-                + ("" if config.BACK_PATH.exists() else " · brak rewersu")
+                + ("" if has_back else " · brak rewersu")
             )
             state = "warn"
         self.ready_label.setProperty("state", state)

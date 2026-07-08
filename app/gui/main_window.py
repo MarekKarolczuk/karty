@@ -34,7 +34,7 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.workspace_view import WorkspaceView
 from app.gui.widgets import show_toast
 from app.gui.worker import (
-    BackWorker, ExportWorker, GenerationWorker, TemplateWorker,
+    BackWorker, ExportWorker, GenerationWorker, SampleWorker, TemplateWorker,
 )
 
 class MainWindow(QMainWindow):
@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         self.template_worker: TemplateWorker | None = None
         self.back_worker: BackWorker | None = None
         self.export_worker: ExportWorker | None = None
+        self.sample_worker: SampleWorker | None = None
         self.deck_name: str = "Rodzinna talia"
 
         root = QWidget()
@@ -79,6 +80,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(10, 8, 10, 10)
         root_layout.setSpacing(10)
         self.title_bar = TitleBar(self)
+        self.title_bar.settings_requested.connect(self._open_settings)
         root_layout.addWidget(self.title_bar)
 
         body = QHBoxLayout()
@@ -123,7 +125,11 @@ class MainWindow(QMainWindow):
         self._refresh_used_photos()
         self._refresh_estimate()
         self._refresh_api_status()
-        self._set_status("Gotowe — przypisz zdjęcia do kart i kliknij GENERUJ")
+        if config.api_ready():
+            self._set_status("Gotowe — przypisz zdjęcia do kart i kliknij GENERUJ")
+        else:
+            self._set_status("Zacznij od skonfigurowania API w Ustawieniach (⚙) "
+                             "— kliknij pigułkę API u góry")
 
     def _wrap_stack(self) -> QVBoxLayout:
         wrap = QVBoxLayout()
@@ -171,18 +177,23 @@ class MainWindow(QMainWindow):
         gen.versions_spin.valueChanged.connect(lambda _=0: self._refresh_estimate())
 
         self.settings_view.model_changed.connect(self._on_model_changed)
+        self.settings_view.models_refreshed.connect(self._sync_model_views)
         self.settings_view.keys_changed.connect(self._refresh_api_status)
         self.settings_view.card_preset_changed.connect(self._on_card_preset_changed)
-        # zmiana aktywnego zestawu stylu (w Ustawieniach) → odśwież edytory teł
-        # i zapamiętaj wybór dla tej talii (projekt.json)
-        self.settings_view.style_slot_changed.connect(
-            self.back_view.reload_style_slot
-        )
-        self.settings_view.style_slot_changed.connect(self._save_project)
 
+        # edycja stylu postaci w zakładce „Style" → zapis + odśwież podgląd promptu
+        self.back_view.character_changed.connect(self._save_project)
+        self.back_view.character_changed.connect(self.settings_view.refresh_prompt)
+        # zmiana struktury presetów (nowy/usuń/import) → odśwież podgląd + zapis
+        self.back_view.style_slot_changed.connect(self.settings_view.refresh_prompt)
+        self.back_view.style_slot_changed.connect(self._save_project)
+        # aktywowano preset kategorii → zastosuj do roboczego wyglądu talii
+        self.back_view.preset_applied.connect(self._on_preset_applied)
+        self.back_view.generate_sample_clicked.connect(self._generate_sample)
         self.back_view.generate_back_clicked.connect(self._start_back_generation)
         self.back_view.generate_front_clicked.connect(self._start_front_generation)
         self.export_view.export_clicked.connect(self._start_export)
+        self.export_view.options_changed.connect(self._save_project)
 
     def _build_status_bar(self) -> QWidget:
         bar = QWidget()
@@ -211,6 +222,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- pomocnicze stany
     def _switch_view(self, index: int) -> None:
         self.stack.fade_to(index)
+
+    _SETTINGS_INDEX = 4   # kolejność wg VIEWS w sidebarze
+
+    def _open_settings(self) -> None:
+        """Skok do Ustawień (np. z klikniętej pigułki API na pasku tytułu)."""
+        self.sidebar.set_current(self._SETTINGS_INDEX)
+        self._switch_view(self._SETTINGS_INDEX)
 
     def _values(self) -> list[str]:
         return list(self._deck_values)
@@ -243,7 +261,9 @@ class MainWindow(QMainWindow):
         self._refresh_estimate()
 
     def _refresh_api_status(self) -> None:
-        self.title_bar.refresh_api_status(bool(config.GEMINI_API_KEY))
+        self.title_bar.refresh_api_status(config.api_ready())
+        # backend (Vertex/AI Studio) mógł się zmienić → odśwież pole „Silnik"
+        self.generation.refresh_engine()
 
     def _set_status(self, text: str) -> None:
         self.status_text.setText(text)
@@ -510,7 +530,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             show_toast(self, "Poczekaj — trwa generacja", "info")
             return
-        if not self._guard_full_ai():
+        if not self._guard_api_ready() or not self._guard_full_ai():
             return
         suit = Suit.from_nazwa(suit_nazwa)
         transform = self.transforms.get(f"{suit_nazwa}:{value}")
@@ -690,7 +710,7 @@ class MainWindow(QMainWindow):
         self.generation.set_estimate(text)
 
     def _start_generation(self) -> None:
-        if not self._guard_full_ai():
+        if not self._guard_api_ready() or not self._guard_full_ai():
             return
         specs = self._collect_specs()
         if not specs:
@@ -698,6 +718,16 @@ class MainWindow(QMainWindow):
                        "(lub odznacz „Pomiń gotowe”)", "error")
             return
         self._run_generation(specs)
+
+    def _guard_api_ready(self) -> bool:
+        """Blokuje generację, gdy API nie jest skonfigurowane — jeden czytelny
+        komunikat i skok do Ustawień zamiast serii błędów per karta."""
+        if not config.api_ready():
+            show_toast(self, "Najpierw skonfiguruj API w Ustawieniach "
+                       "(klucz Google AI Studio lub Vertex)", "error")
+            self._open_settings()
+            return False
+        return True
 
     def _guard_full_ai(self) -> bool:
         """Blokuje tryb Pełne AI na modelu innym niż Gemini (inaczej każda
@@ -839,6 +869,7 @@ class MainWindow(QMainWindow):
         self._show_preview(load_thumbnail(Path(path), 900))
         self.generation.mark_done(spec)
         self.gallery.mark_dirty()
+        self.back_view.refresh_style_preview()   # podgląd stylu = najnowsza karta
         self._refresh_overview()
         # nowy wariant trafia do historii — nawigator skacze na najnowszy
         self.card_history_pos.pop(key, None)
@@ -904,10 +935,29 @@ class MainWindow(QMainWindow):
         self._rebuild_grids(self._values())
         self._set_status(f"Tło {suit.symbol} {suit.nazwa}: {Path(path).name}")
 
+    def _on_preset_applied(self, cat: str) -> None:
+        """Aktywowano preset w zakładce „Style" — silnik, siatki i eksport
+        czytają wprost z folderu aktywnego presetu, więc wystarczy zrzucić
+        nieaktualne wybory wariantów i odświeżyć widoki."""
+        if cat == "tla_przodu":
+            # wybory wariantów wskazywały pliki poprzedniego presetu
+            config.TEMPLATE_OVERRIDES.clear()
+            card_grid.clear_template_cache()
+            self._rebuild_grids(self._values())
+            self.workspace.template_picker.refresh_templates()
+            self.back_view.refresh_front_preview()
+        elif cat == "rewers":
+            self.back_view.refresh_back_preview()
+            self.gallery.mark_dirty()
+        self.settings_view.refresh_prompt()
+        self._save_project()
+
     def _start_front_generation(self, settings: dict) -> None:
         """Generowanie teł PRZODU karty (zakładka „Tła i rewersy") —
         1 lub 4 warianty tym samym promptem, z możliwością przerwania."""
         if self.template_worker is not None:
+            return
+        if not self._guard_api_ready():
             return
         suit = settings["suit"]
         prompt = settings.get("prompt") or None
@@ -933,6 +983,7 @@ class MainWindow(QMainWindow):
         self._front_made = getattr(self, "_front_made", 0) + 1
         show_toast(self, f"✔ tło {suit.symbol}: {Path(path).name}", "ok")
         # pierwszy wariant od razu ustawiamy jako aktywne tło koloru
+        # (plik leży już w folderze aktywnego presetu teł przodu)
         if self._front_made == 1:
             self._on_template_changed(suit, path)
         self.workspace.template_picker.refresh_templates()
@@ -959,6 +1010,8 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------------- rewers
     def _start_back_generation(self, settings: dict) -> None:
         if self.back_worker is not None:
+            return
+        if not self._guard_api_ready():
             return
         source = settings.get("source_photo") if settings.get("mode") == "i2i" \
             else None
@@ -1002,6 +1055,55 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setVisible(bool(self.worker or self.template_worker))
         self.generation.log_pane.log_line(f"✖ rewers: {message}")
         show_toast(self, f"✖ rewers: {message[:120]}", "error")
+
+    # ----------------------------------------------- podgląd przykładowej karty
+    def _first_available_photo(self) -> Path | None:
+        if config.ZDJECIA_DIR.exists():
+            for p in sorted(config.ZDJECIA_DIR.iterdir()):
+                if p.suffix.lower() in config.IMAGE_EXTS:
+                    return p
+        return None
+
+    def _generate_sample(self, payload: dict) -> None:
+        """Zakładka „Style" → jedna przykładowa karta w bieżącym stylu (bez zapisu)."""
+        if self.sample_worker is not None:
+            show_toast(self, "Poczekaj — trwa generacja podglądu", "info")
+            return
+        if not self._guard_api_ready() or not self._guard_full_ai():
+            return
+        photo = payload.get("photo")
+        photo_path = Path(photo) if photo else self._first_available_photo()
+        if photo_path is None or not photo_path.exists():
+            show_toast(self, "Dodaj zdjęcie do podglądu (wybierz plik albo wrzuć "
+                       "zdjęcie do folderu zdjecia/)", "error")
+            return
+        suit = Suit.KIER
+        if not suit.available_templates():
+            show_toast(self, "Brak tła przodu dla Kier — wygeneruj je najpierw "
+                       "w tej zakładce", "error")
+            return
+        spec = CardSpec(value="A", suit=suit, photo_path=photo_path,
+                        mode=self._mode(), variant=1, transform=None)
+        self.back_view.set_sample_busy(True)
+        self._set_status("Generuję podgląd przykładowej karty…")
+        worker = SampleWorker(spec)
+        worker.done.connect(self._on_sample_done)
+        worker.failed.connect(self._on_sample_failed)
+        self.sample_worker = worker
+        worker.start()
+
+    def _on_sample_done(self, image) -> None:
+        self.sample_worker = None
+        self.back_view.set_sample_busy(False)
+        self.back_view.set_style_preview_image(image)
+        self._set_status("✔ podgląd przykładowej karty gotowy")
+        show_toast(self, "✔ podgląd przykładowej karty gotowy", "ok")
+
+    def _on_sample_failed(self, message: str) -> None:
+        self.sample_worker = None
+        self.back_view.set_sample_busy(False)
+        self.generation.log_pane.log_line(f"✖ podgląd: {message}")
+        show_toast(self, f"✖ podgląd: {message[:120]}", "error")
 
     def _on_card_preset_changed(self, _key: str) -> None:
         self._set_status(
@@ -1047,7 +1149,8 @@ class MainWindow(QMainWindow):
             kind=kind,
             out_path=Path(out_path),
             fronts=self._deck_fronts(),
-            back=config.BACK_PATH if config.BACK_PATH.exists() else None,
+            back=style_store.back_path() if style_store.back_path().exists()
+            else None,
             columns=self.export_view.pdf_columns(),
             bleed=self.export_view.bleed_check.isChecked(),
             marks=self.export_view.marks_check.isChecked(),
@@ -1113,10 +1216,12 @@ class MainWindow(QMainWindow):
             "limit": self.generation.limit_spin.value(),
             "versions": self.generation.versions_spin.value(),
             "skip_done": self.generation.skip_done_check.isChecked(),
-            "style_slot": style_store.active_slot(),
+            "style_presets": {cat: style_store.active(cat)
+                              for cat in style_store.CATEGORIES},
             "model": config.SELECTED_MODEL,
             "card_preset": config.SELECTED_CARD_PRESET,
             "back": self.back_view.settings(),
+            "export": self.export_view.settings(),
         }
         config.PROJEKT_JSON.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -1164,13 +1269,25 @@ class MainWindow(QMainWindow):
             self.settings_view.sync_styles()
         if isinstance(data.get("back"), dict):
             self.back_view.apply_settings(data["back"])
+        if isinstance(data.get("export"), dict):
+            self.export_view.apply_settings(data["export"])
         if data.get("model") in config.MODELS:
             config.SELECTED_MODEL = data["model"]
             self._sync_model_views()
-        # aktywny zestaw stylu zapamiętany dla tej talii
-        slot = data.get("style_slot")
-        if isinstance(slot, str) and slot in style_store.slot_names():
-            style_store.set_active_slot(slot)
-            self.settings_view.sync_styles()
-            self.back_view.reload_style_slot()
+        # aktywne presety stylu zapamiętane dla tej talii
+        chosen = data.get("style_presets")
+        if isinstance(chosen, dict):
+            changed = False
+            for cat in style_store.CATEGORIES:
+                name = chosen.get(cat)
+                if isinstance(name, str) and name != style_store.active(cat) \
+                        and name in style_store.presets(cat):
+                    style_store.set_active(cat, name)
+                    changed = True
+            if changed:
+                # wybory wariantów z projekt.json dotyczyły innych presetów
+                config.TEMPLATE_OVERRIDES.clear()
+                card_grid.clear_template_cache()
+                self.settings_view.refresh_prompt()
+                self.back_view.reload_style_slot()
         self.workspace.template_picker.refresh_templates()

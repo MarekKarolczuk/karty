@@ -11,10 +11,11 @@ zdjecia/
 output/
 arkusz_druku.pdf
 Przykladowe_karty_fajne_ale_nie_spojne/
-tla_kart/rewers_stary_*.png
+Style/
 
 # === Generowane / cache ===
 assets/masks/
+models_cache.json
 __pycache__/
 *.py[cod]
 *.egg-info/

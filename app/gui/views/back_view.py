@@ -1,15 +1,18 @@
-"""Widok „Domyślne style / Tła i rewersy": generowanie teł PRZODU kart oraz
-tyłu kart (rewersu) na podstawie opisów (promptów) — z opisu (T2I) lub ze
-zdjęcia (I2I), presety, orientacja, edytor domyślnego stylu tła."""
+"""Widok „Style": cztery niezależne biblioteki presetów (postać, styl tła,
+tła przodu, rewers). Każda ma wybór presetu + pełny CRUD (nowy/duplikuj/zmień
+nazwę/zapisz/wczytaj/usuń), edytor promptu i podgląd. Wybór presetu teł przodu /
+rewersu od razu staje się aktywnym wyglądem talii (sygnał preset_applied)."""
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
+    QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QVBoxLayout, QWidget,
 )
 
 from app import config
@@ -17,9 +20,21 @@ from app.core import prompts, style_store
 from app.core.models import Suit
 from app.gui.animations import Spinner
 from app.gui.views import view_header
-from app.gui.widgets import SegmentedControl, cover_pixmap, show_toast
+from app.gui.widgets import (
+    SegmentedControl, cover_pixmap, pil_to_pixmap, show_toast,
+)
 
 BACK_W, BACK_H = 200, 279
+
+# Przyciski CRUD wspólne dla każdej biblioteki presetów.
+_CRUD_BUTTONS = (
+    ("＋ Nowy", "Utwórz nowy preset (kopia domyślnych)"),
+    ("⧉ Duplikuj", "Skopiuj bieżący preset"),
+    ("✎ Zmień nazwę", "Zmień nazwę bieżącego presetu"),
+    ("💾 Zapisz", "Zapisz bieżący preset do pliku (.zip)"),
+    ("⬇ Wczytaj", "Wczytaj preset z pliku (.zip)"),
+    ("🗑 Usuń", "Usuń bieżący preset"),
+)
 
 
 class BackView(QWidget):
@@ -28,23 +43,28 @@ class BackView(QWidget):
     generate_back_clicked = pyqtSignal(dict)
     # {"suit": Suit, "prompt": str, "count": int}
     generate_front_clicked = pyqtSignal(dict)
+    character_changed = pyqtSignal()   # edycja dowolnego promptu → zapis + podgląd
+    style_slot_changed = pyqtSignal()  # zmiana struktury presetów (nowy/usuń/...)
+    preset_applied = pyqtSignal(str)   # aktywowano preset danej kategorii (cat)
+    # {"photo": str|None} — generuj podgląd przykładowej karty w bieżącym stylu
+    generate_sample_clicked = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._source_photo: Path | None = None
+        self._sample_photo: Path | None = None
+        self._cat_combos: dict[str, QComboBox] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(10)
 
         outer.addWidget(view_header(
-            "Domyślne style / Tła i rewersy",
-            "Generuj tła przodu kart i wspólny rewers z opisu (promptu) — "
-            "spójny styl całej talii",
+            "Style — postać, tło, tła przodu i rewers",
+            "Cztery biblioteki presetów z pełnym zapisem na dysku — wybór presetu "
+            "teł/rewersu od razu ustawia wygląd całej talii",
         ))
 
-        # scroll, bo zakładka mieści teraz dwie sekcje (tła przodu + rewers)
-        from PyQt6.QtWidgets import QScrollArea
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         host = QWidget()
@@ -52,144 +72,10 @@ class BackView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        # ================= SEKCJA: TŁA PRZODU KART ============================
+        layout.addWidget(self._build_character_panel())
+        layout.addWidget(self._build_template_panel())
         layout.addWidget(self._build_front_panel())
-
-        rewers_caption = QLabel("REWERS (TYŁ KART)")
-        rewers_caption.setObjectName("sectionTitle")
-        layout.addWidget(rewers_caption)
-
-        columns = QHBoxLayout()
-        columns.setSpacing(10)
-
-        # ================= LEWA KOLUMNA: sterowanie ============================
-        controls = QWidget()
-        controls.setObjectName("panel")
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(14, 12, 14, 12)
-        controls_layout.setSpacing(8)
-
-        src_caption = QLabel("ŹRÓDŁO")
-        src_caption.setObjectName("sideCaption")
-        controls_layout.addWidget(src_caption)
-        self.mode_seg = SegmentedControl(["📝 Generuj z opisu",
-                                          "🖼 Generuj ze zdjęcia"])
-        self.mode_seg.changed.connect(self._on_mode_changed)
-        controls_layout.addWidget(self.mode_seg)
-
-        # wiersz zdjęcia źródłowego (tylko tryb I2I)
-        self.photo_row = QWidget()
-        self.photo_row.setObjectName("well")
-        photo_layout = QHBoxLayout(self.photo_row)
-        photo_layout.setContentsMargins(8, 6, 8, 6)
-        self.photo_thumb = QLabel()
-        self.photo_thumb.setFixedSize(36, 36)
-        photo_layout.addWidget(self.photo_thumb)
-        self.photo_name = QLabel("— nie wybrano zdjęcia —")
-        self.photo_name.setObjectName("propValue")
-        photo_layout.addWidget(self.photo_name, stretch=1)
-        pick_btn = QPushButton("Wybierz…")
-        pick_btn.setObjectName("ghostBtn")
-        pick_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        pick_btn.clicked.connect(self._pick_photo)
-        photo_layout.addWidget(pick_btn)
-        self.photo_row.hide()
-        controls_layout.addWidget(self.photo_row)
-
-        orient_caption = QLabel("ORIENTACJA WZORU")
-        orient_caption.setObjectName("sideCaption")
-        controls_layout.addWidget(orient_caption)
-        self.orient_seg = SegmentedControl(["▯ Pionowo", "▭ Poziomo"])
-        controls_layout.addWidget(self.orient_seg)
-
-        preset_caption = QLabel("STYL REWERSU")
-        preset_caption.setObjectName("sideCaption")
-        controls_layout.addWidget(preset_caption)
-        self.preset_combo = QComboBox()
-        self.preset_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        for key, (label, _) in prompts.BACK_PRESETS.items():
-            self.preset_combo.addItem(label, key)
-        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
-        controls_layout.addWidget(self.preset_combo)
-
-        self.custom_edit = QPlainTextEdit()
-        self.custom_edit.setObjectName("styleEdit")
-        self.custom_edit.setPlaceholderText(
-            "Opisz własny wzór rewersu (kolory, motywy, nastrój)…"
-        )
-        self.custom_edit.setFixedHeight(84)
-        self.custom_edit.hide()
-        controls_layout.addWidget(self.custom_edit)
-
-        # --- edytor stylu tła/szablonu (dawny „Styl AI") -----------------------
-        self.bg_caption = QLabel("▦  STYL TŁA / SZABLONU KART")
-        self.bg_caption.setObjectName("sideCaption")
-        controls_layout.addWidget(self.bg_caption)
-        bg_hint = QLabel("Wspólny opis ornamentyki — używany przy generowaniu "
-                         "nowych teł kart i rewersu w stylu domyślnym.")
-        bg_hint.setObjectName("hint")
-        bg_hint.setWordWrap(True)
-        controls_layout.addWidget(bg_hint)
-
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(400)
-        self._debounce.timeout.connect(self._apply_template_style)
-
-        self.template_edit = QPlainTextEdit()
-        self.template_edit.setObjectName("styleEdit")
-        self.template_edit.setPlainText(style_store.template_style())
-        self.template_edit.textChanged.connect(self._debounce.start)
-        controls_layout.addWidget(self.template_edit, stretch=1)
-
-        reset_btn = QPushButton("↺  Przywróć domyślny styl tła")
-        reset_btn.setObjectName("ghostBtn")
-        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        reset_btn.clicked.connect(self._reset_template_style)
-        controls_layout.addWidget(reset_btn)
-
-        columns.addWidget(controls, stretch=3)
-
-        # ================= PRAWA KOLUMNA: podgląd + historia ======================
-        preview_panel = QWidget()
-        preview_panel.setObjectName("panel")
-        preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(14, 12, 14, 12)
-        preview_layout.setSpacing(8)
-
-        prev_caption = QLabel("AKTUALNY REWERS")
-        prev_caption.setObjectName("sideCaption")
-        preview_layout.addWidget(prev_caption)
-
-        self.back_preview = QLabel("brak rewersu —\nwygeneruj go AI")
-        self.back_preview.setObjectName("preview")
-        self.back_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.back_preview.setFixedSize(BACK_W, BACK_H)
-        preview_layout.addWidget(self.back_preview,
-                                 alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        gen_row = QHBoxLayout()
-        self.back_spinner = Spinner(18)
-        self.back_spinner.hide()
-        gen_row.addWidget(self.back_spinner)
-        self.back_btn = QPushButton("✨  Generuj rewers")
-        self.back_btn.setObjectName("generateBtn")
-        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.back_btn.clicked.connect(self._emit_generate)
-        gen_row.addWidget(self.back_btn, stretch=1)
-        preview_layout.addLayout(gen_row)
-
-        backups_caption = QLabel("POPRZEDNIE REWERSY (BACKUP)")
-        backups_caption.setObjectName("sideCaption")
-        preview_layout.addWidget(backups_caption)
-        self.backups = QListWidget()
-        self.backups.setObjectName("queueList")
-        self.backups.setToolTip("Dwuklik otwiera plik w podglądzie systemowym")
-        self.backups.itemDoubleClicked.connect(self._open_backup)
-        preview_layout.addWidget(self.backups, stretch=1)
-
-        columns.addWidget(preview_panel, stretch=2)
-        layout.addLayout(columns)
+        layout.addWidget(self._build_back_panel())
         layout.addStretch(1)
 
         scroll.setWidget(host)
@@ -197,9 +83,405 @@ class BackView(QWidget):
 
         self.refresh_back_preview()
         self.refresh_front_preview()
+
+    # ================= wspólny nagłówek biblioteki presetów ===================
+    def _library_header(self, cat: str) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        cap = QLabel(f"PRESET — {style_store.CATEGORY_LABELS[cat].upper()}")
+        cap.setObjectName("sideCaption")
+        v.addWidget(cap)
+
+        combo = QComboBox()
+        combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        combo.currentIndexChanged.connect(
+            lambda _i, c=cat: self._on_preset_selected(c)
+        )
+        self._cat_combos[cat] = combo
+        v.addWidget(combo)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        handlers = (
+            self._new_preset, self._duplicate_preset, self._rename_preset,
+            self._export_preset, self._import_preset, self._delete_preset,
+        )
+        for (text, tip), handler in zip(_CRUD_BUTTONS, handlers):
+            btn = QPushButton(text)
+            btn.setObjectName("ghostBtn")
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, c=cat, h=handler: h(c))
+            actions.addWidget(btn)
+        actions.addStretch(1)
+        v.addLayout(actions)
+
+        self._refresh_combo(cat)
+        return box
+
+    def _refresh_combo(self, cat: str) -> None:
+        combo = self._cat_combos[cat]
+        combo.blockSignals(True)
+        combo.clear()
+        for name in style_store.presets(cat):
+            combo.addItem(name, name)
+        idx = combo.findData(style_store.active(cat))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    # --- akcje CRUD (współdzielone przez wszystkie kategorie) ------------------
+    def _on_preset_selected(self, cat: str) -> None:
+        name = self._cat_combos[cat].currentData()
+        if not name or name == style_store.active(cat):
+            return
+        style_store.set_active(cat, name)
+        self._activate(cat)
+
+    def _new_preset(self, cat: str) -> None:
+        label = style_store.CATEGORY_LABELS[cat]
+        name, ok = QInputDialog.getText(
+            self, "Nowy preset", f"Nazwa nowego presetu ({label}):")
+        if not ok:
+            return
+        style_store.create(cat, name.strip())
+        self._after_structure_change(cat)
+
+    def _duplicate_preset(self, cat: str) -> None:
+        style_store.duplicate(cat)
+        self._after_structure_change(cat)
+
+    def _rename_preset(self, cat: str) -> None:
+        current = style_store.active(cat)
+        name, ok = QInputDialog.getText(
+            self, "Zmień nazwę presetu", "Nowa nazwa:", text=current)
+        if not ok or not name.strip():
+            return
+        style_store.rename(cat, current, name.strip())
+        self._after_structure_change(cat)
+
+    def _delete_preset(self, cat: str) -> None:
+        if len(style_store.presets(cat)) <= 1:
+            show_toast(self, "Nie można usunąć ostatniego presetu", "info")
+            return
+        current = style_store.active(cat)
+        answer = QMessageBox.question(
+            self, "Usunąć preset?",
+            f"Preset „{current}” ({style_store.CATEGORY_LABELS[cat]}) zostanie "
+            "trwale usunięty (wraz z plikami na dysku).",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        style_store.delete(cat, current)
+        self._after_structure_change(cat)
+
+    def _export_preset(self, cat: str) -> None:
+        name = style_store.active(cat)
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Zapisz preset do pliku",
+            str(config.ROOT / f"{cat}_{safe}.zip"), "Preset (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            style_store.export_preset(cat, path)
+            show_toast(self, "Zapisano preset do pliku", "ok")
+        except OSError as exc:
+            show_toast(self, f"Błąd zapisu: {exc}", "error")
+
+    def _import_preset(self, cat: str) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Wczytaj preset z pliku", str(config.ROOT), "Preset (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            style_store.import_preset(cat, path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            show_toast(self, f"Nie wczytano pliku: {exc}", "error")
+            return
+        self._after_structure_change(cat)
+        show_toast(self, "Wczytano preset", "ok")
+
+    def _activate(self, cat: str) -> None:
+        """Aktywny preset kategorii się zmienił → przeładuj edytory i zastosuj."""
+        self._reload_editors(cat)
+        self.preset_applied.emit(cat)
+        self.character_changed.emit()   # podgląd promptu + zapis projektu
+
+    def _after_structure_change(self, cat: str) -> None:
+        """Po nowym/usuń/zmianie nazwy/imporcie — odśwież combo i aktywuj."""
+        self._refresh_combo(cat)
+        self._reload_editors(cat)
+        self.preset_applied.emit(cat)
+        self.style_slot_changed.emit()
+
+    def _reload_editors(self, cat: str) -> None:
+        if cat == "postac":
+            self._reload_character_edit()
+            self.refresh_style_preview()
+        elif cat == "styl_tla":
+            self._reload_template_edit()
+        elif cat == "tla_przodu":
+            self._reload_front_prompt()
+            self.refresh_front_preview()
+        elif cat == "rewers":
+            self._reload_back_opis()
+            self.refresh_back_preview()
+
+    def reload_style_slot(self) -> None:
+        """Pełne odświeżenie wszystkich bibliotek (np. po wczytaniu projektu)."""
+        for cat in style_store.CATEGORIES:
+            self._refresh_combo(cat)
+            self._reload_editors(cat)
+
+    # ======================= SEKCJA: STYL POSTACI =============================
+    def _build_character_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(14, 12, 14, 12)
+        pl.setSpacing(8)
+
+        self.char_caption = QLabel("👤  STYL POSTACI (POP-OUT)")
+        self.char_caption.setObjectName("sectionTitle")
+        pl.addWidget(self.char_caption)
+        pl.addWidget(self._library_header("postac"))
+
+        char_hint = QLabel("Opis stylizacji postaci ze zdjęcia (technika, paleta, "
+                           "efekt pop-out). Zapisuje się automatycznie w wybranym "
+                           "presecie.")
+        char_hint.setObjectName("hint")
+        char_hint.setWordWrap(True)
+        pl.addWidget(char_hint)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        self._char_debounce = QTimer(self)
+        self._char_debounce.setSingleShot(True)
+        self._char_debounce.setInterval(400)
+        self._char_debounce.timeout.connect(self._apply_character_style)
+
+        self.character_edit = QPlainTextEdit()
+        self.character_edit.setObjectName("styleEdit")
+        self.character_edit.setPlaceholderText(
+            "Opisz styl postaci (technika, paleta, nastrój, efekt pop-out)…"
+        )
+        self.character_edit.setPlainText(style_store.character_style())
+        self.character_edit.textChanged.connect(self._char_debounce.start)
+        left.addWidget(self.character_edit, stretch=1)
+
+        reset_char = QPushButton("↺  Przywróć domyślny styl postaci")
+        reset_char.setObjectName("ghostBtn")
+        reset_char.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_char.clicked.connect(self._reset_character_style)
+        left.addWidget(reset_char)
+        row.addLayout(left, stretch=2)
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        prev_cap = QLabel("PODGLĄD STYLU (przykładowa karta)")
+        prev_cap.setObjectName("sideCaption")
+        right.addWidget(prev_cap)
+        self.style_preview = QLabel()
+        self.style_preview.setObjectName("preview")
+        self.style_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.style_preview.setFixedSize(126, 176)
+        self.style_preview.setWordWrap(True)
+        right.addWidget(self.style_preview, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        self.sample_photo_row = QWidget()
+        self.sample_photo_row.setObjectName("well")
+        sp_layout = QHBoxLayout(self.sample_photo_row)
+        sp_layout.setContentsMargins(8, 6, 8, 6)
+        self.sample_thumb = QLabel()
+        self.sample_thumb.setFixedSize(30, 30)
+        sp_layout.addWidget(self.sample_thumb)
+        self.sample_name = QLabel("— zdjęcie auto —")
+        self.sample_name.setObjectName("propValue")
+        self.sample_name.setWordWrap(True)
+        sp_layout.addWidget(self.sample_name, stretch=1)
+        pick_sample = QPushButton("Wybierz…")
+        pick_sample.setObjectName("ghostBtn")
+        pick_sample.setCursor(Qt.CursorShape.PointingHandCursor)
+        pick_sample.clicked.connect(self._pick_sample_photo)
+        sp_layout.addWidget(pick_sample)
+        right.addWidget(self.sample_photo_row)
+
+        sample_gen_row = QHBoxLayout()
+        self.sample_spinner = Spinner(18)
+        self.sample_spinner.hide()
+        sample_gen_row.addWidget(self.sample_spinner)
+        self.sample_btn = QPushButton("🎬  Wygeneruj podgląd")
+        self.sample_btn.setObjectName("outlineBtn")
+        self.sample_btn.setToolTip("Generuje jedną przykładową kartę w bieżącym "
+                                   "stylu (nie zapisuje do talii)")
+        self.sample_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sample_btn.clicked.connect(self._emit_generate_sample)
+        sample_gen_row.addWidget(self.sample_btn, stretch=1)
+        right.addLayout(sample_gen_row)
+        right.addStretch(1)
+        row.addLayout(right, stretch=1)
+
+        pl.addLayout(row)
+        self._update_character_caption()
+        self.refresh_style_preview()
+        return panel
+
+    def _pick_sample_photo(self) -> None:
+        exts = " ".join(f"*{e}" for e in sorted(config.IMAGE_EXTS))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Zdjęcie do podglądu przykładowej karty",
+            str(config.ZDJECIA_DIR), f"Obrazy ({exts})",
+        )
+        if path:
+            self._set_sample_photo(Path(path))
+
+    def _set_sample_photo(self, path: Path | None) -> None:
+        self._sample_photo = path if (path and path.exists()) else None
+        if self._sample_photo is not None:
+            self.sample_thumb.setPixmap(
+                cover_pixmap(self._sample_photo, 30, 30, radius=6))
+            self.sample_name.setText(self._sample_photo.name)
+        else:
+            self.sample_thumb.clear()
+            self.sample_name.setText("— zdjęcie auto —")
+
+    def _emit_generate_sample(self) -> None:
+        self.generate_sample_clicked.emit(
+            {"photo": str(self._sample_photo) if self._sample_photo else None}
+        )
+
+    def set_sample_busy(self, busy: bool) -> None:
+        self.sample_btn.setEnabled(not busy)
+        self.sample_spinner.setVisible(busy)
+        self.sample_btn.setText("⏳  Generuję podgląd…" if busy
+                                else "🎬  Wygeneruj podgląd")
+
+    def set_style_preview_image(self, image) -> None:
+        pix = pil_to_pixmap(image).scaled(
+            126, 176, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.style_preview.setPixmap(pix)
+
+    def _apply_character_style(self) -> None:
+        style_store.set_text("postac", "styl", self.character_edit.toPlainText())
+        self._update_character_caption()
+        self.character_changed.emit()
+
+    def _reset_character_style(self) -> None:
+        default = style_store.reset("postac", "styl")
+        self.character_edit.blockSignals(True)
+        self.character_edit.setPlainText(default)
+        self.character_edit.blockSignals(False)
+        self._update_character_caption()
+        self.character_changed.emit()
+
+    def _reload_character_edit(self) -> None:
+        self.character_edit.blockSignals(True)
+        self.character_edit.setPlainText(style_store.character_style())
+        self.character_edit.blockSignals(False)
+        self._update_character_caption()
+
+    def _update_character_caption(self) -> None:
+        self.char_caption.setText(
+            "👤  STYL POSTACI (POP-OUT)"
+            + ("" if style_store.is_default("postac", "styl") else "   • zmieniony")
+        )
+
+    def refresh_style_preview(self) -> None:
+        newest = None
+        if config.OUTPUT_DIR.exists():
+            cards = [p for p in config.OUTPUT_DIR.iterdir()
+                     if p.suffix.lower() in config.IMAGE_EXTS]
+            if cards:
+                newest = max(cards, key=lambda p: p.stat().st_mtime)
+        if newest is not None:
+            self.style_preview.setPixmap(cover_pixmap(newest, 126, 176, radius=8))
+        else:
+            self.style_preview.setText("Wygeneruj kartę,\naby zobaczyć\npodgląd stylu")
+
+    # ======================= SEKCJA: STYL TŁA / SZABLONU ======================
+    def _build_template_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(14, 12, 14, 12)
+        pl.setSpacing(8)
+
+        self.tmpl_caption = QLabel("▦  STYL TŁA / SZABLONU KART")
+        self.tmpl_caption.setObjectName("sectionTitle")
+        pl.addWidget(self.tmpl_caption)
+        pl.addWidget(self._library_header("styl_tla"))
+
+        hint = QLabel("Wspólny opis ornamentyki — używany przy generowaniu nowych "
+                      "teł kart i rewersu w stylu domyślnym. Zapisuje się w wybranym "
+                      "presecie.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        pl.addWidget(hint)
+
+        self._tmpl_debounce = QTimer(self)
+        self._tmpl_debounce.setSingleShot(True)
+        self._tmpl_debounce.setInterval(400)
+        self._tmpl_debounce.timeout.connect(self._apply_template_style)
+
+        self.template_edit = QPlainTextEdit()
+        self.template_edit.setObjectName("styleEdit")
+        self.template_edit.setPlainText(style_store.template_style())
+        self.template_edit.textChanged.connect(self._tmpl_debounce.start)
+        pl.addWidget(self.template_edit, stretch=1)
+
+        reset_btn = QPushButton("↺  Przywróć domyślny styl tła")
+        reset_btn.setObjectName("ghostBtn")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.clicked.connect(self._reset_template_style)
+        pl.addWidget(reset_btn)
+
+        self._update_template_caption()
+        return panel
+
+    def _apply_template_style(self) -> None:
+        style_store.set_text("styl_tla", "styl", self.template_edit.toPlainText())
+        self._update_template_caption()
+        self.character_changed.emit()
+
+    def _reset_template_style(self) -> None:
+        answer = QMessageBox.question(
+            self, "Przywrócić domyślny styl tła?",
+            "Opis stylu tła/szablonu wróci do wartości domyślnej.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        default = style_store.reset("styl_tla", "styl")
+        self.template_edit.blockSignals(True)
+        self.template_edit.setPlainText(default)
+        self.template_edit.blockSignals(False)
+        self._update_template_caption()
+        self.character_changed.emit()
+        show_toast(self, "Przywrócono domyślny styl tła", "ok")
+
+    def _reload_template_edit(self) -> None:
+        self.template_edit.blockSignals(True)
+        self.template_edit.setPlainText(style_store.template_style())
+        self.template_edit.blockSignals(False)
         self._update_template_caption()
 
-    # --- panel teł przodu ---------------------------------------------------------
+    def _update_template_caption(self) -> None:
+        self.tmpl_caption.setText(
+            "▦  STYL TŁA / SZABLONU KART"
+            + ("" if style_store.is_default("styl_tla", "styl") else "   • zmieniony")
+        )
+
+    # ======================= SEKCJA: TŁA PRZODU KART ==========================
     def _build_front_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("panel")
@@ -210,12 +492,11 @@ class BackView(QWidget):
         cap = QLabel("🃏  TŁA PRZODU KART")
         cap.setObjectName("sectionTitle")
         pl.addWidget(cap)
-        self.slot_label = QLabel(f"Zestaw stylu: {style_store.active_slot()}")
-        self.slot_label.setObjectName("hint")
-        pl.addWidget(self.slot_label)
-        hint = QLabel("Wygeneruj tło przodu w spójnym stylu. Prompt jest osobny "
-                      "dla kart czerwonych (Kier/Karo) i czarnych (Pik/Trefl) "
-                      "i zapisuje się w aktywnym zestawie stylu.")
+        pl.addWidget(self._library_header("tla_przodu"))
+
+        hint = QLabel("Preset teł przodu = 2 prompty (Kier/Karo i Pik/Trefl) + 4 "
+                      "obrazy kart. Wybór presetu od razu ustawia aktywne tła całej "
+                      "talii. Prompt jest osobny dla kart czerwonych i czarnych.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         pl.addWidget(hint)
@@ -285,7 +566,7 @@ class BackView(QWidget):
         row.addLayout(right, stretch=2)
 
         pl.addLayout(row)
-        self._reload_front_prompt()   # wczytaj prompt dla bieżącego koloru
+        self._reload_front_prompt()
         return panel
 
     def _current_front_suit(self) -> Suit:
@@ -296,7 +577,6 @@ class BackView(QWidget):
         self._reload_front_prompt()
 
     def _reload_front_prompt(self) -> None:
-        """Wczytuje prompt tła przodu dla koloru wybranego w comboboxie."""
         is_red = self._current_front_suit().is_red
         self.front_prompt.blockSignals(True)
         self.front_prompt.setPlainText(style_store.front_prompt(is_red))
@@ -305,38 +585,28 @@ class BackView(QWidget):
 
     def _update_front_caption(self) -> None:
         is_red = self._current_front_suit().is_red
-        kind = "front_red" if is_red else "front_black"
+        field = "front_red" if is_red else "front_black"
         base = ("PROMPT TŁA PRZODU — CZERWONE (Kier/Karo)" if is_red
                 else "PROMPT TŁA PRZODU — CZARNE (Pik/Trefl)")
         self.front_prompt_cap.setText(
-            base + ("" if style_store.is_default(kind) else "   • zmieniony")
+            base + ("" if style_store.is_default("tla_przodu", field)
+                    else "   • zmieniony")
         )
 
-    def _update_template_caption(self) -> None:
-        self.bg_caption.setText("▦  STYL TŁA / SZABLONU KART"
-                                + ("" if style_store.is_default("template")
-                                   else "   • zmieniony"))
-
     def _apply_front_prompt(self) -> None:
-        kind = "front_red" if self._current_front_suit().is_red else "front_black"
-        style_store.set_style(kind, self.front_prompt.toPlainText())
+        field = "front_red" if self._current_front_suit().is_red else "front_black"
+        style_store.set_text("tla_przodu", field, self.front_prompt.toPlainText())
         self._update_front_caption()
+        self.character_changed.emit()
 
     def _reset_front_prompt(self) -> None:
-        kind = "front_red" if self._current_front_suit().is_red else "front_black"
-        default = style_store.reset(kind)
+        field = "front_red" if self._current_front_suit().is_red else "front_black"
+        default = style_store.reset("tla_przodu", field)
         self.front_prompt.blockSignals(True)
         self.front_prompt.setPlainText(default)
         self.front_prompt.blockSignals(False)
-
-    def reload_style_slot(self) -> None:
-        """Odświeża edytory stylu po zmianie aktywnego zestawu (z Ustawień)."""
-        self.slot_label.setText(f"Zestaw stylu: {style_store.active_slot()}")
-        self.template_edit.blockSignals(True)
-        self.template_edit.setPlainText(style_store.template_style())
-        self.template_edit.blockSignals(False)
-        self._update_template_caption()
-        self._reload_front_prompt()
+        self._update_front_caption()
+        self.character_changed.emit()
 
     def _emit_generate_front(self) -> None:
         prompt = self.front_prompt.toPlainText().strip() \
@@ -367,12 +637,156 @@ class BackView(QWidget):
         if not busy:
             self.refresh_front_preview()
 
-    # --- interakcje ----------------------------------------------------------------
+    # ======================= SEKCJA: REWERS (TYŁ KART) ========================
+    def _build_back_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(14, 12, 14, 12)
+        pl.setSpacing(8)
+
+        cap = QLabel("🂠  REWERS (TYŁ KART)")
+        cap.setObjectName("sectionTitle")
+        pl.addWidget(cap)
+        pl.addWidget(self._library_header("rewers"))
+
+        hint = QLabel("Preset rewersu = opis + obraz. Wybór presetu od razu ustawia "
+                      "aktywny rewers całej talii.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        pl.addWidget(hint)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(10)
+
+        # --- lewa kolumna: sterowanie generacją ---
+        controls = QWidget()
+        controls.setObjectName("panel")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(14, 12, 14, 12)
+        controls_layout.setSpacing(8)
+
+        src_caption = QLabel("ŹRÓDŁO")
+        src_caption.setObjectName("sideCaption")
+        controls_layout.addWidget(src_caption)
+        self.mode_seg = SegmentedControl(["📝 Generuj z opisu",
+                                          "🖼 Generuj ze zdjęcia"])
+        self.mode_seg.changed.connect(self._on_mode_changed)
+        controls_layout.addWidget(self.mode_seg)
+
+        self.photo_row = QWidget()
+        self.photo_row.setObjectName("well")
+        photo_layout = QHBoxLayout(self.photo_row)
+        photo_layout.setContentsMargins(8, 6, 8, 6)
+        self.photo_thumb = QLabel()
+        self.photo_thumb.setFixedSize(36, 36)
+        photo_layout.addWidget(self.photo_thumb)
+        self.photo_name = QLabel("— nie wybrano zdjęcia —")
+        self.photo_name.setObjectName("propValue")
+        photo_layout.addWidget(self.photo_name, stretch=1)
+        pick_btn = QPushButton("Wybierz…")
+        pick_btn.setObjectName("ghostBtn")
+        pick_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        pick_btn.clicked.connect(self._pick_photo)
+        photo_layout.addWidget(pick_btn)
+        self.photo_row.hide()
+        controls_layout.addWidget(self.photo_row)
+
+        orient_caption = QLabel("ORIENTACJA WZORU")
+        orient_caption.setObjectName("sideCaption")
+        controls_layout.addWidget(orient_caption)
+        self.orient_seg = SegmentedControl(["▯ Pionowo", "▭ Poziomo"])
+        controls_layout.addWidget(self.orient_seg)
+
+        preset_caption = QLabel("SZYBKI STYL REWERSU")
+        preset_caption.setObjectName("sideCaption")
+        controls_layout.addWidget(preset_caption)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for key, (label, _) in prompts.BACK_PRESETS.items():
+            self.preset_combo.addItem(label, key)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        controls_layout.addWidget(self.preset_combo)
+
+        opis_caption = QLabel("OPIS REWERSU (zapisywany w presecie)")
+        opis_caption.setObjectName("sideCaption")
+        controls_layout.addWidget(opis_caption)
+        self._opis_debounce = QTimer(self)
+        self._opis_debounce.setSingleShot(True)
+        self._opis_debounce.setInterval(400)
+        self._opis_debounce.timeout.connect(self._apply_back_opis)
+        self.custom_edit = QPlainTextEdit()
+        self.custom_edit.setObjectName("styleEdit")
+        self.custom_edit.setPlaceholderText(
+            "Opisz wzór rewersu (kolory, motywy, nastrój)…"
+        )
+        self.custom_edit.setFixedHeight(96)
+        self.custom_edit.setPlainText(style_store.back_text())
+        self.custom_edit.textChanged.connect(self._opis_debounce.start)
+        controls_layout.addWidget(self.custom_edit)
+
+        columns.addWidget(controls, stretch=3)
+
+        # --- prawa kolumna: podgląd + backupy ---
+        preview_panel = QWidget()
+        preview_panel.setObjectName("panel")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(14, 12, 14, 12)
+        preview_layout.setSpacing(8)
+
+        prev_caption = QLabel("AKTUALNY REWERS")
+        prev_caption.setObjectName("sideCaption")
+        preview_layout.addWidget(prev_caption)
+
+        self.back_preview = QLabel("brak rewersu —\nwygeneruj go AI")
+        self.back_preview.setObjectName("preview")
+        self.back_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.back_preview.setFixedSize(BACK_W, BACK_H)
+        preview_layout.addWidget(self.back_preview,
+                                 alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        gen_row = QHBoxLayout()
+        self.back_spinner = Spinner(18)
+        self.back_spinner.hide()
+        gen_row.addWidget(self.back_spinner)
+        self.back_btn = QPushButton("✨  Generuj rewers")
+        self.back_btn.setObjectName("generateBtn")
+        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_btn.clicked.connect(self._emit_generate)
+        gen_row.addWidget(self.back_btn, stretch=1)
+        preview_layout.addLayout(gen_row)
+
+        backups_caption = QLabel("POPRZEDNIE REWERSY (BACKUP)")
+        backups_caption.setObjectName("sideCaption")
+        preview_layout.addWidget(backups_caption)
+        self.backups = QListWidget()
+        self.backups.setObjectName("queueList")
+        self.backups.setToolTip("Dwuklik otwiera plik w podglądzie systemowym")
+        self.backups.itemDoubleClicked.connect(self._open_backup)
+        preview_layout.addWidget(self.backups, stretch=1)
+
+        columns.addWidget(preview_panel, stretch=2)
+        pl.addLayout(columns)
+        return panel
+
     def _on_mode_changed(self, index: int) -> None:
         self.photo_row.setVisible(index == 1)
 
     def _on_preset_changed(self, _index: int) -> None:
-        self.custom_edit.setVisible(self.preset_combo.currentData() == "custom")
+        """Szybki styl: wstaw jego opis do edytora (jeśli ma własny tekst)."""
+        key = self.preset_combo.currentData()
+        style_text = prompts.BACK_PRESETS.get(key, (None, None))[1]
+        if style_text:
+            self.custom_edit.setPlainText(style_text)   # zapis przez debounce
+
+    def _apply_back_opis(self) -> None:
+        style_store.set_text("rewers", "opis", self.custom_edit.toPlainText())
+        self.character_changed.emit()
+
+    def _reload_back_opis(self) -> None:
+        self.custom_edit.blockSignals(True)
+        self.custom_edit.setPlainText(style_store.back_text())
+        self.custom_edit.blockSignals(False)
 
     def _pick_photo(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(config.IMAGE_EXTS))
@@ -405,25 +819,39 @@ class BackView(QWidget):
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-    # --- styl tła --------------------------------------------------------------------
-    def _apply_template_style(self) -> None:
-        style_store.set_style("template", self.template_edit.toPlainText())
-        self._update_template_caption()
+    def refresh_back_preview(self) -> None:
+        back = style_store.back_path()
+        if back.exists():
+            self.back_preview.setPixmap(
+                cover_pixmap(back, BACK_W, BACK_H, radius=10)
+            )
+            self.back_btn.setText("✨  Wygeneruj nowy rewers")
+        else:
+            self.back_preview.setText("brak rewersu —\nwygeneruj go AI")
+        self._refresh_backups()
 
-    def _reset_template_style(self) -> None:
-        answer = QMessageBox.question(
-            self, "Przywrócić domyślny styl tła?",
-            "Opis stylu tła/szablonu wróci do wartości domyślnej.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+    def _refresh_backups(self) -> None:
+        self.backups.clear()
+        back_dir = style_store.preset_dir("rewers")
+        if not back_dir.is_dir():
             return
-        default = style_store.reset("template")
-        self.template_edit.blockSignals(True)
-        self.template_edit.setPlainText(default)
-        self.template_edit.blockSignals(False)
-        show_toast(self, "Przywrócono domyślny styl tła", "ok")
+        backups = sorted(back_dir.glob("rewers_stary_*.png"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in backups:
+            item = QListWidgetItem(f"🕓  {path.name}")
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            self.backups.addItem(item)
 
-    # --- API dla MainWindow ------------------------------------------------------------
+    def set_back_busy(self, busy: bool) -> None:
+        self.back_btn.setEnabled(not busy)
+        self.back_spinner.setVisible(busy)
+        self.back_btn.setText(
+            "⏳  Generuję rewers..." if busy else "✨  Generuj rewers"
+        )
+        if not busy:
+            self.refresh_back_preview()
+
+    # --- API dla MainWindow ---------------------------------------------------
     def settings(self) -> dict:
         return {
             "mode": "i2i" if self.mode_seg.current() == 1 else "t2i",
@@ -444,38 +872,13 @@ class BackView(QWidget):
         preset = data.get("preset", "klasyczny")
         index = self.preset_combo.findData(preset)
         if index >= 0:
+            self.preset_combo.blockSignals(True)
             self.preset_combo.setCurrentIndex(index)
-        self.custom_edit.setPlainText(data.get("custom", ""))
-        self._on_preset_changed(self.preset_combo.currentIndex())
+            self.preset_combo.blockSignals(False)
         source = data.get("source_photo")
         self.set_source_photo(Path(source) if source else None)
 
-    def refresh_back_preview(self) -> None:
-        if config.BACK_PATH.exists():
-            self.back_preview.setPixmap(
-                cover_pixmap(config.BACK_PATH, BACK_W, BACK_H, radius=10)
-            )
-            self.back_btn.setText("✨  Wygeneruj nowy rewers")
-        else:
-            self.back_preview.setText("brak rewersu —\nwygeneruj go AI")
-        self._refresh_backups()
-
-    def _refresh_backups(self) -> None:
-        self.backups.clear()
-        if not config.TLA_DIR.exists():
-            return
-        backups = sorted(config.TLA_DIR.glob("rewers_stary_*.png"),
-                         key=lambda p: p.stat().st_mtime, reverse=True)
-        for path in backups:
-            item = QListWidgetItem(f"🕓  {path.name}")
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            self.backups.addItem(item)
-
-    def set_back_busy(self, busy: bool) -> None:
-        self.back_btn.setEnabled(not busy)
-        self.back_spinner.setVisible(busy)
-        self.back_btn.setText(
-            "⏳  Generuję rewers..." if busy else "✨  Generuj rewers"
-        )
-        if not busy:
-            self.refresh_back_preview()
+    def showEvent(self, event):  # noqa: N802 (API Qt)
+        self.reload_style_slot()
+        self.refresh_style_preview()
+        super().showEvent(event)

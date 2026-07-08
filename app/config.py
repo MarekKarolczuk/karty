@@ -1,6 +1,7 @@
 """Centralna konfiguracja: ścieżki, kolory, rozmiar karty, modele."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -11,7 +12,7 @@ load_dotenv(ROOT / ".env")
 
 # --- Foldery (wg opis_pomyslu.md, dopasowane do istniejących nazw) ---
 ZDJECIA_DIR = ROOT / "zdjecia"
-TLA_DIR = ROOT / "tla_kart"
+TLA_DIR = ROOT / "tla_kart"          # LEGACY — tylko jednorazowa migracja do Style/
 REFERENCJE_DIR = ROOT / "Przykladowe_karty_fajne_ale_nie_spojne"
 OUTPUT_DIR = ROOT / "output"
 ASSETS_DIR = ROOT / "assets"
@@ -19,8 +20,16 @@ MASKS_DIR = ASSETS_DIR / "masks"
 FONTS_DIR = ASSETS_DIR / "fonts"
 UI_FONTS_DIR = FONTS_DIR / "ui"      # fonty interfejsu (NIE do rysowania kart!)
 PROJEKT_JSON = ROOT / "projekt.json"
-STYLES_JSON = ROOT / "styles.json"   # edytowalne style AI (globalne)
-BACK_PATH = TLA_DIR / "rewers.png"   # wspólny rewers talii
+STYLES_JSON = ROOT / "styles.json"   # STARY format (migrowany do Style/)
+# Rewers i tła przodu żyją w folderach presetów: style_store.back_path()
+# i style_store.front_dir() wskazują pliki AKTYWNYCH presetów.
+
+# --- Biblioteki presetów stylu (foldery na dysku) ---
+# Każda kategoria to podfolder Style/<kategoria>/, a każdy preset to podfolder
+# z jego nazwą. Aktywny preset per kategoria zapisywany w Style/active.json.
+STYLE_ROOT = ROOT / "Style"
+STYLE_CATEGORIES = ("postac", "styl_tla", "tla_przodu", "rewers")
+STYLE_ACTIVE_JSON = STYLE_ROOT / "active.json"
 
 # --- API ---
 # Klucze czytane ze zmiennych środowiskowych / .env (NIGDY nie hardcodowane —
@@ -32,25 +41,122 @@ CUSTOM_API_KEY = os.getenv("CUSTOM_API_KEY", "")
 # Zachowane dla zgodności (stability_client importuje tę stałą); puste = nieużywane.
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY", "")
 
-# Rejestr dostępnych modeli obrazowych (wybór w GUI). Obecnie tylko Gemini —
-# generuje całą stylizację (pop-out i pełne AI). provider: "gemini".
-MODELS: dict[str, dict] = {
+# --- Vertex AI (Google Cloud) — alternatywa dla klucza z AI Studio ---
+# USE_VERTEX=true → generacja idzie przez Vertex AI (billing GCP, np. 300$ z
+# trialu), logowanie przez ADC (gcloud auth application-default login), BEZ
+# klucza API. Wymaga GOOGLE_CLOUD_PROJECT i włączonego Vertex AI API.
+USE_VERTEX = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() \
+    in ("1", "true", "yes", "on")
+GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+# Region dotyczy tylko modeli regionalnych (np. gemini-2.5-flash-image). Modele
+# global-only (Gemini 3 Image) wymuszają endpoint "global" niezależnie od tej
+# wartości — patrz vertex_location_for() i pole "vertex_location" w MODELS.
+GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "").strip() or "us-central1"
+
+
+def api_ready() -> bool:
+    """Czy jest z czym wołać model: klucz AI Studio albo tryb Vertex + projekt."""
+    return bool(GEMINI_API_KEY) or (USE_VERTEX and bool(GCP_PROJECT))
+
+
+def active_provider_label() -> str:
+    """Czytelna nazwa aktywnego źródła generacji (do paska tytułu / Ustawień).
+    Pusty string, gdy nic nie jest skonfigurowane."""
+    if USE_VERTEX and GCP_PROJECT:
+        return f"Vertex AI · {GCP_PROJECT}"
+    if GEMINI_API_KEY:
+        return "Google AI Studio"
+    return ""
+
+# Rejestr modeli obrazowych (wybór w GUI). Baza kuratorowana + modele odkryte
+# przez models.list() („Odśwież listę" w Ustawieniach), cache'owane na dysku.
+CURATED_MODELS: dict[str, dict] = {
     "gemini-3-pro-image": {
         "provider": "gemini",
         "label": "Gemini 3 Pro Image",
         "tier": "best",
+        "vertex_location": "global",   # na Vertex serwowany tylko z "global"
     },
     "gemini-2.5-flash-image": {
         "provider": "gemini",
         "label": "Gemini 2.5 Flash Image",
+        "vertex_location": None,       # honoruje GCP_LOCATION (regionalny)
     },
 }
+MODELS: dict[str, dict] = dict(CURATED_MODELS)
 DEFAULT_MODEL = "gemini-3-pro-image"
 SELECTED_MODEL = DEFAULT_MODEL   # nadpisywane z GUI / projekt.json
+MODELS_CACHE_JSON = ROOT / "models_cache.json"   # odkryte modele między sesjami
 
 
 def current_model() -> dict:
     return MODELS.get(SELECTED_MODEL, MODELS[DEFAULT_MODEL])
+
+
+def _derive_model_entry(model_id: str, label: str | None = None,
+                        vertex_location: str | None = None) -> dict:
+    """Wpis rejestru dla modelu odkrytego przez API (heurystyki metadanych)."""
+    if not label:
+        label = model_id.replace("-", " ").title().replace("Ai ", "AI ")
+    if vertex_location is None and model_id.startswith("gemini-3"):
+        vertex_location = "global"     # rodzina gemini-3* jest global-only
+    return {
+        "provider": "gemini",
+        "label": label,
+        "vertex_location": vertex_location,
+        "discovered": True,
+    }
+
+
+def merge_discovered_models(discovered: dict[str, dict]) -> None:
+    """Przebudowuje MODELS: kuratorowane wpisy wygrywają (i nigdy nie znikają),
+    zbiór odkrytych jest zastępowany w całości."""
+    MODELS.clear()
+    MODELS.update(CURATED_MODELS)
+    for model_id in sorted(discovered, reverse=True):   # nowsze rodziny wyżej
+        if model_id in CURATED_MODELS:
+            continue
+        meta = discovered[model_id] or {}
+        MODELS[model_id] = _derive_model_entry(
+            model_id, meta.get("label"), meta.get("vertex_location"),
+        )
+
+
+def save_models_cache(discovered: dict[str, dict]) -> None:
+    """Zapisuje odkryte modele na dysk (przeżywają restart aplikacji)."""
+    from datetime import datetime
+    try:
+        MODELS_CACHE_JSON.write_text(
+            json.dumps({"fetched_at": datetime.now().isoformat(),
+                        "discovered": discovered},
+                       indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def load_models_cache() -> None:
+    """Wczytuje odkryte modele z dysku (start aplikacji). Błędy ignorowane —
+    rejestr kuratorowany zawsze działa."""
+    try:
+        data = json.loads(MODELS_CACHE_JSON.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    discovered = data.get("discovered")
+    if isinstance(discovered, dict):
+        merge_discovered_models(
+            {k: v for k, v in discovered.items()
+             if isinstance(k, str) and isinstance(v, dict)}
+        )
+
+
+def vertex_location_for(model_id: str | None = None) -> str:
+    """Region Vertex dla danego modelu: wymuszony (np. 'global' dla modeli
+    global-only) albo region użytkownika z GCP_LOCATION."""
+    model_id = model_id or SELECTED_MODEL
+    forced = MODELS.get(model_id, {}).get("vertex_location")
+    return forced or GCP_LOCATION
 
 # --- Spójność stylistyczna (PRIORYTET KRYTYCZNY) ---
 ACCENT_HEX = "#801515"           # wartości, znaki, ramki dla kolorów czerwonych
@@ -127,3 +233,8 @@ def dpi_for_template(width_px: int, height_px: int) -> tuple[float, float]:
         width_px / (CARD_MM[0] / mm_per_inch),
         height_px / (CARD_MM[1] / mm_per_inch),
     )
+
+
+# Odkryte modele z poprzedniej sesji — PRZED wczytaniem projekt.json
+# (main_window waliduje zapisany model przez `in MODELS`).
+load_models_cache()

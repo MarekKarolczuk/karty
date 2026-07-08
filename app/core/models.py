@@ -6,6 +6,7 @@ from enum import Enum
 from pathlib import Path
 
 from app import config
+from app.core import style_store
 
 
 class Suit(Enum):
@@ -31,13 +32,20 @@ class Suit(Enum):
             return Path(override)
         templates = self.available_templates()
         if not templates:
-            raise FileNotFoundError(f"Brak szablonu dla koloru '{self.nazwa}' w {config.TLA_DIR}")
+            raise FileNotFoundError(
+                f"Brak szablonu dla koloru '{self.nazwa}' "
+                f"w {style_store.front_dir()}"
+            )
         return templates[0]
 
     def available_templates(self) -> list[Path]:
-        """Wszystkie szablony tego koloru z tla_kart/ (nazwa pliku zawiera kolor)."""
+        """Wszystkie szablony tego koloru z folderu AKTYWNEGO presetu teł
+        przodu (nazwa pliku zawiera kolor)."""
+        d = style_store.front_dir()
+        if not d.is_dir():
+            return []
         return [
-            p for p in sorted(config.TLA_DIR.iterdir())
+            p for p in sorted(d.iterdir())
             if p.suffix.lower() in config.IMAGE_EXTS and self.nazwa in p.stem.lower()
         ]
 
