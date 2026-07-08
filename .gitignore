@@ -15,7 +15,6 @@ Style/
 
 # === Generowane / cache ===
 assets/masks/
-models_cache.json
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -177,7 +177,6 @@ class MainWindow(QMainWindow):
         gen.versions_spin.valueChanged.connect(lambda _=0: self._refresh_estimate())
 
         self.settings_view.model_changed.connect(self._on_model_changed)
-        self.settings_view.models_refreshed.connect(self._sync_model_views)
         self.settings_view.keys_changed.connect(self._refresh_api_status)
         self.settings_view.card_preset_changed.connect(self._on_card_preset_changed)
 

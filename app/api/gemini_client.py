@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import io
-import os
 import time
 
 from google import genai
@@ -55,71 +54,6 @@ def _model_name() -> str:
     if model["provider"] == "gemini":
         return config.SELECTED_MODEL
     return "gemini-2.5-flash-image"  # fallback, gdy wybrany model nie jest z Gemini
-
-
-# id zawierające te fragmenty na pewno NIE są generatorami obrazu
-_NON_IMAGE_HINTS = ("embedding", "veo", "tts", "audio", "-live")
-
-
-def _is_image_model(model_id: str, actions: list[str] | None) -> bool:
-    """Heurystyka: czy model generuje obrazy przez generate_content.
-    `actions` bywa None (Vertex nie zawsze zwraca supported_actions)."""
-    mid = model_id.lower()
-    if any(hint in mid for hint in _NON_IMAGE_HINTS):
-        return False
-    supports_gc = actions is None or "generateContent" in actions
-    if mid.startswith("imagen"):
-        # Imagen działa przez predict — bez generateContent nie umiemy go wołać
-        return actions is not None and "generateContent" in actions
-    return "image" in mid and supports_gc
-
-
-def list_image_models() -> dict[str, dict]:
-    """Odkrywa modele obrazowe dostępne w aktywnym źródle (AI Studio / Vertex).
-
-    Zwraca {model_id: {"label": str|None, "vertex_location": str|None}}.
-    Na Vertex łączy wyniki z endpointu "global" i regionu użytkownika
-    (rodzina gemini-3* jest serwowana tylko z "global")."""
-    if os.getenv("KARTY_FAKE_API", "") == "1":
-        return {
-            "gemini-3-pro-image": {"label": "Gemini 3 Pro Image",
-                                   "vertex_location": "global"},
-            "gemini-2.5-flash-image": {"label": "Gemini 2.5 Flash Image",
-                                       "vertex_location": None},
-            "gemini-3.1-flash-image-preview": {
-                "label": "Gemini 3.1 Flash Image (Nano Banana 2)",
-                "vertex_location": "global"},
-        }
-
-    locations: list[str | None]
-    if config.USE_VERTEX:
-        locations = ["global", config.GCP_LOCATION]
-    else:
-        locations = [None]
-
-    discovered: dict[str, dict] = {}
-    errors: list[str] = []
-    for loc in locations:
-        try:
-            models = get_client(loc).models.list()
-        except Exception as exc:   # jedna lokacja może nie listować
-            errors.append(f"{loc or 'api'}: {str(exc)[:120]}")
-            continue
-        for model in models:
-            model_id = (model.name or "").split("/")[-1]
-            if not model_id or model_id in discovered:
-                continue
-            if not _is_image_model(model_id, model.supported_actions):
-                continue
-            discovered[model_id] = {
-                "label": model.display_name or None,
-                "vertex_location": ("global" if loc == "global" else None),
-            }
-    if not discovered and errors:
-        raise GeminiError(
-            "Nie udało się pobrać listy modeli: " + "   ·   ".join(errors)
-        )
-    return discovered
 
 
 def generate_image(contents: list, retries: int = 3) -> Image.Image:

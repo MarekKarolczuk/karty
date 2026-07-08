@@ -23,8 +23,6 @@ MODEL_DESCRIPTIONS = {
     "gemini-3-pro-image": "Najwyższa jakość ilustracji, wolniejszy.",
     "gemini-3.1-flash-image-preview": "Nano Banana 2 — szybki i tani następca "
                                       "Imagen (preview).",
-    "gemini-3.1-flash-lite-image-preview": "Najtańszy wariant Nano Banana 2 "
-                                           "(preview).",
 }
 PROVIDER_TAGS = {"gemini": "Google"}
 
@@ -57,35 +55,14 @@ class _TestWorker(QThread):
             self.finished_error.emit("   ·   ".join(errors))
 
 
-class _RefreshModelsWorker(QThread):
-    """Pobiera listę modeli obrazowych z aktywnego źródła — poza wątkiem GUI."""
-
-    finished_ok = pyqtSignal(dict)     # {model_id: {label, vertex_location}}
-    finished_error = pyqtSignal(str)
-
-    def run(self) -> None:
-        if not config.api_ready():
-            self.finished_error.emit(
-                "Brak skonfigurowanego źródła — uzupełnij klucz albo Vertex."
-            )
-            return
-        try:
-            from app.api import gemini_client
-            self.finished_ok.emit(gemini_client.list_image_models())
-        except Exception as exc:
-            self.finished_error.emit(str(exc)[:200])
-
-
 class SettingsView(QWidget):
     keys_changed = pyqtSignal()
     model_changed = pyqtSignal(str)
     card_preset_changed = pyqtSignal(str)
-    models_refreshed = pyqtSignal()    # lista modeli przebudowana (odkrywanie)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._test_worker: _TestWorker | None = None
-        self._models_worker: _RefreshModelsWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -184,24 +161,9 @@ class SettingsView(QWidget):
         model_layout.setContentsMargins(14, 12, 14, 12)
         model_layout.setSpacing(8)
 
-        model_header = QHBoxLayout()
         model_caption = QLabel("✦  MODEL GENERUJĄCY OBRAZ")
         model_caption.setObjectName("sectionTitle")
-        model_header.addWidget(model_caption)
-        model_header.addStretch(1)
-        self.models_spinner = Spinner(18)
-        self.models_spinner.hide()
-        model_header.addWidget(self.models_spinner)
-        self.refresh_models_btn = QPushButton("🔄  Odśwież listę")
-        self.refresh_models_btn.setObjectName("ghostBtn")
-        self.refresh_models_btn.setToolTip(
-            "Pobiera z API wszystkie dostępne modele obrazowe "
-            "(z aktywnego źródła: klucz / Vertex)"
-        )
-        self.refresh_models_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.refresh_models_btn.clicked.connect(self._refresh_models)
-        model_header.addWidget(self.refresh_models_btn)
-        model_layout.addLayout(model_header)
+        model_layout.addWidget(model_caption)
 
         self._model_group = QButtonGroup(self)
         self._model_group.setExclusive(True)
@@ -402,11 +364,7 @@ class SettingsView(QWidget):
 
         for i, (key, model) in enumerate(config.MODELS.items()):
             provider = PROVIDER_TAGS.get(model["provider"], model["provider"])
-            description = MODEL_DESCRIPTIONS.get(
-                key, "Model obrazowy wykryty przez API."
-            )
-            if "preview" in key and "preview" not in description.lower():
-                description += "   · preview"
+            description = MODEL_DESCRIPTIONS.get(key, "Model obrazowy Gemini.")
             btn = QPushButton(
                 f"{model['label']}   ·   {provider}\n{description}"
             )
@@ -421,39 +379,6 @@ class SettingsView(QWidget):
             self._model_grid.addWidget(btn, i // 2, i % 2)
             self._model_buttons[key] = btn
         self.sync_model()
-
-    def _refresh_models(self) -> None:
-        """Pobiera z API listę wszystkich dostępnych modeli obrazowych."""
-        if self._models_worker is not None:
-            return
-        self.refresh_models_btn.setEnabled(False)
-        self.models_spinner.show()
-        worker = _RefreshModelsWorker()
-        worker.finished_ok.connect(self._models_done)
-        worker.finished_error.connect(self._models_failed)
-        self._models_worker = worker
-        worker.start()
-
-    def _models_done(self, discovered: dict) -> None:
-        self._models_worker = None
-        self.refresh_models_btn.setEnabled(True)
-        self.models_spinner.hide()
-        config.merge_discovered_models(discovered)
-        config.save_models_cache(discovered)
-        if config.SELECTED_MODEL not in config.MODELS:
-            config.SELECTED_MODEL = config.DEFAULT_MODEL
-            show_toast(self, "Wybrany model zniknął z API — wracam do "
-                             "domyślnego", "info")
-        self._rebuild_model_grid()
-        self.models_refreshed.emit()
-        show_toast(self, f"Modele obrazowe: {len(config.MODELS)} "
-                         f"(API zwróciło {len(discovered)})", "ok")
-
-    def _models_failed(self, message: str) -> None:
-        self._models_worker = None
-        self.refresh_models_btn.setEnabled(True)
-        self.models_spinner.hide()
-        show_toast(self, f"Nie pobrano listy modeli: {message}", "error")
 
     # --- format talii -----------------------------------------------------------------
     def sync_styles(self) -> None:

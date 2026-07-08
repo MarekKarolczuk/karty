@@ -1,7 +1,6 @@
 """Centralna konfiguracja: ścieżki, kolory, rozmiar karty, modele."""
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -68,14 +67,19 @@ def active_provider_label() -> str:
         return "Google AI Studio"
     return ""
 
-# Rejestr modeli obrazowych (wybór w GUI). Baza kuratorowana + modele odkryte
-# przez models.list() („Odśwież listę" w Ustawieniach), cache'owane na dysku.
-CURATED_MODELS: dict[str, dict] = {
+# Rejestr modeli obrazowych (wybór w GUI). Stała lista — tylko modele
+# generujące obrazy (Imagen 3/4 wyłączone przez Google VI 2026, nie dodawać).
+MODELS: dict[str, dict] = {
     "gemini-3-pro-image": {
         "provider": "gemini",
         "label": "Gemini 3 Pro Image",
         "tier": "best",
         "vertex_location": "global",   # na Vertex serwowany tylko z "global"
+    },
+    "gemini-3.1-flash-image-preview": {
+        "provider": "gemini",
+        "label": "Gemini 3.1 Flash Image (Nano Banana 2)",
+        "vertex_location": "global",   # rodzina gemini-3* jest global-only
     },
     "gemini-2.5-flash-image": {
         "provider": "gemini",
@@ -83,72 +87,12 @@ CURATED_MODELS: dict[str, dict] = {
         "vertex_location": None,       # honoruje GCP_LOCATION (regionalny)
     },
 }
-MODELS: dict[str, dict] = dict(CURATED_MODELS)
 DEFAULT_MODEL = "gemini-3-pro-image"
 SELECTED_MODEL = DEFAULT_MODEL   # nadpisywane z GUI / projekt.json
-MODELS_CACHE_JSON = ROOT / "models_cache.json"   # odkryte modele między sesjami
 
 
 def current_model() -> dict:
     return MODELS.get(SELECTED_MODEL, MODELS[DEFAULT_MODEL])
-
-
-def _derive_model_entry(model_id: str, label: str | None = None,
-                        vertex_location: str | None = None) -> dict:
-    """Wpis rejestru dla modelu odkrytego przez API (heurystyki metadanych)."""
-    if not label:
-        label = model_id.replace("-", " ").title().replace("Ai ", "AI ")
-    if vertex_location is None and model_id.startswith("gemini-3"):
-        vertex_location = "global"     # rodzina gemini-3* jest global-only
-    return {
-        "provider": "gemini",
-        "label": label,
-        "vertex_location": vertex_location,
-        "discovered": True,
-    }
-
-
-def merge_discovered_models(discovered: dict[str, dict]) -> None:
-    """Przebudowuje MODELS: kuratorowane wpisy wygrywają (i nigdy nie znikają),
-    zbiór odkrytych jest zastępowany w całości."""
-    MODELS.clear()
-    MODELS.update(CURATED_MODELS)
-    for model_id in sorted(discovered, reverse=True):   # nowsze rodziny wyżej
-        if model_id in CURATED_MODELS:
-            continue
-        meta = discovered[model_id] or {}
-        MODELS[model_id] = _derive_model_entry(
-            model_id, meta.get("label"), meta.get("vertex_location"),
-        )
-
-
-def save_models_cache(discovered: dict[str, dict]) -> None:
-    """Zapisuje odkryte modele na dysk (przeżywają restart aplikacji)."""
-    from datetime import datetime
-    try:
-        MODELS_CACHE_JSON.write_text(
-            json.dumps({"fetched_at": datetime.now().isoformat(),
-                        "discovered": discovered},
-                       indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
-def load_models_cache() -> None:
-    """Wczytuje odkryte modele z dysku (start aplikacji). Błędy ignorowane —
-    rejestr kuratorowany zawsze działa."""
-    try:
-        data = json.loads(MODELS_CACHE_JSON.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    discovered = data.get("discovered")
-    if isinstance(discovered, dict):
-        merge_discovered_models(
-            {k: v for k, v in discovered.items()
-             if isinstance(k, str) and isinstance(v, dict)}
-        )
 
 
 def vertex_location_for(model_id: str | None = None) -> str:
@@ -233,8 +177,3 @@ def dpi_for_template(width_px: int, height_px: int) -> tuple[float, float]:
         width_px / (CARD_MM[0] / mm_per_inch),
         height_px / (CARD_MM[1] / mm_per_inch),
     )
-
-
-# Odkryte modele z poprzedniej sesji — PRZED wczytaniem projekt.json
-# (main_window waliduje zapisany model przez `in MODELS`).
-load_models_cache()
