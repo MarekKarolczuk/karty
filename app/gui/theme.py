@@ -441,6 +441,14 @@ QLabel#slotChip {{
     padding: 2px 8px;
 }}
 QLabel#slotChip[red="true"] {{ color: {ACCENT_HOVER}; }}
+QLabel#variantBadge {{
+    background: {GOLD};
+    color: #1A1408;
+    font-size: 10px;
+    font-weight: bold;
+    border-radius: 7px;
+    padding: 1px 6px;
+}}
 QLabel#slotGhost {{
     color: {MUTED};
     font-size: 11px;

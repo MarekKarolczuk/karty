@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QCursor
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QCursor, QDesktopServices
 from PyQt6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QVBoxLayout, QWidget,
@@ -23,6 +23,7 @@ from app.core.models import CardSpec, GenMode, Suit
 from app.gui import card_grid
 from app.gui.animations import BusyOverlay, FadingStackedWidget
 from app.gui.card_grid import CardSlot
+from app.gui.lightbox import CardLightbox, LightboxContext
 from app.gui.photo_gallery import load_thumbnail
 from app.gui.sidebar import Sidebar
 from app.gui.title_bar import TitleBar
@@ -119,6 +120,9 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self._build_status_bar())
 
         self.deck.set_variant_resolver(self._selected_variant)
+        self.deck.set_variant_counter(
+            lambda suit, value: len(self._card_variants(suit, value)))
+        self._lightbox: CardLightbox | None = None
         self._wire_views()
         self._load_project()
         self._rebuild_grids(self._values())
@@ -167,6 +171,8 @@ class MainWindow(QMainWindow):
         self.deck.edit_values_clicked.connect(self._edit_values)
         self.deck.deck_name_changed.connect(self._on_deck_name_changed)
         self.deck.restamp_clicked.connect(self._start_restamp)
+        self.deck.lightbox_requested.connect(self._open_lightbox)
+        self.deck.preview_file_requested.connect(self._preview_file)
 
         gen = self.generation
         gen.generate_clicked.connect(self._start_generation)
@@ -628,12 +634,14 @@ class MainWindow(QMainWindow):
                     targets.append(CardSpec(value=value, suit=suit, variant=variant))
         return targets
 
-    def _start_restamp(self) -> None:
-        """Przestemplowuje narożniki wszystkich wygenerowanych kart wg aktywnego
-        presetu „wartości narożne" — czyta output/_raw/, ZERO wywołań API."""
+    def _start_restamp(self, targets: list[CardSpec] | None = None) -> None:
+        """Przestemplowuje narożniki wygenerowanych kart wg aktywnego presetu
+        „wartości narożne" — czyta output/_raw/, ZERO wywołań API.
+        targets=None → wszystkie karty talii (wszystkie warianty)."""
         if self.restamp_worker is not None:
             return
-        targets = self._collect_restamp_targets()
+        if targets is None:
+            targets = self._collect_restamp_targets()
         if not targets:
             show_toast(self, "Brak wygenerowanych kart do przestemplowania", "info")
             return
@@ -657,12 +665,116 @@ class MainWindow(QMainWindow):
                 if slot.generated_path is not None:
                     slot.set_generated(slot.generated_path)
         self.gallery.mark_dirty()
+        self.deck.mark_dirty()
         self._refresh_history(self._current_suit.nazwa, self._current_value)
+        if self._lightbox is not None:
+            self._lightbox.refresh()
         self._set_status(f"Przestemplowano narożniki: {ok} kart"
                          + (f", błędy: {errors}" if errors else ""))
         show_toast(self, f"Przestemplowano {ok} kart (bez API)"
                    + (f" · błędów: {errors}" if errors else ""),
                    "error" if errors and not ok else "ok")
+
+    # -------------------------------------------------------------- lightbox kart
+    def _lightbox_ctx(self) -> LightboxContext:
+        return LightboxContext(
+            cards=self._lightbox_cards,
+            variants=self._card_variants,
+            selected=self._selected_variant,
+            card_label=lambda s, v: f"{v}{Suit.from_nazwa(s).symbol}",
+        )
+
+    def _lightbox_cards(self) -> list[tuple[str, str]]:
+        """Karty z wygenerowanymi plikami, wg aktywnego filtra koloru Talii."""
+        selected_suit = self.deck.current_filter()
+        cards: list[tuple[str, str]] = []
+        for suit in Suit:
+            if selected_suit is not None and suit is not selected_suit:
+                continue
+            for value in self._values():
+                if self._card_variants(suit.nazwa, value):
+                    cards.append((suit.nazwa, value))
+        return cards
+
+    def _open_lightbox(self, suit_nazwa: str, value: str) -> None:
+        box = CardLightbox(self._lightbox_ctx(), suit_nazwa, value, self)
+        box.set_main_requested.connect(self._on_lightbox_set_main)
+        box.delete_requested.connect(self._on_lightbox_delete)
+        box.restamp_requested.connect(self._on_lightbox_restamp)
+        box.open_folder_requested.connect(self._open_in_folder)
+        self._lightbox = box
+        try:
+            box.exec()
+        finally:
+            self._lightbox = None
+
+    def _preview_file(self, path: str) -> None:
+        """Prosty podgląd pojedynczego pliku (historia, backup rewersu,
+        szablon) — lightbox w trybie single."""
+        box = CardLightbox(self._lightbox_ctx(), "", "", self,
+                           single_path=Path(path))
+        box.open_folder_requested.connect(self._open_in_folder)
+        box.exec()
+
+    def _on_lightbox_set_main(self, suit_nazwa: str, value: str,
+                              path: str) -> None:
+        """Wybrany w lightboxie wariant staje się głównym — WSKAŹNIK,
+        bez kopiowania plików (jak _on_history_set_main)."""
+        key = f"{suit_nazwa}:{value}"
+        self.selections[key] = path
+        slot = self.grids[Suit.from_nazwa(suit_nazwa)].slots.get(value)
+        if slot is not None:
+            slot.set_generated(Path(path))
+        self.gallery.mark_dirty()
+        self._refresh_overview()
+        self._refresh_history(suit_nazwa, value)
+        self._save_project()
+        if self._lightbox is not None:
+            self._lightbox.refresh()
+        show_toast(self, f"★ {value}{Suit.from_nazwa(suit_nazwa).symbol}: "
+                   "ustawiono jako główną", "ok")
+
+    def _on_lightbox_delete(self, suit_nazwa: str, value: str,
+                            path: str) -> None:
+        target = Path(path)
+        answer = QMessageBox.question(
+            self, "Usunąć wariant?",
+            f"Plik {target.name} (oraz jego surowa wersja z _raw/) zostanie "
+            "trwale usunięty.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        raw = config.RAW_DIR / (target.stem + ".png")
+        for p in (target, raw):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                show_toast(self, f"Nie usunięto {p.name}: {exc}", "error")
+                return
+        key = f"{suit_nazwa}:{value}"
+        if self.selections.get(key) == path:
+            self.selections.pop(key, None)
+        self._after_card_files_changed(suit_nazwa, value)
+        self.deck.mark_dirty()
+        if self._lightbox is not None:
+            self._lightbox.refresh()
+
+    def _on_lightbox_restamp(self, suit_nazwa: str, value: str) -> None:
+        """Przestemplowanie wszystkich wariantów jednej karty (bez API)."""
+        suit = Suit.from_nazwa(suit_nazwa)
+        targets = []
+        for p in self._card_variants(suit_nazwa, value):
+            variant = 1
+            if "_v" in p.stem:
+                try:
+                    variant = int(p.stem.rsplit("_v", 1)[1])
+                except ValueError:
+                    pass
+            targets.append(CardSpec(value=value, suit=suit, variant=variant))
+        self._start_restamp(targets)
+
+    def _open_in_folder(self, path: str) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
 
     def _on_photo_deleted(self, path: str) -> None:
         """Zdjęcie usunięte z galerii — czyścimy karty, które go używały."""

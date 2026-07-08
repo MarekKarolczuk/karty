@@ -93,6 +93,11 @@ class CardSlot(QFrame):
         self.chip.adjustSize()
         self.chip.move(max(6, round(14 * scale)), max(6, round(14 * scale)))
 
+        # badge liczby wariantów (prawy górny róg, widoczny gdy > 1)
+        self.badge = QLabel("", self)
+        self.badge.setObjectName("variantBadge")
+        self.badge.hide()
+
         self._shadow = QGraphicsDropShadowEffect(self)
         self._shadow.setBlurRadius(16)
         self._shadow.setOffset(0, 4)
@@ -137,6 +142,17 @@ class CardSlot(QFrame):
         self.setToolTip(f"✔ {path}")
         self._refresh_image()
         self._repolish()
+
+    def set_variant_count(self, count: int) -> None:
+        """Badge z liczbą wariantów karty — pokazywany tylko gdy > 1."""
+        if count > 1:
+            self.badge.setText(f"×{count}")
+            self.badge.adjustSize()
+            self.badge.move(self._w - self.badge.width() - 6, 6)
+            self.badge.show()
+            self.badge.raise_()
+        else:
+            self.badge.hide()
 
     def set_error(self, message: str) -> None:
         self.setProperty("state", "error")

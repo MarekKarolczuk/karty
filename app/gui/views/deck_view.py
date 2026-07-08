@@ -17,7 +17,7 @@ from app.core import style_store
 from app.core.models import Suit
 from app.gui.card_grid import CardGrid
 from app.gui.views import view_header
-from app.gui.widgets import SegmentedControl, ZoomDialog
+from app.gui.widgets import SegmentedControl
 
 ROW_SCALE = 0.56   # kompaktowe sloty, żeby 13 kart mieściło się w wierszu
 
@@ -27,6 +27,8 @@ class DeckView(QWidget):
     edit_values_clicked = pyqtSignal()
     deck_name_changed = pyqtSignal(str)
     restamp_clicked = pyqtSignal()             # przestempluj narożniki (bez API)
+    lightbox_requested = pyqtSignal(str, str)  # suit_nazwa, value (karta z wariantami)
+    preview_file_requested = pyqtSignal(str)   # pojedynczy plik (historia/backup)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,20 +202,33 @@ class DeckView(QWidget):
         for suit, row in self._rows.items():
             row.setVisible(selected is None or suit is selected)
 
+    def current_filter(self) -> Suit | None:
+        """Aktywny filtr koloru siatki (None = wszystkie) — dla nawigacji
+        ↑/↓ w lightboxie."""
+        index = self.suit_seg.current()
+        return None if index == 0 else list(Suit)[index - 1]
+
     # --- lightbox + odświeżanie ------------------------------------------------------
     def _zoom_slot(self, slot) -> None:
-        """Kliknięcie karty w siatce = powiększenie (lightbox).
-
-        Pokazuje wygenerowaną kartę, a jeśli jej nie ma — przypisane zdjęcie
-        lub szablon tła."""
-        target = slot.generated_path or slot.photo_path or slot.suit.template_path
+        """Kliknięcie karty w siatce = lightbox z wariantami (obsługiwany
+        w MainWindow); karta bez wygenerowanych plików = prosty podgląd
+        zdjęcia/szablonu."""
+        if slot.generated_path is not None:
+            self.lightbox_requested.emit(slot.suit.nazwa, slot.value)
+            return
+        target = slot.photo_path or slot.suit.template_path
         if target and Path(target).exists():
-            ZoomDialog(target, self).exec()
+            self.preview_file_requested.emit(str(target))
 
     def set_variant_resolver(self, resolver) -> None:
         """Callback (suit_nazwa, value) -> Path|None zwracający WYBRANY wariant
         karty. Dostarcza go MainWindow (zna metadane selekcji)."""
         self._variant_resolver = resolver
+
+    def set_variant_counter(self, counter) -> None:
+        """Callback (suit_nazwa, value) -> int z liczbą wariantów karty —
+        zasila badge'e na miniaturach siatki."""
+        self._variant_counter = counter
 
     def mark_dirty(self) -> None:
         """Podgląd talii/historia wymaga odświeżenia (zmiana w output/).
@@ -221,12 +236,15 @@ class DeckView(QWidget):
         Uzupełnia sloty siatki o WYBRANY wariant karty i — jeśli sekcja
         Historia jest aktywna — odświeża listę."""
         resolver = getattr(self, "_variant_resolver", None)
+        counter = getattr(self, "_variant_counter", None)
         if resolver is not None:
             for suit, grid in self.grids.items():
                 for value, slot in grid.slots.items():
                     chosen = resolver(suit.nazwa, value)
                     if chosen is not None and slot.generated_path != chosen:
                         slot.set_generated(chosen)
+                    if counter is not None:
+                        slot.set_variant_count(counter(suit.nazwa, value))
         # pusty stan siatki: brak jakiejkolwiek wygenerowanej karty
         any_generated = any(
             slot.generated_path is not None
@@ -270,4 +288,4 @@ class DeckView(QWidget):
     def _zoom_history_item(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.ItemDataRole.UserRole)
         if path and Path(path).exists():
-            ZoomDialog(path, self).exec()
+            self.preview_file_requested.emit(str(path))
