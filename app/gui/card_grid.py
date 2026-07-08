@@ -4,7 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QRectF, QVariantAnimation, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap
+from PyQt6.QtGui import QColor, QGuiApplication, QImageReader, QPainter, \
+    QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
     QFrame, QGraphicsDropShadowEffect, QGridLayout, QLabel, QWidget,
 )
@@ -189,10 +190,16 @@ class CardSlot(QFrame):
 
     def enterEvent(self, event):  # noqa: N802 (API Qt) — efekt „uniesienia”
         self._animate_lift(True)
+        grid = self.parentWidget()
+        if hasattr(grid, "_set_hovered_slot"):
+            grid._set_hovered_slot(self)
         super().enterEvent(event)
 
     def leaveEvent(self, event):  # noqa: N802
         self._animate_lift(False)
+        grid = self.parentWidget()
+        if hasattr(grid, "_set_hovered_slot"):
+            grid._set_hovered_slot(None)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):  # noqa: N802
@@ -222,8 +229,51 @@ class CardSlot(QFrame):
         event.acceptProposedAction()
 
 
+class _PeekOverlay(QLabel):
+    """Lekki podgląd przelotny (peek): przytrzymanie Spacji nad kartą w siatce
+    pokazuje powiększenie, puszczenie chowa. ToolTip-window = zero kradzieży
+    focusu, bez wchodzenia w pełny lightbox."""
+
+    _instance: "_PeekOverlay | None" = None
+
+    @classmethod
+    def instance(cls) -> "_PeekOverlay":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.ToolTip
+                         | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet(
+            "background: #14100B; border: 1px solid #4A3F2C; "
+            "border-radius: 12px; padding: 10px;")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def show_for(self, path: Path) -> None:
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        max_h = round(avail.height() * 0.7) if avail else 700
+        max_w = round(avail.width() * 0.7) if avail else 900
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid():
+            reader.setScaledSize(size.scaled(
+                max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio))
+        self.setPixmap(QPixmap.fromImage(reader.read()))
+        self.adjustSize()
+        if avail is not None:
+            self.move(avail.center() - self.rect().center())
+        self.show()
+        self.raise_()
+
+
 class CardGrid(QWidget):
-    """Siatka slotów dla jednego koloru; sloty tworzone z listy wartości."""
+    """Siatka slotów dla jednego koloru; sloty tworzone z listy wartości.
+
+    Peek: przytrzymanie Spacji nad kartą pokazuje szybkie powiększenie
+    (siatka przejmuje focus po najechaniu myszą)."""
 
     slot_clicked = pyqtSignal(object)          # CardSlot
     slot_right_clicked = pyqtSignal(object)    # CardSlot
@@ -236,11 +286,44 @@ class CardGrid(QWidget):
         self._columns = columns
         self._scale = scale
         self._droppable = droppable
+        self._hovered: CardSlot | None = None
         self.slots: dict[str, CardSlot] = {}
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._layout = QGridLayout(self)
         self._layout.setSpacing(spacing)
         self._layout.setContentsMargins(4, 4, 4, 4)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+    # --- peek Spacją ------------------------------------------------------------
+    def _set_hovered_slot(self, slot: "CardSlot | None") -> None:
+        self._hovered = slot
+
+    def enterEvent(self, event):  # noqa: N802 — Spacja działa po najechaniu
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().enterEvent(event)
+
+    def keyPressEvent(self, event):  # noqa: N802
+        if (event.key() == Qt.Key.Key_Space and not event.isAutoRepeat()
+                and self._hovered is not None):
+            slot = self._hovered
+            target = slot.generated_path or slot.photo_path
+            if target is None:
+                try:
+                    target = slot.suit.template_path
+                except FileNotFoundError:
+                    target = None
+            if target is not None and Path(target).exists():
+                _PeekOverlay.instance().show_for(Path(target))
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):  # noqa: N802
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            _PeekOverlay.instance().hide()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def rebuild(self, values: list[str], assignments: dict[str, str]) -> None:
         """Odtwarza sloty dla podanych wartości, zachowując istniejące przypisania."""

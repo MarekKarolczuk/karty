@@ -7,10 +7,10 @@ from pathlib import Path
 from PyQt6.QtCore import (
     QEasingCurve, QPoint, QPropertyAnimation, QRectF, QTimer, Qt, pyqtSignal,
 )
-from PyQt6.QtGui import QGuiApplication, QImageReader, QPainter, QPainterPath, QPixmap
+from PyQt6.QtGui import QImageReader, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
-    QButtonGroup, QDialog, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-    QPushButton, QVBoxLayout, QWidget,
+    QButtonGroup, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
+    QPushButton, QWidget,
 )
 
 
@@ -140,45 +140,5 @@ def show_toast(parent: QWidget, text: str, kind: str = "info") -> None:
     Toast(parent, text, kind)
 
 
-class ZoomDialog(QDialog):
-    """Powiększony podgląd karty/pliku: ciemne tło, zamykanie kliknięciem/Esc."""
-
-    def __init__(self, path: Path | str, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint
-                            | Qt.WindowType.Dialog)
-        self.setModal(True)
-        self.setStyleSheet("background: rgba(12, 9, 6, 235);")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        screen = QGuiApplication.primaryScreen()
-        avail = screen.availableGeometry() if screen else None
-        max_w = round(avail.width() * 0.9) if avail is not None else 1200
-        max_h = round(avail.height() * 0.9) if avail is not None else 800
-
-        reader = QImageReader(str(path))
-        reader.setAutoTransform(True)
-        size = reader.size()
-        if size.isValid():
-            scaled = size.scaled(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio)
-            reader.setScaledSize(scaled)
-        pixmap = QPixmap.fromImage(reader.read())
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 16)
-        layout.setSpacing(8)
-        image = QLabel()
-        image.setPixmap(pixmap)
-        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(image, stretch=1)
-        caption = QLabel(f"{Path(path).name}   ·   kliknij albo Esc, aby zamknąć")
-        caption.setStyleSheet("color: #B9AC98; background: transparent;")
-        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(caption)
-        self.adjustSize()
-        if avail is not None:
-            self.move(avail.center() - self.rect().center())
-
-    def mousePressEvent(self, event):  # noqa: N802 (API Qt)
-        self.accept()
-        super().mousePressEvent(event)
+# ZoomDialog usunięty — powiększenia obsługuje CardLightbox (app/gui/lightbox.py):
+# tryb wariantów w Taliach i tryb single dla pojedynczych plików.

@@ -12,16 +12,92 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QEasingCurve, QPropertyAnimation, QRectF, QSize, Qt, QVariantAnimation,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QGuiApplication, QIcon, QImageReader, QPixmap
 from PyQt6.QtWidgets import (
-    QButtonGroup, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QDialog, QFrame, QGraphicsPixmapItem, QGraphicsScene,
+    QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from app.gui.widgets import cover_pixmap
 
 THUMB_W, THUMB_H = 64, 90
+MAX_ZOOM = 4.0
+ANIM_MS = 120     # standard: animacje lightboxa ≤ 120 ms
+
+
+class ZoomableImage(QGraphicsView):
+    """Podgląd obrazu z zoomem: kółko = skala 1.0–4.0 wokół kursora,
+    przeciąganie przesuwa przy skali > 100%, dwuklik = animowany reset.
+    Klik w obraz jest konsumowany tutaj — NIE zamyka lightboxa."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self._item = QGraphicsPixmapItem()
+        self._item.setTransformationMode(
+            Qt.TransformationMode.SmoothTransformation)
+        self._scene.addItem(self._item)
+        self.setScene(self._scene)
+        self._zoom = 1.0
+
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self._reset_anim = QVariantAnimation(self)
+        self._reset_anim.setDuration(ANIM_MS)
+        self._reset_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reset_anim.valueChanged.connect(self._apply_zoom)
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
+        self._reset_anim.stop()
+        self._item.setPixmap(pixmap)
+        self._scene.setSceneRect(QRectF(pixmap.rect()))
+        self._apply_zoom(1.0)
+
+    def _apply_zoom(self, zoom: float) -> None:
+        """Skala absolutna: fit-to-view (=100%) pomnożony przez zoom."""
+        self._zoom = max(1.0, min(float(zoom), MAX_ZOOM))
+        if self._item.pixmap().isNull():
+            return
+        self.resetTransform()
+        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+        if self._zoom > 1.0:
+            self.scale(self._zoom, self._zoom)
+        self.setDragMode(
+            QGraphicsView.DragMode.ScrollHandDrag if self._zoom > 1.0
+            else QGraphicsView.DragMode.NoDrag)
+
+    def wheelEvent(self, event):  # noqa: N802 (API Qt)
+        factor = 1.18 if event.angleDelta().y() > 0 else 1 / 1.18
+        self._reset_anim.stop()
+        self._apply_zoom(self._zoom * factor)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        self._reset_anim.stop()
+        self._reset_anim.setStartValue(self._zoom)
+        self._reset_anim.setEndValue(1.0)
+        self._reset_anim.start()
+        event.accept()
+
+    def mousePressEvent(self, event):  # noqa: N802 — klik w obraz nie zamyka
+        super().mousePressEvent(event)
+        event.accept()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_zoom(self._zoom)
 
 
 @dataclass
@@ -90,10 +166,8 @@ class CardLightbox(QDialog):
         top.addWidget(self.close_btn)
         layout.addLayout(top)
 
-        # --- obraz -------------------------------------------------------------
-        self.image = QLabel()
-        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image.setStyleSheet("background: transparent;")
+        # --- obraz (zoom kółkiem, pan przy >100%, dwuklik = reset) -----------
+        self.image = ZoomableImage()
         layout.addWidget(self.image, stretch=1)
 
         # --- pasek miniatur wariantów -------------------------------------------
@@ -145,7 +219,29 @@ class CardLightbox(QDialog):
             self.actions_host.hide()
         if avail is not None:
             self.move(avail.center() - self.rect().center())
+
+        # animacja otwarcia: fade 0 → 1 (≤ 120 ms)
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(ANIM_MS)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+
         self.refresh()
+
+    def showEvent(self, event):  # noqa: N802 (API Qt)
+        self.setWindowOpacity(0.0)
+        self._fade.start()
+        super().showEvent(event)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        """Klik w przyciemnione TŁO zamyka; klik w obraz/panele — nie
+        (ZoomableImage i przyciski konsumują swoje kliknięcia same)."""
+        child = self.childAt(event.position().toPoint())
+        if child is None or child in (self.title_label, self.counter_label):
+            self.reject()
+            return
+        super().mousePressEvent(event)
 
     # ------------------------------------------------------------- stan / dane
     def _variants(self) -> list[Path]:
@@ -177,16 +273,11 @@ class CardLightbox(QDialog):
         if path is None:
             return
         variants = self._variants()
-        # obraz przeskalowany do dostępnego pola (QImageReader = szybki odczyt)
+        # pełna rozdzielczość — ZoomableImage skaluje do widoku, a zapas
+        # pikseli obsługuje zoom do 400%
         reader = QImageReader(str(path))
         reader.setAutoTransform(True)
-        max_w = max(200, self.width() - 60)
-        max_h = max(200, self.height() - 260)
-        size = reader.size()
-        if size.isValid():
-            reader.setScaledSize(size.scaled(
-                max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio))
-        self.image.setPixmap(QPixmap.fromImage(reader.read()))
+        self.image.set_pixmap(QPixmap.fromImage(reader.read()))
 
         if self._single:
             self.title_label.setText(Path(path).name)
