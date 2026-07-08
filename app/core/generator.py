@@ -74,13 +74,12 @@ def _popout_card(spec: CardSpec, template_size: tuple[int, int]) -> Image.Image:
     # szablonu — grawerowane tło zostaje piksel-w-piksel nietknięte.
     template = Image.open(spec.suit.template_path).convert("RGB")
     popout_full = masks.get_popout_mask(spec.suit.template_path)
-    result = Image.composite(result, template, popout_full)
-    # Wartości narożne zawsze lokalnie — 100% spójności (serif, pion, #801515)
-    return compositor.draw_corners(result, spec)
+    return Image.composite(result, template, popout_full)
 
 
-def _build_card(spec: CardSpec) -> Image.Image:
-    """Buduje obraz karty (bez zapisu) — wspólny rdzeń generate_card/generate_sample."""
+def _build_card_raw(spec: CardSpec) -> Image.Image:
+    """Buduje SUROWY obraz karty (bez narożników, bez zapisu) — AI nie rysuje
+    tekstu; narożniki stempluje potem compositor.stempluj_narozniki()."""
     if spec.photo_path is None:
         raise ValueError(f"Karta {spec.label} nie ma przypisanego zdjęcia")
 
@@ -90,22 +89,28 @@ def _build_card(spec: CardSpec) -> Image.Image:
         return _popout_card(spec, template.size)
     # GenMode.FULL_AI — wymaga dwóch obrazów wejściowych, tylko Gemini
     if _fake_api():
-        return compositor.compose_card(spec, _fake_illustration(spec.photo_path))
+        return compositor.compose_card_raw(spec, _fake_illustration(spec.photo_path))
     if _provider() != "gemini":
         raise ValueError(
             "Tryb Pełne AI wymaga modelu Gemini (Stability przyjmuje jeden "
             "obraz wejściowy) — przełącz model albo użyj trybu pop-out"
         )
-    prompt = prompts.full_card_prompt(
-        spec.value, spec.suit.symbol, prompts.SUIT_NAME_EN[spec.suit.nazwa]
-    )
-    return gemini_client.compose_full_card(template, spec.photo_path, prompt)
+    prompt = prompts.full_card_prompt(prompts.SUIT_NAME_EN[spec.suit.nazwa])
+    result = gemini_client.compose_full_card(template, spec.photo_path, prompt)
+    if result.size != template.size:
+        result = result.resize(template.size, Image.Resampling.LANCZOS)
+    # Model mimo zakazu potrafi narysować coś w tarczach — twardy reset
+    tmasks = masks.get_masks(spec.suit.template_path)
+    return compositor.wyczysc_tarcze(result, template, tmasks)
 
 
 def generate_card(spec: CardSpec) -> Path:
-    """Generuje jedną kartę i zapisuje do output/. Zwraca ścieżkę pliku."""
-    card = _build_card(spec)
+    """Generuje jedną kartę: surowe wyjście AI do output/_raw/ (PNG), finalna
+    karta (raw + narożniki) do output/. Zwraca ścieżkę finalnego pliku."""
+    raw = _build_card_raw(spec)
     template = Image.open(spec.suit.template_path).convert("RGB")
+    compositor.save_raw(raw, spec, template.size)
+    card = compositor.stempluj_narozniki(raw, spec)
     compositor.save_card(card, spec, template.size)
     return spec.output_path
 
@@ -113,7 +118,30 @@ def generate_card(spec: CardSpec) -> Path:
 def generate_sample(spec: CardSpec) -> Image.Image:
     """Generuje pojedynczą kartę PODGLĄDU — zwraca obraz, NIE zapisuje do output/
     (nie zaśmieca historii ani wariantów)."""
-    return _build_card(spec)
+    return compositor.stempluj_narozniki(_build_card_raw(spec), spec)
+
+
+def przestempluj_plik(spec: CardSpec) -> Path:
+    """Przestemplowuje narożniki karty BEZ wywołań API: czyta surowy PNG
+    z output/_raw/ (fallback dla starych kart bez raw: finalny .jpg z twardym
+    resetem tarcz z szablonu), stempluje wg aktywnego presetu „wartosci"
+    i nadpisuje finalny plik."""
+    template = Image.open(spec.suit.template_path).convert("RGB")
+    if spec.raw_path.exists():
+        raw = Image.open(spec.raw_path).convert("RGB")
+        if raw.size != template.size:
+            raw = raw.resize(template.size, Image.Resampling.LANCZOS)
+    elif spec.output_path.exists():
+        stary = Image.open(spec.output_path).convert("RGB")
+        if stary.size != template.size:
+            stary = stary.resize(template.size, Image.Resampling.LANCZOS)
+        tmasks = masks.get_masks(spec.suit.template_path)
+        raw = compositor.wyczysc_tarcze(stary, template, tmasks)
+    else:
+        raise FileNotFoundError(f"Brak pliku karty {spec.label} do przestemplowania")
+    card = compositor.stempluj_narozniki(raw, spec)
+    compositor.save_card(card, spec, template.size)
+    return spec.output_path
 
 
 def _fit_card_ratio(img: Image.Image, landscape: bool = False) -> Image.Image:

@@ -34,7 +34,8 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.workspace_view import WorkspaceView
 from app.gui.widgets import show_toast
 from app.gui.worker import (
-    BackWorker, ExportWorker, GenerationWorker, SampleWorker, TemplateWorker,
+    BackWorker, ExportWorker, GenerationWorker, RestampWorker, SampleWorker,
+    TemplateWorker,
 )
 
 class MainWindow(QMainWindow):
@@ -72,6 +73,7 @@ class MainWindow(QMainWindow):
         self.back_worker: BackWorker | None = None
         self.export_worker: ExportWorker | None = None
         self.sample_worker: SampleWorker | None = None
+        self.restamp_worker: RestampWorker | None = None
         self.deck_name: str = "Rodzinna talia"
 
         root = QWidget()
@@ -154,6 +156,7 @@ class MainWindow(QMainWindow):
         ws.transform_committed.connect(self._on_transform_committed)
         ws.history_navigate.connect(self._on_history_navigate)
         ws.history_set_main.connect(self._on_history_set_main)
+        ws.restamp_clicked.connect(self._start_restamp)
 
         self.photo_library.photo_deleted.connect(self._on_photo_deleted)
         self.photo_library.photos_imported.connect(self._on_photos_imported)
@@ -163,6 +166,7 @@ class MainWindow(QMainWindow):
         self.deck.slot_right_clicked.connect(self._on_slot_menu)
         self.deck.edit_values_clicked.connect(self._edit_values)
         self.deck.deck_name_changed.connect(self._on_deck_name_changed)
+        self.deck.restamp_clicked.connect(self._start_restamp)
 
         gen = self.generation
         gen.generate_clicked.connect(self._start_generation)
@@ -607,6 +611,59 @@ class MainWindow(QMainWindow):
             self._refresh_history(suit_nazwa, value)
         self._save_project()
 
+    # -------------------------------------------------- przestemplowanie narożników
+    def _collect_restamp_targets(self) -> list[CardSpec]:
+        """CardSpec dla KAŻDEGO istniejącego pliku karty (wszystkie warianty)."""
+        targets: list[CardSpec] = []
+        for suit in Suit:
+            for value in self._values():
+                for path in self._card_variants(suit.nazwa, value):
+                    variant = 1
+                    stem = path.stem
+                    if "_v" in stem:
+                        try:
+                            variant = int(stem.rsplit("_v", 1)[1])
+                        except ValueError:
+                            pass
+                    targets.append(CardSpec(value=value, suit=suit, variant=variant))
+        return targets
+
+    def _start_restamp(self) -> None:
+        """Przestemplowuje narożniki wszystkich wygenerowanych kart wg aktywnego
+        presetu „wartości narożne" — czyta output/_raw/, ZERO wywołań API."""
+        if self.restamp_worker is not None:
+            return
+        targets = self._collect_restamp_targets()
+        if not targets:
+            show_toast(self, "Brak wygenerowanych kart do przestemplowania", "info")
+            return
+        self._set_status(f"Przestemplowuję narożniki: 0 / {len(targets)}…")
+        worker = RestampWorker(targets)
+        worker.progress.connect(
+            lambda i, n: self._set_status(f"Przestemplowuję narożniki: {i} / {n}…")
+        )
+        worker.done.connect(self._on_restamp_done)
+        worker.failed.connect(
+            lambda msg: show_toast(self, f"Błąd przestemplowania: {msg}", "error")
+        )
+        self.restamp_worker = worker
+        worker.start()
+
+    def _on_restamp_done(self, ok: int, errors: int) -> None:
+        self.restamp_worker = None
+        # te same ścieżki plików — set_generated wymusza ponowny odczyt pikseli
+        for grid in self.grids.values():
+            for slot in grid.slots.values():
+                if slot.generated_path is not None:
+                    slot.set_generated(slot.generated_path)
+        self.gallery.mark_dirty()
+        self._refresh_history(self._current_suit.nazwa, self._current_value)
+        self._set_status(f"Przestemplowano narożniki: {ok} kart"
+                         + (f", błędy: {errors}" if errors else ""))
+        show_toast(self, f"Przestemplowano {ok} kart (bez API)"
+                   + (f" · błędów: {errors}" if errors else ""),
+                   "error" if errors and not ok else "ok")
+
     def _on_photo_deleted(self, path: str) -> None:
         """Zdjęcie usunięte z galerii — czyścimy karty, które go używały."""
         removed = [k for k, v in self.assignments.items() if v == path]
@@ -948,6 +1005,9 @@ class MainWindow(QMainWindow):
         elif cat == "rewers":
             self.back_view.refresh_back_preview()
             self.gallery.mark_dirty()
+        elif cat == "wartosci":
+            show_toast(self, "Preset wartości aktywny — „Przestempluj narożniki” "
+                             "naniesie go na istniejące karty (bez API)", "info")
         self.settings_view.refresh_prompt()
         self._save_project()
 

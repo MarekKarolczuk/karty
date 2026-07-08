@@ -26,6 +26,7 @@ class DeckView(QWidget):
     slot_right_clicked = pyqtSignal(object)    # CardSlot (menu zarządzania)
     edit_values_clicked = pyqtSignal()
     deck_name_changed = pyqtSignal(str)
+    restamp_clicked = pyqtSignal()             # przestempluj narożniki (bez API)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -55,6 +56,16 @@ class DeckView(QWidget):
         values_btn.setToolTip("Zmień listę wartości talii (np. A, K, Q, J, 10)")
         values_btn.clicked.connect(self.edit_values_clicked.emit)
         top.addWidget(values_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        restamp_btn = QPushButton("♻ Przestempluj narożniki")
+        restamp_btn.setObjectName("ghostBtn")
+        restamp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        restamp_btn.setToolTip(
+            "Nanosi wartości i symbole narożne na wszystkie wygenerowane "
+            "karty wg presetu „wartości narożne” — bez wywołań API"
+        )
+        restamp_btn.clicked.connect(self.restamp_clicked.emit)
+        top.addWidget(restamp_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
         self.section_seg = SegmentedControl(["▦ Siatka", "🕓 Historia"])
         self.section_seg.changed.connect(self._on_section_changed)

@@ -194,8 +194,10 @@ QLabel#propValue {{ color: {TEXT_BRIGHT}; font-size: 13px; }}
 QLabel#mutedInfo {{ color: {MUTED_2}; font-size: 12px; }}
 
 /* ---------- ekran roboczy: nagłówek karty + właściwości ---------- */
+/* cyfry w licznikach: font UI (Archivo) ma lining figures — serif Cormorant
+   renderuje old-style („10" wygląda jak „1o") */
 QLabel#cardBigValue {{
-    font-family: {SERIF};
+    font-family: {UI_FAMILY};
     font-size: 34px;
     font-weight: bold;
 }}
@@ -298,7 +300,7 @@ QWidget#statCard {{
     border-radius: 10px;
 }}
 QLabel#statNumber {{
-    font-family: {SERIF};
+    font-family: {UI_FAMILY};
     font-size: 22px;
     font-weight: bold;
     color: {TEXT_BRIGHT};
@@ -306,13 +308,13 @@ QLabel#statNumber {{
 QLabel#statNumber[tone="ok"] {{ color: {GREEN}; }}
 QLabel#statNumber[tone="warn"] {{ color: {GOLD}; }}
 QLabel#bigCounter {{
-    font-family: {SERIF};
+    font-family: {UI_FAMILY};
     font-size: 40px;
     font-weight: bold;
     color: {TEXT_BRIGHT};
 }}
 QLabel#bigPercentAccent {{
-    font-family: {SERIF};
+    font-family: {UI_FAMILY};
     font-size: 34px;
     font-weight: bold;
     color: {ACCENT_HOVER};

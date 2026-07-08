@@ -14,6 +14,7 @@ ZDJECIA_DIR = ROOT / "zdjecia"
 TLA_DIR = ROOT / "tla_kart"          # LEGACY — tylko jednorazowa migracja do Style/
 REFERENCJE_DIR = ROOT / "Przykladowe_karty_fajne_ale_nie_spojne"
 OUTPUT_DIR = ROOT / "output"
+RAW_DIR = OUTPUT_DIR / "_raw"        # surowe wyjście AI (PNG, bez narożników)
 ASSETS_DIR = ROOT / "assets"
 MASKS_DIR = ASSETS_DIR / "masks"
 FONTS_DIR = ASSETS_DIR / "fonts"
@@ -27,7 +28,7 @@ STYLES_JSON = ROOT / "styles.json"   # STARY format (migrowany do Style/)
 # Każda kategoria to podfolder Style/<kategoria>/, a każdy preset to podfolder
 # z jego nazwą. Aktywny preset per kategoria zapisywany w Style/active.json.
 STYLE_ROOT = ROOT / "Style"
-STYLE_CATEGORIES = ("postac", "styl_tla", "tla_przodu", "rewers")
+STYLE_CATEGORIES = ("postac", "styl_tla", "tla_przodu", "rewers", "wartosci")
 STYLE_ACTIVE_JSON = STYLE_ROOT / "active.json"
 
 # --- API ---
@@ -161,13 +162,38 @@ def find_symbol_font() -> Path:
     return find_serif_font()
 
 
+def _ma_rowne_cyfry(path: Path) -> bool:
+    """Czy font ma cyfry o równej wysokości (lining figures)? Old-style
+    figures (np. Georgia) renderują „10" jak „1o" — takie fonty odpadają."""
+    try:
+        from PIL import ImageFont
+        boxes = [ImageFont.truetype(str(path), 64).getbbox(d)
+                 for d in "0123456789"]
+    except OSError:
+        return False
+    tops = [b[1] for b in boxes]
+    bottoms = [b[3] for b in boxes]
+    return max(tops) - min(tops) <= 5 and max(bottoms) - min(bottoms) <= 5
+
+
+_serif_font_cache: Path | None = None
+
+
 def find_serif_font() -> Path:
-    for candidate in SERIF_FONT_CANDIDATES:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "Nie znaleziono czcionki serif. Umieść plik .ttf w assets/fonts/."
+    """Czcionka serif do narożników kart — preferuje fonty z lining figures
+    (równe cyfry); wynik cache'owany na czas procesu."""
+    global _serif_font_cache
+    if _serif_font_cache is not None:
+        return _serif_font_cache
+    existing = [c for c in SERIF_FONT_CANDIDATES if c.exists()]
+    if not existing:
+        raise FileNotFoundError(
+            "Nie znaleziono czcionki serif. Umieść plik .ttf w assets/fonts/."
+        )
+    _serif_font_cache = next(
+        (c for c in existing if _ma_rowne_cyfry(c)), existing[0]
     )
+    return _serif_font_cache
 
 
 def dpi_for_template(width_px: int, height_px: int) -> tuple[float, float]:

@@ -163,6 +163,7 @@ class WorkspaceView(QWidget):
     transform_committed = pyqtSignal(str, str, dict)  # puszczenie suwaka → zapis
     history_navigate = pyqtSignal(str, str, int)      # suit, value, kierunek (-1/+1)
     history_set_main = pyqtSignal(str, str)           # ustaw bieżący wariant jako główny
+    restamp_clicked = pyqtSignal()                    # przestempluj narożniki (bez API)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -190,6 +191,15 @@ class WorkspaceView(QWidget):
         self.mask_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mask_btn.toggled.connect(self._toggle_mask_preview)
         top.addWidget(self.mask_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.restamp_btn = QPushButton("♻  Przestempluj narożniki")
+        self.restamp_btn.setObjectName("ghostBtn")
+        self.restamp_btn.setToolTip(
+            "Nanosi wartości i symbole narożne na wszystkie wygenerowane "
+            "karty wg presetu „wartości narożne” — bez wywołań API"
+        )
+        self.restamp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.restamp_btn.clicked.connect(self.restamp_clicked.emit)
+        top.addWidget(self.restamp_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         self.generate_btn = QPushButton("⚡  Generuj talię")
         self.generate_btn.setObjectName("generateBtn")
         self.generate_btn.setToolTip("Generuje wszystkie przypisane karty (Ctrl+G)")

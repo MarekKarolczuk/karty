@@ -8,16 +8,16 @@ import zipfile
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QVBoxLayout, QWidget,
+    QColorDialog, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from app import config
 from app.core import prompts, style_store
-from app.core.models import Suit
+from app.core.models import CardSpec, Suit
 from app.gui.animations import Spinner
 from app.gui.views import view_header
 from app.gui.widgets import (
@@ -76,6 +76,7 @@ class BackView(QWidget):
         layout.addWidget(self._build_template_panel())
         layout.addWidget(self._build_front_panel())
         layout.addWidget(self._build_back_panel())
+        layout.addWidget(self._build_wartosci_panel())
         layout.addStretch(1)
 
         scroll.setWidget(host)
@@ -232,6 +233,8 @@ class BackView(QWidget):
         elif cat == "rewers":
             self._reload_back_opis()
             self.refresh_back_preview()
+        elif cat == "wartosci":
+            self._reload_wartosci()
 
     def reload_style_slot(self) -> None:
         """Pełne odświeżenie wszystkich bibliotek (np. po wczytaniu projektu)."""
@@ -850,6 +853,203 @@ class BackView(QWidget):
         )
         if not busy:
             self.refresh_back_preview()
+
+    # ==================== SEKCJA: WARTOŚCI NAROŻNE ============================
+    def _build_wartosci_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(14, 12, 14, 12)
+        pl.setSpacing(8)
+
+        cap = QLabel("🔤  WARTOŚCI NAROŻNE (STEMPLOWANE LOKALNIE)")
+        cap.setObjectName("sectionTitle")
+        pl.addWidget(cap)
+        pl.addWidget(self._library_header("wartosci"))
+
+        hint = QLabel("Wartość i symbol w narożnikach rysuje program (nie AI) — "
+                      "identycznie na każdej karcie. Zmiany zastosujesz na "
+                      "istniejących kartach przyciskiem „Przestempluj narożniki” "
+                      "w Ekranie roboczym lub Taliach — bez zużywania API.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        pl.addWidget(hint)
+
+        self._wart_debounce = QTimer(self)
+        self._wart_debounce.setSingleShot(True)
+        self._wart_debounce.setInterval(400)
+        self._wart_debounce.timeout.connect(self._apply_wartosci)
+
+        # --- czcionka ---
+        font_row = QHBoxLayout()
+        font_row.setSpacing(6)
+        font_cap = QLabel("CZCIONKA")
+        font_cap.setObjectName("sideCaption")
+        font_row.addWidget(font_cap)
+        self.wart_font_label = QLabel()
+        self.wart_font_label.setObjectName("propValue")
+        font_row.addWidget(self.wart_font_label, stretch=1)
+        pick_font = QPushButton("📁 Wybierz plik (.ttf)")
+        pick_font.setObjectName("ghostBtn")
+        pick_font.setCursor(Qt.CursorShape.PointingHandCursor)
+        pick_font.clicked.connect(self._pick_wartosci_font)
+        font_row.addWidget(pick_font)
+        reset_font = QPushButton("↺")
+        reset_font.setObjectName("ghostBtn")
+        reset_font.setToolTip("Wróć do domyślnej czcionki serif")
+        reset_font.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_font.clicked.connect(self._reset_wartosci_font)
+        font_row.addWidget(reset_font)
+        pl.addLayout(font_row)
+
+        # --- rozmiary / offsety (spinboxy w dwóch rzędach) ---
+        self._wart_spins: dict[str, QSpinBox] = {}
+        rows = (
+            (("rozmiar_wartosci", "Rozmiar wartości", 10, 90),
+             ("rozmiar_symbolu", "Rozmiar symbolu", 10, 90),
+             ("odstep", "Odstęp wartość↔symbol", 10, 80)),
+            (("offset_x", "Offset X", -30, 30),
+             ("offset_y", "Offset Y", -30, 30)),
+        )
+        for row_def in rows:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            for field, label, lo, hi in row_def:
+                lab = QLabel(label.upper())
+                lab.setObjectName("sideCaption")
+                row.addWidget(lab)
+                spin = QSpinBox()
+                spin.setRange(lo, hi)
+                spin.setSuffix(" %")
+                spin.valueChanged.connect(
+                    lambda _v: self._wart_debounce.start())
+                self._wart_spins[field] = spin
+                row.addWidget(spin)
+            row.addStretch(1)
+            pl.addLayout(row)
+
+        # --- kolory ---
+        self._wart_colors: dict[str, str] = {}
+        color_row = QHBoxLayout()
+        color_row.setSpacing(6)
+        self._wart_color_btns: dict[str, QPushButton] = {}
+        for field, label in (("kolor_czerwony", "Kolor kier / karo"),
+                             ("kolor_czarny", "Kolor pik / trefl")):
+            lab = QLabel(label.upper())
+            lab.setObjectName("sideCaption")
+            color_row.addWidget(lab)
+            btn = QPushButton()
+            btn.setFixedSize(64, 26)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip("Kliknij, aby wybrać kolor")
+            btn.clicked.connect(lambda _=False, f=field: self._pick_wartosci_color(f))
+            self._wart_color_btns[field] = btn
+            color_row.addWidget(btn)
+        color_row.addStretch(1)
+        pl.addLayout(color_row)
+
+        # --- podgląd tarcz (kier + pik) ---
+        prev_row = QHBoxLayout()
+        prev_row.setSpacing(10)
+        self._wart_previews: dict[str, QLabel] = {}
+        for suit in (Suit.KIER, Suit.PIK):
+            box = QLabel()
+            box.setObjectName("well")
+            box.setFixedSize(96, 120)
+            box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            box.setScaledContents(False)
+            self._wart_previews[suit.nazwa] = box
+            prev_row.addWidget(box)
+        prev_hint = QLabel("Podgląd tarczy narożnej\n(„10” pokazuje równość cyfr).")
+        prev_hint.setObjectName("hint")
+        prev_row.addWidget(prev_hint)
+        prev_row.addStretch(1)
+        pl.addLayout(prev_row)
+
+        self._reload_wartosci()
+        return panel
+
+    def _reload_wartosci(self) -> None:
+        """Ustawia kontrolki wg aktywnego presetu „wartosci" (bez emitowania)."""
+        czcionka = style_store.text("wartosci", "czcionka").strip()
+        self.wart_font_label.setText(czcionka or "domyślna (serif systemowy)")
+        for field, spin in self._wart_spins.items():
+            spin.blockSignals(True)
+            try:
+                spin.setValue(round(float(
+                    style_store.text("wartosci", field).replace(",", "."))))
+            except ValueError:
+                pass
+            spin.blockSignals(False)
+        for field, btn in self._wart_color_btns.items():
+            value = style_store.text("wartosci", field).strip()
+            self._wart_colors[field] = value
+            btn.setStyleSheet(
+                f"background: {value}; border: 1px solid #555; border-radius: 6px;"
+            )
+        self._refresh_wartosci_preview()
+
+    def _apply_wartosci(self) -> None:
+        """Debounce spinów → zapis pól liczbowych do presetu + podgląd."""
+        for field, spin in self._wart_spins.items():
+            style_store.set_text("wartosci", field, str(spin.value()))
+        self._refresh_wartosci_preview()
+        self.character_changed.emit()
+
+    def _pick_wartosci_font(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Wybierz czcionkę wartości", r"C:\Windows\Fonts",
+            "Czcionki (*.ttf *.otf)",
+        )
+        if not path:
+            return
+        try:
+            name = style_store.save_font_file("wartosci", Path(path))
+        except OSError as exc:
+            show_toast(self, f"Nie skopiowano czcionki: {exc}", "error")
+            return
+        style_store.set_text("wartosci", "czcionka", name)
+        self.wart_font_label.setText(name)
+        self._refresh_wartosci_preview()
+        self.character_changed.emit()
+
+    def _reset_wartosci_font(self) -> None:
+        style_store.set_text("wartosci", "czcionka", "")
+        self.wart_font_label.setText("domyślna (serif systemowy)")
+        self._refresh_wartosci_preview()
+        self.character_changed.emit()
+
+    def _pick_wartosci_color(self, field: str) -> None:
+        initial = QColor(self._wart_colors.get(field) or "#801515")
+        color = QColorDialog.getColor(initial, self, "Kolor wartości narożnych")
+        if not color.isValid():
+            return
+        hex_value = color.name()
+        self._wart_colors[field] = hex_value
+        style_store.set_text("wartosci", field, hex_value)
+        self._wart_color_btns[field].setStyleSheet(
+            f"background: {hex_value}; border: 1px solid #555; border-radius: 6px;"
+        )
+        self._refresh_wartosci_preview()
+        self.character_changed.emit()
+
+    def _refresh_wartosci_preview(self) -> None:
+        """Podgląd tarczy TL („10" kier i pik) ostemplowanej bieżącym stylem."""
+        from app.core import compositor, masks
+        for suit in (Suit.KIER, Suit.PIK):
+            box = self._wart_previews[suit.nazwa]
+            try:
+                tpath = suit.template_path
+                tmasks = masks.get_masks(tpath)
+                from PIL import Image
+                template = Image.open(tpath).convert("RGB")
+                spec = CardSpec(value="10", suit=suit)
+                card = compositor.stempluj_narozniki(template, spec, tmasks=tmasks)
+                crop = card.crop(tmasks.tl_box)
+                crop.thumbnail((92, 116), Image.Resampling.LANCZOS)
+                box.setPixmap(pil_to_pixmap(crop))
+            except (FileNotFoundError, RuntimeError, OSError):
+                box.setText("brak\nszablonu")
 
     # --- API dla MainWindow ---------------------------------------------------
     def settings(self) -> dict:

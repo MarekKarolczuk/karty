@@ -18,7 +18,8 @@ from PIL import Image
 from app import config
 
 # Wersja algorytmu masek — podbicie unieważnia wszystkie cache na dysku
-MASK_VERSION = 2
+# (v3: narożniki stemplowane wyłącznie lokalnie — patrz compositor)
+MASK_VERSION = 3
 
 # Tolerancja flood-filla: PIL-owe thresh=90 to suma |diff| po kanałach,
 # czyli ~30 na kanał w cv2 (FLOODFILL_FIXED_RANGE porównuje do seeda).
@@ -121,8 +122,9 @@ def _shield_box(img: np.ndarray, seed_rel: tuple[float, float],
 
 
 def _cleanup_old_cache(stem: str) -> None:
-    """Usuwa niewersjonowane cache sprzed MASK_VERSION (stare maski z prostokątami)."""
-    for suffix in ("_center.png", "_boxes.txt", "_popout.png"):
+    """Usuwa cache poprzednich wersji algorytmu masek (niewersjonowane i v2)."""
+    for suffix in ("_center.png", "_boxes.txt", "_popout.png",
+                   "_center_v2.png", "_boxes_v2.txt", "_popout_v2.png"):
         old = config.MASKS_DIR / f"{stem}{suffix}"
         old.unlink(missing_ok=True)
 

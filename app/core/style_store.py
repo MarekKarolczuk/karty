@@ -92,6 +92,18 @@ _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
     "styl_tla": {"styl": DEFAULT_TEMPLATE_STYLE},
     "tla_przodu": {"front_red": DEFAULT_FRONT_RED, "front_black": DEFAULT_FRONT_BLACK},
     "rewers": {"opis": ""},
+    # Typografia narożników (stemplowanie lokalne, nie AI) — liczby w %
+    # wysokości tarczy, kolory hex; parsowanie w compositor.styl_z_presetu()
+    "wartosci": {
+        "czcionka": "",                       # nazwa pliku .ttf w folderze presetu
+        "rozmiar_wartosci": "40",
+        "rozmiar_symbolu": "32",
+        "kolor_czerwony": config.ACCENT_HEX,
+        "kolor_czarny": config.BLACK_HEX,
+        "offset_x": "0",
+        "offset_y": "0",
+        "odstep": "42",
+    },
 }
 
 # Obrazy (plik <key>.png), per kategoria.
@@ -106,6 +118,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "styl_tla": "styl tła",
     "tla_przodu": "tła przodu",
     "rewers": "rewers",
+    "wartosci": "wartości narożne",
 }
 
 DEFAULT_PRESET_NAME = "Domyślny"
@@ -254,6 +267,17 @@ def save_image(cat: str, key: str, image) -> Path:
     path = d / f"{key}.png"
     image.save(path)
     return path
+
+
+def save_font_file(cat: str, src: Path) -> str:
+    """Kopiuje plik czcionki (.ttf/.otf) do folderu AKTYWNEGO presetu.
+    Zwraca nazwę pliku (zapisywaną w polu tekstowym presetu) — CRUD i eksport
+    zip kopiują cały folder, więc czcionka wędruje razem z presetem."""
+    d = preset_dir(cat)
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / Path(src).name
+    shutil.copy2(src, dest)
+    return dest.name
 
 
 def back_path() -> Path:

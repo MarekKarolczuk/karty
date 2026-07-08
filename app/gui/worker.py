@@ -169,6 +169,39 @@ class SampleWorker(QThread):
                 self.failed.emit(str(exc))
 
 
+class RestampWorker(QThread):
+    """Przestemplowuje narożniki kart z output/_raw/ (lub finalnych z resetem
+    tarcz) wg aktywnego presetu „wartosci" — ZERO wywołań API."""
+
+    progress = pyqtSignal(int, int)   # zrobione, wszystkie
+    done = pyqtSignal(int, int)       # sukcesy, błędy
+    failed = pyqtSignal(str)          # błąd krytyczny (pierwsza karta)
+
+    def __init__(self, targets: list[CardSpec], parent=None):
+        super().__init__(parent)
+        self.targets = targets
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        ok = errors = 0
+        total = len(self.targets)
+        for i, spec in enumerate(self.targets, start=1):
+            if self._cancelled:
+                break
+            try:
+                generator.przestempluj_plik(spec)
+                ok += 1
+            except Exception as exc:
+                errors += 1
+                if ok == 0 and errors == 1:
+                    self.failed.emit(f"{spec.label}: {exc}")
+            self.progress.emit(i, total)
+        self.done.emit(ok, errors)
+
+
 class ExportWorker(QThread):
     """Eksport talii (PDF/ZIP/atlas) w tle — bez wywołań API."""
 

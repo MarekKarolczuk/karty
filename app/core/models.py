@@ -72,13 +72,26 @@ class CardSpec:
     transform: dict | None = None   # kadr z GUI: {"zoom","dx","dy"}
 
     @property
+    def _suffix(self) -> str:
+        return "" if self.variant <= 1 else f"_v{self.variant}"
+
+    @property
     def output_name(self) -> str:
-        suffix = "" if self.variant <= 1 else f"_v{self.variant}"
-        return f"{self.value}_{self.suit.nazwa}{suffix}.jpg"
+        return f"{self.value}_{self.suit.nazwa}{self._suffix}.jpg"
 
     @property
     def output_path(self) -> Path:
         return config.OUTPUT_DIR / self.output_name
+
+    @property
+    def raw_name(self) -> str:
+        """Surowe wyjście AI (bez narożników) — nazewnictwo lustrzane do
+        finalnego, ale bezstratny PNG."""
+        return f"{self.value}_{self.suit.nazwa}{self._suffix}.png"
+
+    @property
+    def raw_path(self) -> Path:
+        return config.RAW_DIR / self.raw_name
 
     @property
     def label(self) -> str:

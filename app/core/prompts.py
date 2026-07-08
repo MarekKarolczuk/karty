@@ -12,6 +12,14 @@ from app.core import style_store
 CHARACTER_STYLE = style_store.DEFAULT_CHARACTER_STYLE
 TEMPLATE_STYLE = style_store.DEFAULT_TEMPLATE_STYLE
 
+# Twardy zakaz tekstu — doklejany na końcu KAŻDEGO promptu generującego przód
+# karty lub tło. AI nie rysuje tekstu: wartości i symbole narożne stempluje
+# deterministycznie compositor.stempluj_narozniki() PO odpowiedzi API.
+NO_TEXT_SUFFIX = """\
+ABSOLUTE: The output MUST contain NO text, NO letters, NO numbers, NO corner
+pips, NO watermark, NO signature — anywhere in the image. Corner areas must
+remain clean vintage cream background."""
+
 # Twarde wymogi kompozycji dla stylizacji zdjęcia (tryb hybrydowy) —
 # niezbędne dla masek kompozytora, nieedytowalne.
 _CHARACTER_REQUIREMENTS = f"""\
@@ -35,14 +43,14 @@ def template_style() -> str:
     return style_store.template_style()
 
 
-def full_card_prompt(value: str, suit_symbol: str, suit_name_en: str) -> str:
+def full_card_prompt(suit_name_en: str) -> str:
     return f"""\
 The first image is a playing-card template in this style:
 {style_store.template_style().rstrip()}
 The central element is an ornate, bold suit-shaped frame with saturated fill.
-The template must remain 100% UNTOUCHED outside the central suit frame and the
-corner shields: do not redraw, move, recolor or alter any ornament, line or
-border. Keep the exact resolution of the template image.
+The template must remain 100% UNTOUCHED outside the central suit frame:
+do not redraw, move, recolor or alter any ornament, line or border.
+Keep the exact resolution of the template image.
 
 Task — seamless inpainting-style composition:
 1. Take the people from the second image (the photo) and repaint them in this
@@ -50,12 +58,10 @@ Task — seamless inpainting-style composition:
 {style_store.character_style().rstrip()}
 2. Place that illustration ONLY inside the central {suit_name_en}-shaped frame
    of the template, strictly vertical, nicely filling the frame.
-3. In the top-left corner shield draw the value "{value}" and below it the
-   suit symbol "{suit_symbol}", stacked VERTICALLY, using a classic SERIF font,
-   color exactly {config.ACCENT_HEX}. In the bottom-right corner shield draw
-   the same value and symbol rotated 180 degrees (as on real playing cards).
-4. Do not edit the background or ornaments of the template. Do not change the
+3. Do not edit the background or ornaments of the template. Do not change the
    output resolution — it must match the template image exactly.
+
+{NO_TEXT_SUFFIX}
 """
 
 
@@ -102,7 +108,8 @@ Mandatory layout (identical to the reference image if one is provided):
   EMPTY, flat cream area (an illustration will be pasted there later).
 - Two empty shield-shaped plaques: one in the top-left corner, one in the
   bottom-right corner (flat cream interiors, values will be added later).
-- Absolutely NO letters, numbers, text or watermarks anywhere on the card.
+
+{NO_TEXT_SUFFIX}
 """
 
 
@@ -128,7 +135,8 @@ def popout_prompt() -> str:
     (Ustawienia i style) jako doprecyzowanie wyglądu."""
     return (DEFAULT_POPOUT_PROMPT
             + "\n\nSubject style details:\n"
-            + style_store.character_style().strip())
+            + style_store.character_style().strip()
+            + "\n\n" + NO_TEXT_SUFFIX)
 
 
 # --- Rewers (tył karty) --------------------------------------------------------
