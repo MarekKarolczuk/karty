@@ -7,11 +7,14 @@ dane_do_api.md
 # === Dane użytkownika / stan lokalny ===
 projekt.json
 styles.json
+analiza_zdjec.json
 zdjecia/
 output/
 arkusz_druku.pdf
 Przykladowe_karty_fajne_ale_nie_spojne/
-Style/
+# Style/ zostaje lokalne poza tłami przodu — tła idą do repo
+Style/*
+!Style/tla_przodu/
 
 # === Generowane / cache ===
 assets/masks/
