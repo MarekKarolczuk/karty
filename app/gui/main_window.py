@@ -17,11 +17,12 @@ from PyQt6.QtWidgets import (
 )
 
 from app import config
-from app.core import prompts, style_store
+from app.core import photo_analyzer, prompts, style_store
 from app.core.exporter import ExportJob
 from app.core.models import CardSpec, GenMode, Suit
 from app.gui import card_grid
 from app.gui.animations import BusyOverlay, FadingStackedWidget
+from app.gui.auto_assign_dialog import AutoAssignDialog
 from app.gui.card_grid import CardSlot
 from app.gui.lightbox import CardLightbox, LightboxContext
 from app.gui.photo_gallery import load_thumbnail
@@ -35,8 +36,8 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.workspace_view import WorkspaceView
 from app.gui.widgets import show_toast
 from app.gui.worker import (
-    BackWorker, ExportWorker, GenerationWorker, RestampWorker, SampleWorker,
-    TemplateWorker,
+    AnalysisWorker, BackWorker, ExportWorker, GenerationWorker, RestampWorker,
+    SampleWorker, TemplateSetWorker, TemplateWorker,
 )
 
 class MainWindow(QMainWindow):
@@ -70,11 +71,19 @@ class MainWindow(QMainWindow):
         self._current_suit: Suit = Suit.KIER
         self._current_value: str = "A"
         self.worker: GenerationWorker | None = None
-        self.template_worker: TemplateWorker | None = None
+        self.template_worker: TemplateWorker | TemplateSetWorker | None = None
         self.back_worker: BackWorker | None = None
         self.export_worker: ExportWorker | None = None
         self.sample_worker: SampleWorker | None = None
         self.restamp_worker: RestampWorker | None = None
+        self.analysis_worker: AnalysisWorker | None = None
+        # auto-przydział: edytowalne motywy kolorów + stan bieżącej sesji
+        self.auto_motywy: dict[str, str] = dict(photo_analyzer.DOMYSLNE_MOTYWY)
+        self._auto_dialog: AutoAssignDialog | None = None
+        self._auto_propozycje: list = []
+        self._auto_nadpisz = False
+        self._analysis_cancelled = False
+        self._analysis_fatal = False
         self.deck_name: str = "Rodzinna talia"
 
         root = QWidget()
@@ -149,18 +158,18 @@ class MainWindow(QMainWindow):
         ws.gallery_panel.photo_deleted.connect(self._on_photo_deleted)
         # Ekran roboczy tylko WYBIERA tło (generowanie żyje w „Tła i rewersy")
         ws.template_picker.template_changed.connect(self._on_template_changed)
-        ws.strip_card_selected.connect(self._select_card)
         ws.card_picked.connect(self._select_card)
         ws.regenerate_clicked.connect(self._regenerate_single)
         ws.generate_deck_clicked.connect(self._generate_from_workspace)
         ws.unassign_clicked.connect(self._unassign_card)
-        ws.strip_photo_dropped.connect(self._on_strip_photo_dropped)
+        ws.grid_photo_dropped.connect(self._on_grid_photo_dropped)
         ws.preview_photo_dropped.connect(self._on_preview_photo_dropped)
         ws.transform_changed.connect(self._on_transform_changed)
         ws.transform_committed.connect(self._on_transform_committed)
         ws.history_navigate.connect(self._on_history_navigate)
         ws.history_set_main.connect(self._on_history_set_main)
         ws.restamp_clicked.connect(self._start_restamp)
+        ws.auto_assign_clicked.connect(self._start_auto_assign)
 
         self.photo_library.photo_deleted.connect(self._on_photo_deleted)
         self.photo_library.photos_imported.connect(self._on_photos_imported)
@@ -201,6 +210,8 @@ class MainWindow(QMainWindow):
         self.back_view.generate_sample_clicked.connect(self._generate_sample)
         self.back_view.generate_back_clicked.connect(self._start_back_generation)
         self.back_view.generate_front_clicked.connect(self._start_front_generation)
+        self.back_view.generate_front_set_clicked.connect(self._start_front_set)
+        self.back_view.import_front_clicked.connect(self._on_front_import)
         self.export_view.export_clicked.connect(self._start_export)
         self.export_view.options_changed.connect(self._save_project)
 
@@ -300,7 +311,9 @@ class MainWindow(QMainWindow):
                 1 for slot in self.grids[suit].slots.values()
                 if slot.photo_path is not None
             )
-            self.deck.suit_seg.set_badge(i, str(count) if count else "")
+            badge = str(count) if count else ""
+            self.deck.suit_seg.set_badge(i, badge)
+            self.workspace.deck_panel.suit_seg.set_badge(i, badge)
 
     def _deck_progress(self) -> tuple[int, int, int]:
         """(gotowe, wszystkie, w toku) — karta gotowa, gdy istnieje jej wybrany
@@ -319,8 +332,8 @@ class MainWindow(QMainWindow):
 
     def _load_generated_state(self) -> None:
         """Wczytuje z dysku stan wygenerowanych kart do slotów siatki — dzięki
-        temu karty z poprzednich sesji są widoczne od razu po starcie (siatka
-        Talii + film-strip), nie dopiero po kolejnej generacji."""
+        temu karty z poprzednich sesji są widoczne od razu po starcie (siatki
+        Talii i Ekranu roboczego), nie dopiero po kolejnej generacji."""
         for suit in Suit:
             for value, slot in self.grids[suit].slots.items():
                 selected = self._selected_variant(suit.nazwa, value)
@@ -328,13 +341,14 @@ class MainWindow(QMainWindow):
                     slot.set_generated(selected)
 
     def _refresh_overview(self) -> None:
-        """Sidebar (postęp, liczniki), film-strip i licznik eksportu — po każdej zmianie."""
+        """Sidebar (postęp, liczniki), siatka talii Ekranu roboczego i licznik
+        eksportu — po każdej zmianie."""
         done, total, pending = self._deck_progress()
         self.sidebar.set_deck_progress(done, total, pending)
         # indeksy sidebara: 0 Ekran roboczy · 2 Talie
         self.sidebar.set_badge(0, pending)    # Ekran roboczy — do generacji
         self.sidebar.set_badge(2, done)       # Talie — gotowe
-        self.workspace.refresh_strip(self._values(), self.grids)
+        self.workspace.sync_deck(self._values(), self.grids)
         self.export_view.set_ready_info(done, total)
 
     # --------------------------------------------------------------- nowa talia
@@ -366,7 +380,7 @@ class MainWindow(QMainWindow):
         return f"{slot.suit.nazwa}:{slot.value}"
 
     def _select_card(self, suit_nazwa: str, value: str) -> None:
-        """Wybór karty z film-stripu / klawiatury wartości / siatki kolorów."""
+        """Wybór karty z siatki talii / klawiatury wartości / siatki kolorów."""
         slot = self.grids[Suit.from_nazwa(suit_nazwa)].slots.get(value)
         if slot is None:
             return
@@ -378,9 +392,12 @@ class MainWindow(QMainWindow):
         if shown is not None:
             self.workspace.preview.show_preview(load_thumbnail(shown, 900))
         else:
-            self.workspace.preview.show_preview(
-                load_thumbnail(slot.suit.template_path, 900)
-            )
+            try:
+                self.workspace.preview.show_preview(
+                    load_thumbnail(slot.suit.template_path, 900)
+                )
+            except FileNotFoundError:   # świeży preset bez tła tego koloru
+                self.workspace.preview.clear_preview()
         self._refresh_history(suit_nazwa, value)
 
     def _unassign_card(self, suit_nazwa: str, value: str) -> None:
@@ -398,8 +415,8 @@ class MainWindow(QMainWindow):
             load_thumbnail(slot.suit.template_path, 900)
         )
 
-    def _on_strip_photo_dropped(self, key: str, path: str) -> None:
-        """Upuszczenie zdjęcia na film-strip Ekranu roboczego."""
+    def _on_grid_photo_dropped(self, key: str, path: str) -> None:
+        """Upuszczenie zdjęcia na slot siatki talii Ekranu roboczego."""
         suit_nazwa, value = key.split(":", 1)
         slot = self.grids[Suit.from_nazwa(suit_nazwa)].slots.get(value)
         if slot is not None:
@@ -660,10 +677,12 @@ class MainWindow(QMainWindow):
     def _on_restamp_done(self, ok: int, errors: int) -> None:
         self.restamp_worker = None
         # te same ścieżki plików — set_generated wymusza ponowny odczyt pikseli
-        for grid in self.grids.values():
-            for slot in grid.slots.values():
-                if slot.generated_path is not None:
-                    slot.set_generated(slot.generated_path)
+        # (obie instancje siatki: Talie + Ekran roboczy)
+        for grids in (self.grids, self.workspace.deck_panel.grids):
+            for grid in grids.values():
+                for slot in grid.slots.values():
+                    if slot.generated_path is not None:
+                        slot.set_generated(slot.generated_path)
         self.gallery.mark_dirty()
         self.deck.mark_dirty()
         self._refresh_history(self._current_suit.nazwa, self._current_value)
@@ -807,10 +826,145 @@ class MainWindow(QMainWindow):
         self.workspace.gallery_panel.set_used_paths(used)
         self.photo_library.panel.set_used_paths(used)
 
+    # ---------------------------------------------- auto-przydział zdjęć AI
+    def _auto_assign_paths(self, nadpisz: bool) -> list[str]:
+        """Zdjęcia do analizy: cała galeria, a przy nadpisz=False tylko
+        nieużyte w przypisaniach (mniej wywołań API)."""
+        if not config.ZDJECIA_DIR.exists():
+            return []
+        paths = [str(p) for p in sorted(config.ZDJECIA_DIR.iterdir())
+                 if p.is_file() and p.suffix.lower() in config.IMAGE_EXTS]
+        if not nadpisz:
+            used = set(self.assignments.values())
+            paths = [p for p in paths if p not in used]
+        return paths
+
+    def _start_auto_assign(self) -> None:
+        """Przycisk „Auto-przydział AI" — dialog: konfiguracja → analiza →
+        podgląd propozycji → zastosowanie."""
+        if self.analysis_worker is not None:
+            return
+        if not photo_analyzer._fake_api() and not self._guard_api_ready():
+            return
+        if not self._auto_assign_paths(True):
+            show_toast(self, "Folder zdjecia/ jest pusty — dodaj zdjęcia "
+                       "w Galerii", "info")
+            return
+        dialog = AutoAssignDialog(self.auto_motywy, self._auto_assign_paths,
+                                  parent=self)
+        dialog.start_requested.connect(self._run_analysis)
+        dialog.cancel_requested.connect(self._cancel_analysis)
+        dialog.apply_requested.connect(self._apply_auto_assign)
+        self._auto_dialog = dialog
+        dialog.exec()
+        self._auto_dialog = None
+        # dialog zamknięty w trakcie analizy bez „Anuluj" nie zostawia workera
+        if self.analysis_worker is not None:
+            self._cancel_analysis()
+
+    def _run_analysis(self, motywy: dict, nadpisz: bool) -> None:
+        """Start workera analizy (strona postępu dialogu już widoczna)."""
+        self.auto_motywy = {k: str(v) for k, v in motywy.items()}
+        self._save_project()
+        self._auto_nadpisz = nadpisz
+        self._auto_propozycje = []
+        self._analysis_cancelled = False
+        self._analysis_fatal = False
+        worker = AnalysisWorker(self._auto_assign_paths(nadpisz),
+                                self.auto_motywy)
+        worker.progress.connect(self._on_analysis_progress)
+        worker.photo_done.connect(self._on_analysis_photo_done)
+        worker.photo_error.connect(self._on_analysis_photo_error)
+        worker.fatal_error.connect(self._on_analysis_fatal)
+        worker.finished_all.connect(self._on_analysis_finished)
+        self.analysis_worker = worker
+        worker.start()
+
+    def _cancel_analysis(self) -> None:
+        """Anulowanie analizy: flaga + porzucenie żywego wątku (wzorzec
+        _cancel_generation — QThread nie może być zniszczony w locie)."""
+        worker = self.analysis_worker
+        if worker is None:
+            return
+        self._analysis_cancelled = True
+        worker.cancel()
+        self._abandoned.append(worker)
+        worker.finished.connect(
+            lambda w=worker: self._abandoned.remove(w)
+            if w in self._abandoned else None
+        )
+        self.analysis_worker = None
+        self._set_status("Anulowano analizę zdjęć")
+
+    def _on_analysis_progress(self, done: int, total: int) -> None:
+        if self._auto_dialog is not None and not self._analysis_cancelled:
+            self._auto_dialog.show_progress(done, total)
+
+    def _on_analysis_photo_done(self, path: str, _analiza) -> None:
+        if self._auto_dialog is not None and not self._analysis_cancelled:
+            self._auto_dialog.show_current_file(path)
+
+    def _on_analysis_photo_error(self, path: str, message: str) -> None:
+        if self._analysis_cancelled:
+            return
+        self.generation.log_pane.log_line(
+            f"✖ analiza {Path(path).name}: {message}")
+        if self._auto_dialog is not None:
+            self._auto_dialog.add_error(path, message)
+
+    def _on_analysis_fatal(self, message: str) -> None:
+        self._analysis_fatal = True
+        if self._auto_dialog is not None:
+            self._auto_dialog.analysis_failed(message)
+        show_toast(self, f"✖ analiza zdjęć: {message[:160]}", "error")
+
+    def _on_analysis_finished(self, wyniki: list) -> None:
+        self.analysis_worker = None
+        if self._analysis_cancelled or self._analysis_fatal:
+            return
+        dialog = self._auto_dialog
+        if dialog is None:
+            return
+        propozycje, puste, nieuzyte = photo_analyzer.uloz_propozycje(
+            wyniki, self._values(), self.assignments, self._auto_nadpisz)
+        # czytelna kolejność podglądu: kolory wg Suit, wartości wg talii
+        order_s = {s.nazwa: i for i, s in enumerate(Suit)}
+        order_v = {v: i for i, v in enumerate(self._values())}
+        propozycje.sort(key=lambda p: (
+            order_s.get(p.klucz.split(":", 1)[0], 9),
+            order_v.get(p.klucz.split(":", 1)[1], 99),
+        ))
+        self._auto_propozycje = propozycje
+        dialog.show_proposals(propozycje, puste, nieuzyte)
+
+    def _apply_auto_assign(self) -> None:
+        """Zastosowanie zatwierdzonych propozycji — masowo, z JEDNYM
+        odświeżeniem (_after_assignment_change) na końcu."""
+        zastosowane = 0
+        for prop in self._auto_propozycje:
+            suit_nazwa, value = prop.klucz.split(":", 1)
+            try:
+                suit = Suit.from_nazwa(suit_nazwa)
+            except ValueError:
+                continue
+            slot = self.grids[suit].slots.get(value)
+            if slot is None:   # wartość mogła zniknąć po edycji talii
+                continue
+            self.assignments[prop.klucz] = prop.sciezka
+            self.transforms.pop(prop.klucz, None)  # stary kadr ≠ nowe zdjęcie
+            slot.set_photo(Path(prop.sciezka))
+            zastosowane += 1
+        self._auto_propozycje = []
+        self._after_assignment_change()
+        show_toast(self, f"Auto-przydział: przypisano {zastosowane} kart", "ok")
+
     def _rebuild_grids(self, values: list[str]) -> None:
         self._deck_values = list(values)
         for suit, grid in self.grids.items():
             grid.rebuild(values, self.assignments)
+        # druga instancja siatki na Ekranie roboczym — te same wartości
+        # i przypisania; stan generacji dosypie sync_deck w _refresh_overview
+        self.workspace.deck_panel.rebuild(values, self.assignments)
         self.workspace.set_available_values(values)
         self.deck.set_card_count(len(values) * len(Suit))
         self._update_badges()
@@ -922,7 +1076,8 @@ class MainWindow(QMainWindow):
         if missing:
             names = ", ".join(f"{s.symbol} {s.nazwa}" for s in missing)
             show_toast(self, f"Brak tła przodu dla: {names} — wygeneruj je w "
-                       "„Tła i rewersy” albo wgraj plik do tla_kart/", "error")
+                       "„Tła i rewersy” (np. „Generuj komplet”) albo wgraj "
+                       "tam własne tło", "error")
             return
         from app.api import stability_client
         stability_client.reset_abort()   # świeży start serii (kasuje flagę Anuluj)
@@ -936,6 +1091,8 @@ class MainWindow(QMainWindow):
             slot = self._slot_for(spec)
             if slot is not None:
                 slot.set_queued(True)
+        # siatka Ekranu roboczego od razu pokazuje karty „w kolejce"
+        self.workspace.sync_deck(self._values(), self.grids)
         self._set_status(f"Generuję {len(specs)} kart ({self._mode().value})...")
         self.worker = GenerationWorker(specs)
         self.worker.progress.connect(self._on_progress)
@@ -1099,6 +1256,11 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------------- tła kart
     def _on_template_changed(self, suit: Suit, path: str) -> None:
         config.TEMPLATE_OVERRIDES[suit.nazwa] = path
+        # Tło spoza programu (np. wrzucone ręcznie do folderu presetu) od razu
+        # dopasowuje się do wybranego formatu i rozdzielczości — podgląd
+        # siatki i kolaż widzą już znormalizowany plik
+        from app.core import generator
+        generator.normalizuj_szablon(Path(path))
         card_grid.clear_template_cache()
         self._rebuild_grids(self._values())
         self._set_status(f"Tło {suit.symbol} {suit.nazwa}: {Path(path).name}")
@@ -1131,7 +1293,9 @@ class MainWindow(QMainWindow):
         if not self._guard_api_ready():
             return
         suit = settings["suit"]
-        prompt = settings.get("prompt") or None
+        # baza z edytora + twardy layout (kształt symbolu koloru, tarcze TL/BR,
+        # zakaz tekstu); w trybie własnym presetu baza idzie dosłownie
+        prompt = prompts.front_background_prompt(suit, settings.get("prompt"))
         count = int(settings.get("count", 1))
         from app.api import stability_client
         stability_client.reset_abort()
@@ -1177,6 +1341,98 @@ class MainWindow(QMainWindow):
             self._set_status(f"Przerwano — wygenerowano {made}/{total} teł")
         else:
             self._set_status(f"✔ wygenerowano {made} teł przodu")
+
+    # ------------------------------------------- komplet wyglądu talii (4 tła)
+    def _start_front_set(self, opts: dict) -> None:
+        """Komplet 4 teł jednym stylem (+ opcjonalnie rewers) — spójny zestaw:
+        pierwsze tło kotwiczy pozostałe kolory (referencja + wspólny seed)."""
+        if self.template_worker is not None or self.back_worker is not None:
+            return
+        if not self._guard_api_ready():
+            return
+        back_prompt = back_source = None
+        orientation = "portrait"
+        if opts.get("include_back"):
+            settings = self.back_view.settings()
+            orientation = settings.get("orientation", "portrait")
+            back_source = settings.get("source_photo") \
+                if settings.get("mode") == "i2i" else None
+            back_prompt = prompts.back_generation_prompt(
+                preset=settings.get("preset", "klasyczny"),
+                custom_text=settings.get("custom", ""),
+                orientation=orientation,
+                from_photo=bool(back_source),
+            )
+        from app.api import stability_client
+        stability_client.reset_abort()
+        self._gen_cancelled = False
+        self.back_view.set_front_busy(True)
+        self.cancel_btn.setVisible(True)
+        total = len(Suit) + (1 if back_prompt else 0)
+        self._set_status(f"Komplet wyglądu talii: 0 / {total}…")
+        worker = TemplateSetWorker(back_prompt=back_prompt,
+                                   back_source=back_source,
+                                   back_orientation=orientation)
+        worker.variant_done.connect(self._on_set_variant_done)
+        worker.back_done.connect(self._on_set_back_done)
+        worker.failed.connect(self._on_set_failed)
+        worker.progress.connect(
+            lambda i, n: self._set_status(f"Komplet wyglądu talii: {i} / {n}…")
+        )
+        worker.finished_all.connect(self._on_set_finished)
+        self.template_worker = worker   # slot template_worker → działa Przerwij
+        worker.start()
+
+    def _on_set_variant_done(self, suit: Suit, path: str) -> None:
+        if self._gen_cancelled:
+            return
+        # każde tło kompletu od razu staje się aktywnym tłem swojego koloru
+        self._on_template_changed(suit, path)
+        self.workspace.template_picker.refresh_templates()
+        self.back_view.refresh_front_preview()
+        self._show_preview(load_thumbnail(Path(path), 900))
+        show_toast(self, f"✔ tło {suit.symbol}: {Path(path).name}", "ok")
+
+    def _on_set_back_done(self, path: str) -> None:
+        if self._gen_cancelled:
+            return
+        self.gallery.mark_dirty()
+        self.back_view.refresh_back_preview()
+        show_toast(self, f"✔ rewers zestawu: {Path(path).name}", "ok")
+
+    def _on_set_failed(self, suit, message: str) -> None:
+        label = f"tło {suit.nazwa}" if suit is not None else "rewers"
+        self.generation.log_pane.log_line(f"✖ {label}: {message}")
+        show_toast(self, f"✖ {label}: {message[:120]}", "error")
+
+    def _on_set_finished(self, made: int, total: int) -> None:
+        if self._gen_cancelled:
+            self.template_worker = None
+            return
+        self.template_worker = None
+        self.back_view.set_front_busy(False)
+        self.cancel_btn.setVisible(bool(self.worker))
+        self._save_project()
+        if made < total:
+            self._set_status(f"Komplet przerwany — {made}/{total} elementów")
+        else:
+            self._set_status(f"✔ komplet wyglądu talii gotowy ({made} elementów)"
+                             " — teraz przypisz zdjęcia na Ekranie roboczym")
+
+    def _on_front_import(self, suit: Suit, src: str) -> None:
+        """Własny obraz użytkownika jako tło koloru — docięcie do proporcji
+        karty (bez API) i natychmiastowa aktywacja."""
+        from app.core import generator
+        try:
+            path = generator.import_template(suit, Path(src))
+        except (OSError, ValueError) as exc:
+            show_toast(self, f"Nie wczytano obrazu: {exc}", "error")
+            return
+        self._on_template_changed(suit, str(path))
+        self.workspace.template_picker.refresh_templates()
+        self.back_view.refresh_front_preview()
+        self._save_project()
+        show_toast(self, f"✔ własne tło {suit.symbol}: {path.name}", "ok")
 
     # ----------------------------------------------------------------------- rewers
     def _start_back_generation(self, settings: dict) -> None:
@@ -1393,6 +1649,7 @@ class MainWindow(QMainWindow):
             "card_preset": config.SELECTED_CARD_PRESET,
             "back": self.back_view.settings(),
             "export": self.export_view.settings(),
+            "auto_przydzial": {"motywy": self.auto_motywy},
         }
         config.PROJEKT_JSON.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -1438,6 +1695,12 @@ class MainWindow(QMainWindow):
         if data.get("card_preset") in config.CARD_PRESETS:
             config.set_card_preset(data["card_preset"])
             self.settings_view.sync_styles()
+        auto = data.get("auto_przydzial")
+        if isinstance(auto, dict) and isinstance(auto.get("motywy"), dict):
+            for kolor in photo_analyzer.DOMYSLNE_MOTYWY:
+                motyw = auto["motywy"].get(kolor)
+                if isinstance(motyw, str) and motyw.strip():
+                    self.auto_motywy[kolor] = motyw
         if isinstance(data.get("back"), dict):
             self.back_view.apply_settings(data["back"])
         if isinstance(data.get("export"), dict):

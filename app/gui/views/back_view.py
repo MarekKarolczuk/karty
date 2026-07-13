@@ -10,9 +10,9 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
-    QColorDialog, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
-    QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QColorDialog, QComboBox, QFileDialog, QHBoxLayout,
+    QInputDialog, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from app import config
@@ -43,6 +43,10 @@ class BackView(QWidget):
     generate_back_clicked = pyqtSignal(dict)
     # {"suit": Suit, "prompt": str, "count": int}
     generate_front_clicked = pyqtSignal(dict)
+    # komplet 4 teł jednym stylem; {"include_back": bool}
+    generate_front_set_clicked = pyqtSignal(dict)
+    # własny plik użytkownika jako tło przodu: Suit, ścieżka obrazu
+    import_front_clicked = pyqtSignal(object, str)
     character_changed = pyqtSignal()   # edycja dowolnego promptu → zapis + podgląd
     style_slot_changed = pyqtSignal()  # zmiana struktury presetów (nowy/usuń/...)
     preset_applied = pyqtSignal(str)   # aktywowano preset danej kategorii (cat)
@@ -499,10 +503,25 @@ class BackView(QWidget):
 
         hint = QLabel("Preset teł przodu = 2 prompty (Kier/Karo i Pik/Trefl) + 4 "
                       "obrazy kart. Wybór presetu od razu ustawia aktywne tła całej "
-                      "talii. Prompt jest osobny dla kart czerwonych i czarnych.")
+                      "talii. Prompt jest osobny dla kart czerwonych i czarnych. "
+                      "Program dokleja do promptu twardy layout: centralną ramę w "
+                      "kształcie symbolu koloru (kier → serce) i puste tarcze na "
+                      "wartości TYLKO w lewym górnym i prawym dolnym rogu — chyba "
+                      "że włączysz tryb własny poniżej.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         pl.addWidget(hint)
+
+        self.front_custom_check = QCheckBox(
+            "🧩 Tryb własnego promptu — wysyłaj prompt dosłownie "
+            "(np. karty do planszówek)")
+        self.front_custom_check.setToolTip(
+            "Bez wbudowanych dopisków programu: kształtu symbolu koloru, "
+            "tarcz narożnych, zakazu tekstu i palety talii. W trybie kompletu "
+            "dodawana jest tylko informacja o obrazie referencyjnym. "
+            "Ustawienie zapisuje się w wybranym presecie.")
+        self.front_custom_check.toggled.connect(self._on_front_custom_toggled)
+        pl.addWidget(self.front_custom_check)
 
         row = QHBoxLayout()
         row.setSpacing(10)
@@ -543,6 +562,34 @@ class BackView(QWidget):
         self.front_btn.clicked.connect(self._emit_generate_front)
         gen_row.addWidget(self.front_btn, stretch=1)
         left.addLayout(gen_row)
+
+        # --- komplet: 4 kolory jednym stylem (+ opcjonalnie rewers) ----------
+        self.front_set_btn = QPushButton("🎴  Generuj komplet (4 kolory)")
+        self.front_set_btn.setObjectName("outlineBtn")
+        self.front_set_btn.setToolTip(
+            "Cztery tła jednym stylem: kier → karo → pik → trefl. Pierwsze "
+            "tło kotwiczy pozostałe (wspólny seed + referencja) — spójny "
+            "zestaw; czerwone i czarne karty dostają swój kolor ornamentu. "
+            "Wartości narożne ustawisz w sekcji „Wartości narożne” poniżej."
+        )
+        self.front_set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.front_set_btn.clicked.connect(self._emit_generate_front_set)
+        left.addWidget(self.front_set_btn)
+        self.front_set_back_check = QCheckBox("razem z rewersem")
+        self.front_set_back_check.setToolTip(
+            "Po 4 tłach wygeneruj też rewers wg ustawień sekcji „Rewers”"
+        )
+        left.addWidget(self.front_set_back_check)
+
+        self.front_import_btn = QPushButton("📁  Wgraj własne tło")
+        self.front_import_btn.setObjectName("ghostBtn")
+        self.front_import_btn.setToolTip(
+            "Użyj własnego obrazu jako tła wybranego koloru — plik zostanie "
+            "docięty do proporcji karty (bez API)"
+        )
+        self.front_import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.front_import_btn.clicked.connect(self._pick_front_file)
+        left.addWidget(self.front_import_btn)
         left.addStretch(1)
         row.addLayout(left, stretch=1)
 
@@ -584,6 +631,9 @@ class BackView(QWidget):
         self.front_prompt.blockSignals(True)
         self.front_prompt.setPlainText(style_store.front_prompt(is_red))
         self.front_prompt.blockSignals(False)
+        self.front_custom_check.blockSignals(True)
+        self.front_custom_check.setChecked(style_store.front_custom_mode())
+        self.front_custom_check.blockSignals(False)
         self._update_front_caption()
 
     def _update_front_caption(self) -> None:
@@ -591,10 +641,16 @@ class BackView(QWidget):
         field = "front_red" if is_red else "front_black"
         base = ("PROMPT TŁA PRZODU — CZERWONE (Kier/Karo)" if is_red
                 else "PROMPT TŁA PRZODU — CZARNE (Pik/Trefl)")
-        self.front_prompt_cap.setText(
-            base + ("" if style_store.is_default("tla_przodu", field)
-                    else "   • zmieniony")
-        )
+        if not style_store.is_default("tla_przodu", field):
+            base += "   • zmieniony"
+        if style_store.front_custom_mode():
+            base += "   • tryb własny"
+        self.front_prompt_cap.setText(base)
+
+    def _on_front_custom_toggled(self, checked: bool) -> None:
+        style_store.set_text("tla_przodu", "tryb_wlasny", "1" if checked else "0")
+        self._update_front_caption()
+        self.character_changed.emit()
 
     def _apply_front_prompt(self) -> None:
         field = "front_red" if self._current_front_suit().is_red else "front_black"
@@ -621,6 +677,19 @@ class BackView(QWidget):
             "count": count,
         })
 
+    def _emit_generate_front_set(self) -> None:
+        self.generate_front_set_clicked.emit({
+            "include_back": self.front_set_back_check.isChecked(),
+        })
+
+    def _pick_front_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Własne tło przodu karty", "",
+            "Obrazy (*.png *.jpg *.jpeg *.webp)",
+        )
+        if path:
+            self.import_front_clicked.emit(self._current_front_suit(), path)
+
     def refresh_front_preview(self) -> None:
         suit = self._current_front_suit()
         try:
@@ -634,6 +703,8 @@ class BackView(QWidget):
 
     def set_front_busy(self, busy: bool) -> None:
         self.front_btn.setEnabled(not busy)
+        self.front_set_btn.setEnabled(not busy)
+        self.front_import_btn.setEnabled(not busy)
         self.front_spinner.setVisible(busy)
         self.front_btn.setText("⏳  Generuję tła..." if busy
                                else "🎨  Generuj tło przodu")
@@ -728,6 +799,16 @@ class BackView(QWidget):
         self.custom_edit.textChanged.connect(self._opis_debounce.start)
         controls_layout.addWidget(self.custom_edit)
 
+        self.back_custom_check = QCheckBox(
+            "🧩 Tryb własnego promptu — wysyłaj opis dosłownie")
+        self.back_custom_check.setToolTip(
+            "Bez wbudowanych wymogów programu (symetria 180°, bordiura, "
+            "zakaz tekstu) — do modelu idzie wyłącznie opis powyżej. "
+            "Ustawienie zapisuje się w wybranym presecie.")
+        self.back_custom_check.setChecked(style_store.back_custom_mode())
+        self.back_custom_check.toggled.connect(self._on_back_custom_toggled)
+        controls_layout.addWidget(self.back_custom_check)
+
         columns.addWidget(controls, stretch=3)
 
         # --- prawa kolumna: podgląd + backupy ---
@@ -786,10 +867,17 @@ class BackView(QWidget):
         style_store.set_text("rewers", "opis", self.custom_edit.toPlainText())
         self.character_changed.emit()
 
+    def _on_back_custom_toggled(self, checked: bool) -> None:
+        style_store.set_text("rewers", "tryb_wlasny", "1" if checked else "0")
+        self.character_changed.emit()
+
     def _reload_back_opis(self) -> None:
         self.custom_edit.blockSignals(True)
         self.custom_edit.setPlainText(style_store.back_text())
         self.custom_edit.blockSignals(False)
+        self.back_custom_check.blockSignals(True)
+        self.back_custom_check.setChecked(style_store.back_custom_mode())
+        self.back_custom_check.blockSignals(False)
 
     def _pick_photo(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(config.IMAGE_EXTS))
@@ -870,7 +958,9 @@ class BackView(QWidget):
         hint = QLabel("Wartość i symbol w narożnikach rysuje program (nie AI) — "
                       "identycznie na każdej karcie. Zmiany zastosujesz na "
                       "istniejących kartach przyciskiem „Przestempluj narożniki” "
-                      "w Ekranie roboczym lub Taliach — bez zużywania API.")
+                      "w Ekranie roboczym lub Taliach — bez zużywania API. "
+                      "Kolory czerwony/czarny zasilają też prompty AI — cała "
+                      "talia trzyma jedną paletę.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         pl.addWidget(hint)
@@ -909,7 +999,9 @@ class BackView(QWidget):
              ("rozmiar_symbolu", "Rozmiar symbolu", 10, 90),
              ("odstep", "Odstęp wartość↔symbol", 10, 80)),
             (("offset_x", "Offset X", -30, 30),
-             ("offset_y", "Offset Y", -30, 30)),
+             ("offset_y", "Offset Y", -30, 30),
+             ("obwodka_grubosc", "Obwódka", 0, 12),
+             ("cien_przesuniecie", "Cień", 0, 10)),
         )
         for row_def in rows:
             row = QHBoxLayout()
@@ -934,7 +1026,9 @@ class BackView(QWidget):
         color_row.setSpacing(6)
         self._wart_color_btns: dict[str, QPushButton] = {}
         for field, label in (("kolor_czerwony", "Kolor kier / karo"),
-                             ("kolor_czarny", "Kolor pik / trefl")):
+                             ("kolor_czarny", "Kolor pik / trefl"),
+                             ("obwodka_kolor", "Obwódka"),
+                             ("cien_kolor", "Cień")):
             lab = QLabel(label.upper())
             lab.setObjectName("sideCaption")
             color_row.addWidget(lab)
@@ -984,9 +1078,14 @@ class BackView(QWidget):
         for field, btn in self._wart_color_btns.items():
             value = style_store.text("wartosci", field).strip()
             self._wart_colors[field] = value
-            btn.setStyleSheet(
-                f"background: {value}; border: 1px solid #555; border-radius: 6px;"
-            )
+            if value:
+                btn.setStyleSheet(f"background: {value}; "
+                                  "border: 1px solid #555; border-radius: 6px;")
+                btn.setToolTip("Kliknij, aby wybrać kolor")
+            else:   # puste = automatyczny (obwódka: krem, cień: czerń)
+                btn.setStyleSheet("background: transparent; "
+                                  "border: 1px dashed #777; border-radius: 6px;")
+                btn.setToolTip("Automatyczny — kliknij, aby wybrać własny")
         self._refresh_wartosci_preview()
 
     def _apply_wartosci(self) -> None:

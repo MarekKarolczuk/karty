@@ -5,6 +5,7 @@ import io
 import time
 
 from google import genai
+from google.genai import types
 from PIL import Image
 
 from app import config
@@ -56,15 +57,82 @@ def _model_name() -> str:
     return "gemini-2.5-flash-image"  # fallback, gdy wybrany model nie jest z Gemini
 
 
-def generate_image(contents: list, retries: int = 3) -> Image.Image:
-    """Wysyła prompt (tekst + obrazy PIL) i zwraca pierwszy obraz z odpowiedzi."""
+def _generation_config(seed: int | None,
+                       poziom: int = 0) -> types.GenerateContentConfig:
+    """Config stabilizujący spójność talii: niska temperatura + seed.
+
+    Dwustopniowa degradacja dla backendów odrzucających pola (INVALID_ARGUMENT):
+    poziom 0 — pełny config; poziom 1 — bez response_modalities, ale SEED
+    ZOSTAJE (spójność talii); poziom 2 — tylko temperatura."""
+    if poziom >= 2:
+        return types.GenerateContentConfig(temperature=config.GEN_TEMPERATURE)
+    if poziom == 1:
+        return types.GenerateContentConfig(
+            temperature=config.GEN_TEMPERATURE, seed=seed
+        )
+    return types.GenerateContentConfig(
+        temperature=config.GEN_TEMPERATURE,
+        seed=seed,
+        response_modalities=["TEXT", "IMAGE"],
+    )
+
+
+def _raise_if_fatal(exc: Exception, model: str) -> None:
+    """Mapuje błędy konta (billing / klucz / brak modelu) na FatalAPIError —
+    nie do naprawienia ponowieniem, przerywają całą serię. Wspólne dla
+    generate_image() i generate_text(). Zwykłe błędy (sieć, limity chwilowe)
+    przepuszcza do retry."""
+    from app.api.errors import FatalAPIError
+    text = str(exc)
+    # brak billingu / limit 0
+    if "RESOURCE_EXHAUSTED" in text and "limit: 0" in text:
+        raise FatalAPIError(
+            "Konto Vertex AI nie ma dostępu do generowania obrazów "
+            "(limit 0) — sprawdź billing/quota projektu GCP i włączone "
+            "Vertex AI API (console.cloud.google.com)."
+            if config.USE_VERTEX else
+            "Darmowy plan tego klucza API nie obejmuje generowania obrazów "
+            "(limit 0). Włącz rozliczenia (billing) dla projektu w "
+            "https://aistudio.google.com/ i spróbuj ponownie."
+        ) from exc
+    # zły klucz / brak uprawnień ADC — błąd krytyczny konta
+    if any(s in text for s in ("API key not valid", "PERMISSION_DENIED",
+                               "UNAUTHENTICATED", "API_KEY_INVALID")):
+        raise FatalAPIError(
+            "Brak uprawnień do Vertex AI — uruchom `gcloud auth "
+            "application-default login`, nadaj rolę „Vertex AI User” i "
+            "sprawdź ID projektu GCP w Ustawieniach."
+            if config.USE_VERTEX else
+            "Klucz GEMINI_API_KEY jest nieprawidłowy lub bez uprawnień — "
+            "popraw go w Ustawieniach."
+        ) from exc
+    # model niedostępny w regionie / brak dostępu — nie retry'uj
+    if config.USE_VERTEX and any(
+        s in text for s in ("404", "NOT_FOUND", "does not have access")
+    ):
+        region = config.vertex_location_for(model)
+        raise FatalAPIError(
+            f"Model „{model}” jest niedostępny na Vertex AI w regionie "
+            f"„{region}” (lub projekt nie ma do niego dostępu). Wybierz "
+            "inny model albo region w Ustawieniach."
+        ) from exc
+
+
+def generate_image(contents: list, retries: int = 3,
+                   seed: int | None = None) -> Image.Image:
+    """Wysyła prompt (tekst + obrazy PIL) i zwraca pierwszy obraz z odpowiedzi.
+
+    seed — deterministyczny wariant (spójność talii); None = losowo
+    (tła/rewers, gdzie warianty MAJĄ się różnić)."""
     last_error: Exception | None = None
     model = _model_name()
+    poziom_configu = 0
     for attempt in range(1, retries + 1):
         try:
             response = get_client(config.vertex_location_for(model)).models.generate_content(
                 model=model,
                 contents=contents,
+                config=_generation_config(seed, poziom=poziom_configu),
             )
             for candidate in response.candidates or []:
                 if candidate.content is None:
@@ -78,44 +146,71 @@ def generate_image(contents: list, retries: int = 3) -> Image.Image:
         except GeminiError:
             raise
         except Exception as exc:  # błędy sieci / limity API
-            from app.api.errors import FatalAPIError
             last_error = exc
             text = str(exc)
-            # brak billingu / limit 0 — nie do naprawienia ponowieniem: zatrzymaj serię
-            if "RESOURCE_EXHAUSTED" in text and "limit: 0" in text:
-                raise FatalAPIError(
-                    "Konto Vertex AI nie ma dostępu do generowania obrazów "
-                    "(limit 0) — sprawdź billing/quota projektu GCP i włączone "
-                    "Vertex AI API (console.cloud.google.com)."
-                    if config.USE_VERTEX else
-                    "Darmowy plan tego klucza API nie obejmuje generowania obrazów "
-                    "(limit 0). Włącz rozliczenia (billing) dla projektu w "
-                    "https://aistudio.google.com/ i spróbuj ponownie."
-                ) from exc
-            # zły klucz / brak uprawnień ADC — błąd krytyczny konta
-            if any(s in text for s in ("API key not valid", "PERMISSION_DENIED",
-                                       "UNAUTHENTICATED", "API_KEY_INVALID")):
-                raise FatalAPIError(
-                    "Brak uprawnień do Vertex AI — uruchom `gcloud auth "
-                    "application-default login`, nadaj rolę „Vertex AI User” i "
-                    "sprawdź ID projektu GCP w Ustawieniach."
-                    if config.USE_VERTEX else
-                    "Klucz GEMINI_API_KEY jest nieprawidłowy lub bez uprawnień — "
-                    "popraw go w Ustawieniach."
-                ) from exc
-            # model niedostępny w regionie / brak dostępu — nie retry'uj
-            if config.USE_VERTEX and any(
-                s in text for s in ("404", "NOT_FOUND", "does not have access")
-            ):
-                region = config.vertex_location_for(model)
-                raise FatalAPIError(
-                    f"Model „{model}” jest niedostępny na Vertex AI w regionie "
-                    f"„{region}” (lub projekt nie ma do niego dostępu). Wybierz "
-                    "inny model albo region w Ustawieniach."
-                ) from exc
+            # backend odrzucił pole configu — degradacja stopniowa (tylko
+            # w górę, każdy poziom raz): najpierw bez response_modalities
+            # (SEED ZOSTAJE — spójność talii), dopiero potem bez seeda
+            if "INVALID_ARGUMENT" in text:
+                if "seed" in text.lower() and poziom_configu < 2:
+                    poziom_configu = 2
+                    continue
+                if "response_modalit" in text.lower() and poziom_configu < 1:
+                    poziom_configu = 1
+                    continue
+            _raise_if_fatal(exc, model)
             if attempt < retries:
                 time.sleep(2 * attempt)
     raise GeminiError(f"Wywołanie Gemini nie powiodło się po {retries} próbach: {last_error}")
+
+
+def generate_text(contents: list, retries: int = 3) -> str:
+    """Wysyła prompt (tekst + obrazy PIL) do taniego modelu tekstowo-wizyjnego
+    (config.ANALYSIS_MODEL) i zwraca odpowiedź TEKSTOWĄ — JSON analizy zdjęcia
+    (auto-przydział). Osobna od generate_image(): inny model, config wymuszający
+    JSON (response_mime_type), czytanie part.text zamiast inline_data."""
+    last_error: Exception | None = None
+    model = config.ANALYSIS_MODEL
+    minimal_config = False
+    for attempt in range(1, retries + 1):
+        try:
+            if minimal_config:
+                gen_config = types.GenerateContentConfig(
+                    temperature=config.ANALYSIS_TEMPERATURE)
+            else:
+                gen_config = types.GenerateContentConfig(
+                    temperature=config.ANALYSIS_TEMPERATURE,
+                    response_mime_type="application/json",
+                )
+            response = get_client(config.vertex_location_for(model)).models.generate_content(
+                model=model,
+                contents=contents,
+                config=gen_config,
+            )
+            parts_text: list[str] = []
+            for candidate in response.candidates or []:
+                if candidate.content is None:
+                    continue
+                for part in candidate.content.parts or []:
+                    if part.text:
+                        parts_text.append(part.text)
+            if parts_text:
+                return "".join(parts_text)
+            raise GeminiError("Model nie zwrócił tekstu analizy (pusta odpowiedź)")
+        except GeminiError:
+            raise
+        except Exception as exc:  # błędy sieci / limity API
+            last_error = exc
+            text = str(exc)
+            # backend odrzucił response_mime_type — ponów z minimalnym configiem
+            if not minimal_config and "INVALID_ARGUMENT" in text \
+                    and "response_mime" in text.lower():
+                minimal_config = True
+                continue
+            _raise_if_fatal(exc, model)
+            if attempt < retries:
+                time.sleep(2 * attempt)
+    raise GeminiError(f"Analiza Gemini nie powiodła się po {retries} próbach: {last_error}")
 
 
 def _load_photo(path, max_side: int = 1024) -> Image.Image:
@@ -125,20 +220,34 @@ def _load_photo(path, max_side: int = 1024) -> Image.Image:
     return img
 
 
-def stylize_photo(photo_path, style_prompt: str) -> Image.Image:
+def stylize_photo(photo_path, style_prompt: str,
+                  seed: int | None = None) -> Image.Image:
     """Tryb hybrydowy: zdjęcie -> ilustracja wektorowa cell-shaded."""
-    return generate_image([style_prompt, _load_photo(photo_path)])
+    return generate_image([style_prompt, _load_photo(photo_path)], seed=seed)
 
 
-def compose_full_card(template: Image.Image, photo_path, prompt: str) -> Image.Image:
-    """Tryb pełne AI: szablon + zdjęcie -> gotowa karta."""
-    return generate_image([prompt, template, _load_photo(photo_path)])
+def compose_full_card(template: Image.Image, photo_path, prompt: str,
+                      seed: int | None = None,
+                      photo_max_side: int = 1024) -> Image.Image:
+    """Tryb pełne AI: szablon + zdjęcie -> gotowa karta.
+
+    photo_max_side — pomniejszenie zdjęcia; grupy 3+ dostają większą wartość
+    (więcej pikseli na każdą twarz — patrz generator.PHOTO_REF_SIDE_GRUPA)."""
+    contents: list = [prompt, template,
+                      _load_photo(photo_path, max_side=photo_max_side)]
+    return generate_image(contents, seed=seed)
 
 
-def edit_card_image(init: Image.Image, prompt: str) -> Image.Image:
+def edit_card_image(init: Image.Image, prompt: str,
+                    seed: int | None = None,
+                    photo: Image.Image | None = None) -> Image.Image:
     """Pop-out: kolaż (szablon + wkadrowane zdjęcie) -> przerysowana karta.
 
     Gemini edytuje instrukcyjnie (bez twardej maski) — prompt wymusza
     wychodzenie postaci poza ramę i nienaruszanie bordiury/narożników.
-    """
-    return generate_image([prompt, init])
+    photo (opcjonalne) — oryginalne zdjęcie jako DRUGI obraz contents
+    (wierność twarzy i rekwizytów, patrz prompts.photo_ref_note())."""
+    contents: list = [prompt, init]
+    if photo is not None:
+        contents.append(photo)
+    return generate_image(contents, seed=seed)

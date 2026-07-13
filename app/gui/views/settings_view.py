@@ -401,15 +401,17 @@ class SettingsView(QWidget):
             f"{style_store.CATEGORY_LABELS[cat]}: {style_store.active(cat)}"
             for cat in style_store.CATEGORIES
         )
+        front_mode = (" — TRYB WŁASNY (prompt wysyłany dosłownie)"
+                      if style_store.front_custom_mode() else "")
         self.prompt_preview.setPlainText(
             f"AKTYWNE PRESETY:  {actives}\n\n"
             "STYL POSTACI:\n"
             + style_store.character_style().strip()
             + "\n\nSTYL TŁA / SZABLONU (edycja w zakładce Style):\n"
             + style_store.template_style().strip()
-            + "\n\nTŁO PRZODU — CZERWONE (Kier/Karo):\n"
+            + f"\n\nTŁO PRZODU — CZERWONE (Kier/Karo){front_mode}:\n"
             + style_store.front_prompt(True).strip()
-            + "\n\nTŁO PRZODU — CZARNE (Pik/Trefl):\n"
+            + f"\n\nTŁO PRZODU — CZARNE (Pik/Trefl){front_mode}:\n"
             + style_store.front_prompt(False).strip()
         )
 

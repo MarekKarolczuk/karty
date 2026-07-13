@@ -9,17 +9,15 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
+    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from app import config
 from app.core import style_store
 from app.core.models import Suit
-from app.gui.card_grid import CardGrid
+from app.gui.deck_grid_panel import DeckGridPanel
 from app.gui.views import view_header
 from app.gui.widgets import SegmentedControl
-
-ROW_SCALE = 0.56   # kompaktowe sloty, żeby 13 kart mieściło się w wierszu
 
 
 class DeckView(QWidget):
@@ -74,91 +72,22 @@ class DeckView(QWidget):
         top.addWidget(self.section_seg, alignment=Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(top)
 
-        # filtr kolorów — widoczny tylko w sekcji Siatka
-        filter_row = QHBoxLayout()
-        self.suit_seg = SegmentedControl(
-            ["Wszystkie"] + [f"{s.symbol} {s.nazwa.capitalize()}" for s in Suit],
-            red_flags=[False] + [s.is_red for s in Suit],
-        )
-        self.suit_seg.changed.connect(self._on_filter_changed)
-        filter_row.addWidget(self.suit_seg)
-        filter_row.addStretch(1)
-        self._filter_row_host = QWidget()
-        self._filter_row_host.setLayout(filter_row)
-        layout.addWidget(self._filter_row_host)
-
-        # --- sekcje: siatka | wygenerowane | historia ------------------------------
+        # --- sekcje: siatka | historia ------------------------------------------
         self.sections = QStackedWidget()
 
-        # 1) siatka talii
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        host = QWidget()
-        host_layout = QVBoxLayout(host)
-        host_layout.setContentsMargins(0, 0, 0, 0)
-        host_layout.setSpacing(14)
-
-        self.grids: dict[Suit, CardGrid] = {}
-        self._rows: dict[Suit, QWidget] = {}
-        for suit in Suit:
-            row = QWidget()
-            row.setObjectName("panel")
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(12, 10, 12, 10)
-            row_layout.setSpacing(10)
-
-            label_box = QWidget()
-            label_box.setFixedWidth(52)
-            label_layout = QVBoxLayout(label_box)
-            label_layout.setContentsMargins(0, 8, 0, 0)
-            label_layout.setSpacing(0)
-            symbol = QLabel(suit.symbol)
-            symbol.setObjectName("suitRowSymbol")
-            symbol.setProperty("red", suit.is_red)
-            symbol.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            label_layout.addWidget(symbol)
-            name = QLabel(suit.nazwa.capitalize())
-            name.setObjectName("hint")
-            name.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            label_layout.addWidget(name)
-            label_layout.addStretch(1)
-            row_layout.addWidget(label_box)
-
-            # Talie = podgląd; klik otwiera lightbox, brak przypisywania (dodawania)
-            grid = CardGrid(suit, columns=13, scale=ROW_SCALE, spacing=8,
-                            droppable=False)
-            grid.slot_clicked.connect(self._zoom_slot)
-            grid.slot_right_clicked.connect(self.slot_right_clicked.emit)
-            grid_scroll = QScrollArea()
-            grid_scroll.setWidgetResizable(True)
-            grid_scroll.setWidget(grid)
-            grid_scroll.setVerticalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
-            grid_scroll.setFixedHeight(round(210 * ROW_SCALE) + 26)
-            row_layout.addWidget(grid_scroll, stretch=1)
-
-            host_layout.addWidget(row)
-            self.grids[suit] = grid
-            self._rows[suit] = row
-
-        self.empty_state = QLabel(
-            "Jeszcze brak wygenerowanych kart.\n"
-            "Przejdź na Ekran roboczy (◈), przypisz zdjęcia do kart "
-            "i kliknij ⚡ Generuj talię."
+        # 1) siatka talii (wspólny panel z filtrem — patrz DeckGridPanel);
+        #    Talie = podgląd: klik otwiera lightbox, brak przypisywania
+        self.grid_panel = DeckGridPanel(
+            droppable=False,
+            hint="klik = powiększ kartę (lightbox)   •   Spacja = szybki "
+                 "podgląd   •   prawy przycisk = opcje / usuwanie plików",
         )
-        self.empty_state.setObjectName("mutedInfo")
-        self.empty_state.setWordWrap(True)
-        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        host_layout.addWidget(self.empty_state)
-
-        hint = QLabel("klik = powiększ kartę (lightbox)   •   "
-                      "prawy przycisk = opcje / usuwanie plików")
-        hint.setObjectName("hint")
-        host_layout.addWidget(hint)
-        host_layout.addStretch(1)
-        scroll.setWidget(host)
-        self.sections.addWidget(scroll)
+        self.grid_panel.slot_clicked.connect(self._zoom_slot)
+        self.grid_panel.slot_right_clicked.connect(self.slot_right_clicked.emit)
+        self.grids = self.grid_panel.grids
+        self.suit_seg = self.grid_panel.suit_seg
+        self.empty_state = self.grid_panel.empty_state
+        self.sections.addWidget(self.grid_panel)
 
         # 2) historia generacji (output/ + backupy rewersu, po dacie)
         history_host = QWidget()
@@ -193,20 +122,13 @@ class DeckView(QWidget):
     # --- sekcje ---------------------------------------------------------------------
     def _on_section_changed(self, index: int) -> None:
         self.sections.setCurrentIndex(index)
-        self._filter_row_host.setVisible(index == 0)
         if index == 1:   # Historia
             self.refresh_history()
-
-    def _on_filter_changed(self, index: int) -> None:
-        selected = None if index == 0 else list(Suit)[index - 1]
-        for suit, row in self._rows.items():
-            row.setVisible(selected is None or suit is selected)
 
     def current_filter(self) -> Suit | None:
         """Aktywny filtr koloru siatki (None = wszystkie) — dla nawigacji
         ↑/↓ w lightboxie."""
-        index = self.suit_seg.current()
-        return None if index == 0 else list(Suit)[index - 1]
+        return self.grid_panel.current_filter()
 
     # --- lightbox + odświeżanie ------------------------------------------------------
     def _zoom_slot(self, slot) -> None:
@@ -216,7 +138,10 @@ class DeckView(QWidget):
         if slot.generated_path is not None:
             self.lightbox_requested.emit(slot.suit.nazwa, slot.value)
             return
-        target = slot.photo_path or slot.suit.template_path
+        try:
+            target = slot.photo_path or slot.suit.template_path
+        except FileNotFoundError:   # świeży preset bez tła tego koloru
+            return
         if target and Path(target).exists():
             self.preview_file_requested.emit(str(target))
 

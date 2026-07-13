@@ -21,6 +21,7 @@ FONTS_DIR = ASSETS_DIR / "fonts"
 UI_FONTS_DIR = FONTS_DIR / "ui"      # fonty interfejsu (NIE do rysowania kart!)
 PROJEKT_JSON = ROOT / "projekt.json"
 STYLES_JSON = ROOT / "styles.json"   # STARY format (migrowany do Style/)
+ANALIZA_JSON = ROOT / "analiza_zdjec.json"   # cache analiz AI zdjęć (auto-przydział)
 # Rewers i tła przodu żyją w folderach presetów: style_store.back_path()
 # i style_store.front_dir() wskazują pliki AKTYWNYCH presetów.
 
@@ -91,6 +92,14 @@ MODELS: dict[str, dict] = {
 DEFAULT_MODEL = "gemini-3-pro-image"
 SELECTED_MODEL = DEFAULT_MODEL   # nadpisywane z GUI / projekt.json
 
+# Model TEKSTOWO-WIZYJNY do analizy zdjęć (auto-przydział) — celowo POZA MODELS
+# (tam żyją wyłącznie modele obrazowe do pickera w GUI). Tani model multimodalny
+# zwracający JSON. Regionalny: vertex_location_for() dla id spoza MODELS zwraca
+# GCP_LOCATION (gdyby kiedyś zmienić na model rodziny gemini-3*, trzeba wymusić
+# "global" — patrz pole "vertex_location" w MODELS).
+ANALYSIS_MODEL = "gemini-2.5-flash"
+ANALYSIS_TEMPERATURE = 0.1   # analiza ma być powtarzalna, nie kreatywna
+
 
 def current_model() -> dict:
     return MODELS.get(SELECTED_MODEL, MODELS[DEFAULT_MODEL])
@@ -107,6 +116,10 @@ def vertex_location_for(model_id: str | None = None) -> str:
 ACCENT_HEX = "#801515"           # wartości, znaki, ramki dla kolorów czerwonych
 BLACK_HEX = "#1A1414"            # wartości dla pika i trefla
 CREAM_HEX = "#F5EFE0"            # kremowe tło ilustracji (do kluczowania)
+
+# --- Stabilizacja generacji (spójność talii) ---
+GEN_TEMPERATURE = 0.3   # niska temperatura = powtarzalny styl między kartami
+GEN_SEED = 12           # seed bazowy; wywołanie karty używa GEN_SEED + wariant
 
 # --- Format karty (preset wybierany w Ustawieniach) ---
 # klucz -> (etykieta, (szerokość mm, wysokość mm))
@@ -126,6 +139,18 @@ def set_card_preset(key: str) -> None:
     if key in CARD_PRESETS:
         SELECTED_CARD_PRESET = key
         CARD_MM = CARD_PRESETS[key][1]
+
+
+# Standardowa szerokość pliku tła (px) — jak domyślne tła; stałe pikselowe
+# klampu (masks.KLAMP_*) są strojone pod tę skalę
+TEMPLATE_STD_SZEROKOSC = 1696
+
+
+def template_target_size() -> tuple[int, int]:
+    """Docelowy rozmiar pliku tła: standardowa szerokość + proporcje CARD_MM
+    (liczone na żywo — preset formatu z Ustawień zmienia CARD_MM w sesji)."""
+    return (TEMPLATE_STD_SZEROKOSC,
+            round(TEMPLATE_STD_SZEROKOSC * CARD_MM[1] / CARD_MM[0]))
 
 # Rozszerzenia plików traktowane jako obrazy
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}

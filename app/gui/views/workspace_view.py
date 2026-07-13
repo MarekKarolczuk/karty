@@ -1,18 +1,17 @@
-"""Widok Ekran roboczy: pula zdjęć, duży podgląd z efektem AI i podglądem
-maski, właściwości karty (klawiatura wartości + siatka kolorów), suwaki
-kadrowania zdjęcia (Zoom/X/Y), panel generacji (tryb, postęp, kolejka, log)
-i film-strip całej talii z obsługą drag & drop."""
+"""Widok Ekran roboczy: pula zdjęć, środek z siatką talii 4×13 (strona
+domyślna) i szczegółem karty (podgląd + kadrowanie + historia wariantów),
+właściwości karty (klawiatura wartości + siatka kolorów), panel generacji
+oraz wysuwany drawer z kolejką i logiem API."""
 from __future__ import annotations
 
 from PIL import Image
-from PyQt6.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPen, QPixmap,
+from PyQt6.QtCore import (
+    QEasingCurve, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter,
-    QVBoxLayout, QWidget,
+    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout,
+    QWidget,
 )
 
 from app.core.compositor import DEFAULT_TRANSFORM
@@ -20,54 +19,12 @@ from app.core.masks import get_masks
 from app.core.models import Suit
 from app.gui import theme
 from app.gui.card_grid import CardGrid, CardSlot
+from app.gui.deck_grid_panel import DeckGridPanel
 from app.gui.params_panel import PreviewPane, TemplatePicker
-from app.gui.photo_gallery import MIME_PHOTO, GalleryPanel
+from app.gui.photo_gallery import GalleryPanel
 from app.gui.views import view_header
 from app.gui.views.generation_panel import GenerationPanel
 from app.gui.widgets import cover_pixmap
-
-
-class _StripList(QListWidget):
-    """Film-strip talii przyjmujący upuszczane zdjęcia (drag & drop
-    z puli po lewej bezpośrednio na kartę w pasku)."""
-
-    photo_dropped = pyqtSignal(str, str)   # klucz "kolor:wartość", ścieżka
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        # KLUCZOWE: QListWidget przechwytuje drag&drop przez widok elementów —
-        # bez trybu DropOnly zdarzenia nie docierają do dropEvent poniżej.
-        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
-        self.viewport().setAcceptDrops(True)
-
-    def dragEnterEvent(self, event):  # noqa: N802 (API Qt)
-        if event.mimeData().hasFormat(MIME_PHOTO):
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):  # noqa: N802
-        if event.mimeData().hasFormat(MIME_PHOTO):
-            item = self.itemAt(event.position().toPoint())
-            self.setCurrentItem(item)
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event):  # noqa: N802
-        if event.mimeData().hasFormat(MIME_PHOTO):
-            item = self.itemAt(event.position().toPoint())
-            if item is not None:
-                path = bytes(event.mimeData().data(MIME_PHOTO)).decode("utf-8")
-                self.photo_dropped.emit(
-                    item.data(Qt.ItemDataRole.UserRole), path
-                )
-            event.acceptProposedAction()
-        else:
-            super().dropEvent(event)
-
-STRIP_W, STRIP_H = 66, 92
 
 CARD_NAMES = {
     "A": "As", "K": "Król", "Q": "Dama", "J": "Walet",
@@ -83,87 +40,72 @@ STATUS_STYLES = {
 }
 
 
-def _strip_pixmap(source: QPixmap | None, border: str, value: str,
-                  suit: Suit, empty: bool) -> QPixmap:
-    """Miniatura karty do film-stripu z czytelnym badge'em wartość+kolor
-    w rogu (np. „A♥") oraz kolorową ramką stanu. Wskaźnik aktywnej karty
-    rysuje natywnie QListWidget (zaznaczenie — patrz QSS #filmStrip::item:selected)."""
-    out = QPixmap(STRIP_W, STRIP_H)
-    out.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(out)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+class BottomDrawer(QWidget):
+    """Wysuwany od dołu panel nakładany NA widok (nie zmienia layoutu pod
+    spodem): kolejka + log API. Animacja geometrii ≤ 120 ms."""
 
-    body = QRectF(1, 1, STRIP_W - 2, STRIP_H - 2)
-    # tło miniatury (obraz albo przygaszony placeholder pustego slotu)
-    if source is not None and not source.isNull():
-        painter.drawPixmap(0, 0, source)
-    else:
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(theme.SURFACE if hasattr(theme, "SURFACE")
-                                else "#1E1710"))
-        painter.drawRoundedRect(body, 8, 8)
+    HEIGHT = 230
 
-    # dolny scrim, żeby badge był czytelny na jasnym zdjęciu
-    scrim_h = 30
-    gradient = QLinearGradient(0, STRIP_H - scrim_h, 0, STRIP_H)
-    gradient.setColorAt(0.0, QColor(0, 0, 0, 0))
-    gradient.setColorAt(1.0, QColor(0, 0, 0, 165))
-    clip = QRectF(1, STRIP_H - scrim_h, STRIP_W - 2, scrim_h - 1)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(gradient))
-    painter.drawRoundedRect(clip, 8, 8)
-
-    # badge „wartość+kolor" w lewym-dolnym rogu
-    is_red = suit.is_red
-    badge_color = QColor(theme.ACCENT_HOVER if is_red else "#EDE4D2")
-    font = QFont()
-    font.setPointSize(11 if len(value) == 1 else 9)
-    font.setBold(True)
-    painter.setFont(font)
-    painter.setPen(QColor(0, 0, 0, 190))
-    painter.drawText(QRectF(4, STRIP_H - 26, STRIP_W - 6, 22),
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                     f" {value}{suit.symbol}")
-    painter.setPen(badge_color)
-    painter.drawText(QRectF(3, STRIP_H - 27, STRIP_W - 6, 22),
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                     f" {value}{suit.symbol}")
-
-    # kolorowa ramka stanu
-    painter.setPen(QPen(QColor(border), 2.4 if not empty else 1.4))
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawRoundedRect(body, 8, 8)
-    painter.end()
-    return out
-
-
-class _LegendDot(QWidget):
-    def __init__(self, color: str, text: str, parent=None):
+    def __init__(self, content: QWidget, parent: QWidget):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {color}; font-size: 8px;")
-        layout.addWidget(dot)
-        label = QLabel(text)
-        label.setObjectName("hint")
-        layout.addWidget(label)
+        layout.addWidget(content)
+        self._anim = QPropertyAnimation(self, b"geometry", self)
+        self._anim.setDuration(120)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hide()
+
+    def _geometries(self) -> tuple[QRect, QRect]:
+        parent = self.parentWidget()
+        open_rect = QRect(0, parent.height() - self.HEIGHT,
+                          parent.width(), self.HEIGHT)
+        closed_rect = QRect(0, parent.height(), parent.width(), self.HEIGHT)
+        return open_rect, closed_rect
+
+    def set_open(self, open_: bool) -> None:
+        open_rect, closed_rect = self._geometries()
+        self._anim.stop()
+        if open_:
+            self.setGeometry(closed_rect)
+            self.show()
+            self.raise_()
+            self._anim.setStartValue(closed_rect)
+            self._anim.setEndValue(open_rect)
+            try:
+                self._anim.finished.disconnect()
+            except TypeError:
+                pass
+        else:
+            self._anim.setStartValue(self.geometry())
+            self._anim.setEndValue(closed_rect)
+            try:
+                self._anim.finished.disconnect()
+            except TypeError:
+                pass
+            self._anim.finished.connect(self.hide)
+        self._anim.start()
+
+    def reposition(self) -> None:
+        """Po zmianie rozmiaru rodzica (resizeEvent widoku)."""
+        if self.isVisible():
+            open_rect, _ = self._geometries()
+            self.setGeometry(open_rect)
 
 
 class WorkspaceView(QWidget):
-    strip_card_selected = pyqtSignal(str, str)   # suit_nazwa, value
     card_picked = pyqtSignal(str, str)           # suit_nazwa, value (z klawiatury/siatki)
     regenerate_clicked = pyqtSignal(str, str)    # suit_nazwa, value
     generate_deck_clicked = pyqtSignal()
     unassign_clicked = pyqtSignal(str, str)      # suit_nazwa, value
-    strip_photo_dropped = pyqtSignal(str, str)   # klucz "kolor:wartość", ścieżka
+    grid_photo_dropped = pyqtSignal(str, str)    # klucz "kolor:wartość", ścieżka
     preview_photo_dropped = pyqtSignal(str)      # drop na podgląd = swap na bieżącej karcie
     transform_changed = pyqtSignal(str, str, dict)    # podgląd na żywo (debounce)
     transform_committed = pyqtSignal(str, str, dict)  # puszczenie suwaka → zapis
     history_navigate = pyqtSignal(str, str, int)      # suit, value, kierunek (-1/+1)
     history_set_main = pyqtSignal(str, str)           # ustaw bieżący wariant jako główny
     restamp_clicked = pyqtSignal()                    # przestempluj narożniki (bez API)
+    auto_assign_clicked = pyqtSignal()                # auto-przydział zdjęć AI
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -191,6 +133,16 @@ class WorkspaceView(QWidget):
         self.mask_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mask_btn.toggled.connect(self._toggle_mask_preview)
         top.addWidget(self.mask_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.auto_assign_btn = QPushButton("🪄  Auto-przydział AI")
+        self.auto_assign_btn.setObjectName("ghostBtn")
+        self.auto_assign_btn.setToolTip(
+            "AI analizuje zdjęcia z folderu zdjecia/ (liczba osób, motywy, "
+            "jakość)\ni proponuje przypisanie zdjęć do kart — z podglądem "
+            "przed zatwierdzeniem"
+        )
+        self.auto_assign_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_assign_btn.clicked.connect(self.auto_assign_clicked.emit)
+        top.addWidget(self.auto_assign_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         self.restamp_btn = QPushButton("♻  Przestempluj narożniki")
         self.restamp_btn.setObjectName("ghostBtn")
         self.restamp_btn.setToolTip(
@@ -215,13 +167,40 @@ class WorkspaceView(QWidget):
         self.gallery_panel = GalleryPanel()
         splitter.addWidget(self.gallery_panel)
 
-        # --- środek: nagłówek karty + podgląd + film-strip -------------------------
+        # --- środek: QStackedWidget — strona 0: siatka talii 4×13 (domyślna),
+        #     strona 1: szczegół karty (nagłówek + podgląd + historia) ---------
+        self.center_stack = QStackedWidget()
+
+        # strona 0: siatka talii z filtrem (druga instancja panelu — sloty
+        # nie mogą być współdzielone z widokiem Talie; stan synchronizuje
+        # MainWindow przez sync_deck)
+        self.deck_panel = DeckGridPanel(
+            droppable=True,
+            hint="klik = wybierz kartę   •   upuść zdjęcie na slot = przypisz"
+                 "   •   Spacja = szybki podgląd",
+        )
+        self.deck_panel.slot_clicked.connect(
+            lambda slot: self.card_picked.emit(slot.suit.nazwa, slot.value))
+        self.deck_panel.photo_dropped.connect(
+            lambda slot, path: self.grid_photo_dropped.emit(
+                f"{slot.suit.nazwa}:{slot.value}", path))
+        self.center_stack.addWidget(self.deck_panel)
+
+        # strona 1: szczegół wybranej karty
         center = QWidget()
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(8)
 
         card_header = QHBoxLayout()
+        self.back_to_deck_btn = QPushButton("▦  Talia")
+        self.back_to_deck_btn.setObjectName("ghostBtn")
+        self.back_to_deck_btn.setToolTip("Wróć do siatki całej talii")
+        self.back_to_deck_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_to_deck_btn.clicked.connect(
+            lambda: self.center_stack.setCurrentIndex(0))
+        card_header.addWidget(self.back_to_deck_btn,
+                              alignment=Qt.AlignmentFlag.AlignTop)
         self.value_badge = QLabel("—")
         self.value_badge.setObjectName("cardBigValue")
         card_header.addWidget(self.value_badge)
@@ -305,35 +284,8 @@ class WorkspaceView(QWidget):
         regen_row.addWidget(self.regen_btn)
         center_layout.addLayout(regen_row)
 
-        strip_caption = QHBoxLayout()
-        strip_label = QLabel("TALIA — przewiń, aby wybrać · upuść zdjęcie na kartę")
-        strip_label.setObjectName("sideCaption")
-        strip_caption.addWidget(strip_label)
-        strip_caption.addStretch(1)
-        for key in ("done", "assigned", "queued", "empty"):
-            text, color = STATUS_STYLES[key]
-            strip_caption.addWidget(_LegendDot(color, text))
-        center_layout.addLayout(strip_caption)
-
-        self.strip = _StripList()
-        self.strip.setObjectName("filmStrip")
-        self.strip.setViewMode(QListWidget.ViewMode.IconMode)
-        self.strip.setFlow(QListWidget.Flow.LeftToRight)
-        self.strip.setWrapping(False)
-        self.strip.setIconSize(QSize(STRIP_W, STRIP_H))
-        self.strip.setFixedHeight(STRIP_H + 40)
-        self.strip.setHorizontalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
-        self.strip.setSpacing(6)
-        # IconMode włącza wewnętrzne DnD i przesuwanie elementów — wymuszamy
-        # tylko przyjmowanie zrzutów zdjęć, bez rearanżacji miniatur.
-        self.strip.setMovement(QListWidget.Movement.Static)
-        self.strip.setDragDropMode(QListWidget.DragDropMode.DropOnly)
-        self.strip.viewport().setAcceptDrops(True)
-        self.strip.itemClicked.connect(self._on_strip_clicked)
-        self.strip.photo_dropped.connect(self.strip_photo_dropped.emit)
-        center_layout.addWidget(self.strip)
-
-        splitter.addWidget(center)
+        self.center_stack.addWidget(center)
+        splitter.addWidget(self.center_stack)
 
         # --- prawa kolumna: właściwości + kadrowanie + generacja --------------------
         right_scroll = QScrollArea()
@@ -480,11 +432,14 @@ class WorkspaceView(QWidget):
         splitter.setSizes([290, 700, 340])
         layout.addWidget(splitter, stretch=1)
 
-        # --- wysuwany dolny panel: kolejka + log (z GenerationPanel) ---------------
-        self.gen_panel.details.setVisible(False)
-        self.gen_panel.details.setFixedHeight(190)
-        self.details_btn.toggled.connect(self.gen_panel.details.setVisible)
-        layout.addWidget(self.gen_panel.details)
+        # --- wysuwany dolny drawer: kolejka + log (nakładka NA widok — layout
+        #     pod spodem się nie przesuwa) --------------------------------------
+        self.drawer = BottomDrawer(self.gen_panel.details, self)
+        self.details_btn.toggled.connect(self.drawer.set_open)
+
+    def resizeEvent(self, event):  # noqa: N802 (API Qt)
+        super().resizeEvent(event)
+        self.drawer.reposition()
 
     @staticmethod
     def _separator() -> QFrame:
@@ -677,23 +632,11 @@ class WorkspaceView(QWidget):
             self.unassign_btn.setEnabled(False)
             self._current_has_photo = False
         self._update_crop_enabled()
-        self._sync_strip_selection()
+        # wybór karty (siatka/klawiatura/drop) = wejście w stronę szczegółu
+        self.center_stack.setCurrentIndex(1)
 
         if self._mask_preview_on:
             self._apply_mask_overlay(slot.suit)
-
-    def _sync_strip_selection(self) -> None:
-        """Zaznacza w film-stripie miniaturę bieżącej karty (wskaźnik aktywnej
-        karty — natywne zaznaczenie QListWidget, bez przebudowy ikon)."""
-        key = f"{self._current_suit.nazwa}:{self._current_value}"
-        for i in range(self.strip.count()):
-            item = self.strip.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == key:
-                self.strip.blockSignals(True)
-                self.strip.setCurrentItem(item)
-                self.strip.blockSignals(False)
-                self.strip.scrollToItem(item)
-                break
 
     # --- podgląd maski -------------------------------------------------------------
     def _toggle_mask_preview(self, on: bool) -> None:
@@ -713,38 +656,26 @@ class WorkspaceView(QWidget):
         except (FileNotFoundError, OSError):
             self.preview.canvas.set_mask_boxes(None, (1, 1))
 
-    # --- film-strip -----------------------------------------------------------------
-    def refresh_strip(self, values: list[str], grids: dict[Suit, CardGrid]) -> None:
-        selected = self.strip.currentItem()
-        selected_key = selected.data(Qt.ItemDataRole.UserRole) if selected else None
-        self.strip.clear()
-        for suit in Suit:
-            grid = grids[suit]
-            for value in values:
-                slot = grid.slots.get(value)
-                if slot is None:
+    # --- siatka talii (strona 0 środka) ----------------------------------------
+    def sync_deck(self, values: list[str], grids: dict[Suit, CardGrid]) -> None:
+        """Lustro stanu głównych siatek (instancje widoku Talie — self.grids
+        w MainWindow) w panelu talii Ekranu roboczego; wołane po każdej
+        zmianie przypisań / generacji (patrz MainWindow._refresh_overview)."""
+        for suit, grid in grids.items():
+            mirror = self.deck_panel.grids[suit]
+            for value, src in grid.slots.items():
+                dst = mirror.slots.get(value)
+                if dst is None:
                     continue
-                if slot.generated_path is not None:
-                    source_path, border = slot.generated_path, theme.GREEN
-                elif slot.property("state") == "queued":
-                    source_path, border = slot.photo_path, theme.INFO
-                elif slot.photo_path is not None:
-                    source_path, border = slot.photo_path, theme.GOLD
-                else:
-                    source_path, border = None, theme.BORDER
-                base = (cover_pixmap(source_path, STRIP_W, STRIP_H, radius=8)
-                        if source_path is not None else None)
-                icon = _strip_pixmap(base, border, value, suit,
-                                     empty=source_path is None)
-                # tekst wypalony w miniaturze (badge) — pozycja bez podpisu
-                item = QListWidgetItem(QIcon(icon), "")
-                item.setData(Qt.ItemDataRole.UserRole, f"{suit.nazwa}:{value}")
-                name = CARD_NAMES.get(value, value)
-                item.setToolTip(f"{name} {suit.nazwa}")
-                self.strip.addItem(item)
-                if selected_key and item.data(Qt.ItemDataRole.UserRole) == selected_key:
-                    self.strip.setCurrentItem(item)
-
-    def _on_strip_clicked(self, item: QListWidgetItem) -> None:
-        suit_nazwa, value = item.data(Qt.ItemDataRole.UserRole).split(":", 1)
-        self.strip_card_selected.emit(suit_nazwa, value)
+                state = src.property("state")
+                if (dst.photo_path, dst.generated_path, dst.property("state")) \
+                        == (src.photo_path, src.generated_path, state):
+                    continue
+                dst.set_photo(src.photo_path)
+                if src.generated_path is not None:
+                    dst.set_generated(src.generated_path)
+                if state == "queued":
+                    dst.set_queued(True)
+                elif state == "error":
+                    dst.set_error(src.toolTip())
+        self.deck_panel.refresh_empty_state()

@@ -489,17 +489,6 @@ QListWidget {{ border: none; background: transparent; }}
 QListWidget::item {{ border-radius: 10px; padding: 4px; color: {MUTED_2}; }}
 QListWidget::item:selected {{ background: rgba(198, 64, 46, 0.25); color: {TEXT}; }}
 QListWidget::item:hover {{ background: {SURFACE_HOVER}; }}
-QListWidget#filmStrip {{
-    background: {BG_DEEP};
-    border: 1px solid {BORDER};
-    border-radius: 12px;
-    padding: 6px;
-}}
-QListWidget#filmStrip::item {{ border: 2px solid transparent; border-radius: 10px; }}
-QListWidget#filmStrip::item:selected {{
-    background: rgba(198, 64, 46, 0.30);
-    border: 2px solid {ACCENT};
-}}
 QListWidget#queueList {{
     background: {BG_DEEP};
     border: 1px solid {BORDER};

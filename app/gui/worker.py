@@ -67,6 +67,62 @@ class GenerationWorker(QThread):
         self.finished_all.emit(done, errors)
 
 
+class AnalysisWorker(QThread):
+    """Analiza zdjęć przez Gemini (auto-przydział) — sekwencyjnie, z cache
+    na dysku (analiza_zdjec.json). Cache-hit = zero API; po każdej udanej
+    analizie natychmiastowy dopis do cache, więc anulowanie w połowie nie
+    marnuje wykonanych analiz."""
+
+    progress = pyqtSignal(int, int)        # zrobione, wszystkie
+    photo_done = pyqtSignal(str, object)   # ścieżka, AnalizaZdjecia
+    photo_error = pyqtSignal(str, str)     # ścieżka, komunikat błędu
+    fatal_error = pyqtSignal(str)          # błąd konta — stop całej serii
+    finished_all = pyqtSignal(object)      # list[AnalizaZdjecia] (udane)
+
+    def __init__(self, paths: list[str], motywy: dict[str, str], parent=None):
+        super().__init__(parent)
+        self.paths = paths
+        self.motywy = dict(motywy)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        # tylko flaga — abort_active() to mechanizm Stability, tu niepotrzebny;
+        # bieżące żądanie Gemini dokończy się w tle
+        self._cancelled = True
+
+    def run(self) -> None:
+        from pathlib import Path
+
+        from app.api.errors import FatalAPIError
+        from app.core import photo_analyzer
+
+        wyniki: list = []
+        total = len(self.paths)
+        for i, path_str in enumerate(self.paths, start=1):
+            if self._cancelled:
+                break
+            path = Path(path_str)
+            try:
+                analiza = photo_analyzer.z_cache(path, self.motywy)
+                if analiza is None:
+                    analiza = photo_analyzer.analizuj_zdjecie(path, self.motywy)
+                    photo_analyzer.dopisz_cache(path, self.motywy, analiza)
+                    # tani bezpiecznik RPM darmowego planu między wywołaniami
+                    self.msleep(300)
+                wyniki.append(analiza)
+                self.photo_done.emit(path_str, analiza)
+            except FatalAPIError as exc:
+                if not self._cancelled:
+                    self.fatal_error.emit(str(exc))
+                break
+            except Exception as exc:
+                if self._cancelled:
+                    break
+                self.photo_error.emit(path_str, str(exc))
+            self.progress.emit(i, total)
+        self.finished_all.emit(wyniki)
+
+
 class TemplateWorker(QThread):
     """Generowanie teł przodu karty (AI) w tle — 1 lub kilka wariantów.
 
@@ -104,6 +160,74 @@ class TemplateWorker(QThread):
                     self.failed.emit(self.suit, str(exc))
                 break
         self.finished_all.emit(made, self.count)
+
+
+class TemplateSetWorker(QThread):
+    """Generowanie KOMPLETU teł przodu (4 kolory jednym stylem) + opcjonalnie
+    rewers — sekwencyjnie, ze spójnością zestawu: pierwsze tło (kier) powstaje
+    bez referencji, kolejne kolory dostają je jako obraz referencyjny i ten
+    sam seed."""
+
+    variant_done = pyqtSignal(object, str)   # Suit, ścieżka tła
+    back_done = pyqtSignal(str)              # ścieżka rewersu
+    failed = pyqtSignal(object, str)         # Suit|None (None = rewers), błąd
+    progress = pyqtSignal(int, int)          # zrobione, wszystkie
+    finished_all = pyqtSignal(int, int)      # zrobione, wszystkie
+
+    def __init__(self, back_prompt: str | None = None, back_source=None,
+                 back_orientation: str = "portrait", parent=None):
+        super().__init__(parent)
+        self.back_prompt = back_prompt       # None = bez rewersu
+        self.back_source = back_source
+        self.back_orientation = back_orientation
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        from pathlib import Path
+
+        from app import config
+        from app.core import prompts
+
+        total = len(list(Suit)) + (1 if self.back_prompt else 0)
+        made = 0
+        anchor: Path | None = None   # pierwsze tło zestawu = referencja reszty
+        for suit in Suit:
+            if self._cancelled:
+                break
+            try:
+                path = generator.generate_template(
+                    suit,
+                    prompts.front_set_prompt(suit, with_reference=anchor is not None),
+                    reference=anchor,
+                    use_auto_reference=False,
+                    seed=config.GEN_SEED,
+                )
+                if anchor is None:
+                    anchor = path
+                made += 1
+                self.variant_done.emit(suit, str(path))
+            except Exception as exc:
+                if not self._cancelled:
+                    self.failed.emit(suit, str(exc))
+                break
+            self.progress.emit(made, total)
+        if self.back_prompt and not self._cancelled and made == len(list(Suit)):
+            try:
+                path = generator.generate_back(
+                    self.back_prompt, self.back_source, self.back_orientation
+                )
+                made += 1
+                self.back_done.emit(str(path))
+            except Exception as exc:
+                if not self._cancelled:
+                    self.failed.emit(None, str(exc))
+            self.progress.emit(made, total)
+        self.finished_all.emit(made, total)
 
 
 class BackWorker(QThread):

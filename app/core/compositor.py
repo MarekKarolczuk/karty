@@ -1,7 +1,8 @@
-"""Składanie karty: kolaż init_image pod pop-out, wartości w rogach,
-klasyczna kompozycja w masce (fallback) i zapis z DPI.
+"""Składanie karty: kolaż init_image pod pop-out (całe zdjęcie na szablonie),
+wartości w rogach, klasyczna kompozycja w masce (fallback) i zapis z DPI.
 
-Szablon poza maską pozostaje pixel-perfect nienaruszony. ZASADA NADRZĘDNA:
+O nienaruszalność szablonu na FINALNEJ karcie dba klamp adaptacyjny
+(generator._klamp_do_szablonu + masks.maska_klampu). ZASADA NADRZĘDNA:
 AI nie rysuje tekstu — wartości i symbole narożne stempluje deterministycznie
 stempluj_narozniki() PO odpowiedzi API, wg aktywnego presetu „wartosci".
 """
@@ -20,8 +21,8 @@ from app.core.models import CardSpec, Suit
 # Domyślna transformacja kadru (GUI: suwaki Zoom/X/Y)
 DEFAULT_TRANSFORM = {"zoom": 1.0, "dx": 0.0, "dy": 0.0}
 
-# Cache przeskalowanych szablonów/masek dla szybkiego podglądu w GUI
-_scaled_cache: dict[tuple, tuple[Image.Image, Image.Image, tuple]] = {}
+# Cache przeskalowanych szablonów/bboxów dla szybkiego podglądu w GUI
+_scaled_cache: dict[tuple, tuple[Image.Image, Image.Image, tuple, tuple]] = {}
 
 # Cache załadowanych czcionek (stemplowanie 52+ kart bez ponownego I/O)
 _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
@@ -59,6 +60,11 @@ class StylNaroznika:
     offset_x: float = 0.0
     offset_y: float = 0.0
     odstep: float = 42.0                     # wartość↔symbol (domyślnie 30% → 72%)
+    # efekty stempla (0/puste = brak — rendering identyczny jak dawniej)
+    obwodka_grubosc: float = 0.0             # % wysokości tarczy
+    obwodka_kolor: str = ""                  # pusty = config.CREAM_HEX
+    cien_przesuniecie: float = 0.0           # % wysokości tarczy (prawo-dół)
+    cien_kolor: str = ""                     # pusty = czerń (stała alpha)
 
 
 def _liczba(field: str, default: float) -> float:
@@ -71,6 +77,12 @@ def _liczba(field: str, default: float) -> float:
 def _kolor(field: str, default: str) -> str:
     v = style_store.text("wartosci", field).strip()
     return v if re.fullmatch(r"#[0-9a-fA-F]{6}", v) else default
+
+
+def _rgba(hex_color: str, alpha: int) -> tuple[int, int, int, int]:
+    """Hex #RRGGBB → krotka RGBA (do półprzezroczystego cienia)."""
+    return (int(hex_color[1:3], 16), int(hex_color[3:5], 16),
+            int(hex_color[5:7], 16), alpha)
 
 
 def styl_z_presetu() -> StylNaroznika:
@@ -91,6 +103,10 @@ def styl_z_presetu() -> StylNaroznika:
         offset_x=_liczba("offset_x", d.offset_x),
         offset_y=_liczba("offset_y", d.offset_y),
         odstep=_liczba("odstep", d.odstep),
+        obwodka_grubosc=_liczba("obwodka_grubosc", d.obwodka_grubosc),
+        obwodka_kolor=_kolor("obwodka_kolor", d.obwodka_kolor),
+        cien_przesuniecie=_liczba("cien_przesuniecie", d.cien_przesuniecie),
+        cien_kolor=_kolor("cien_kolor", d.cien_kolor),
     )
 
 
@@ -110,8 +126,23 @@ def _corner_tile(box: tuple[int, int, int, int], spec: CardSpec,
     cx = w / 2 + w * styl.offset_x / 100
     value_y = h * 0.30 + h * styl.offset_y / 100
     symbol_y = value_y + h * styl.odstep / 100
-    draw.text((cx, value_y), spec.value, font=value_font, fill=color, anchor="mm")
-    draw.text((cx, symbol_y), spec.suit.symbol, font=symbol_font, fill=color, anchor="mm")
+
+    # cień pod tekstem (przesunięty w prawo-dół, bez obwódki)
+    if styl.cien_przesuniecie > 0:
+        off = h * styl.cien_przesuniecie / 100
+        shadow = _rgba(styl.cien_kolor or "#000000", 110)
+        draw.text((cx + off, value_y + off), spec.value, font=value_font,
+                  fill=shadow, anchor="mm")
+        draw.text((cx + off, symbol_y + off), spec.suit.symbol,
+                  font=symbol_font, fill=shadow, anchor="mm")
+
+    # obwódka (kontur) — stroke_width=0 renderuje identycznie jak dawniej
+    stroke_w = round(h * styl.obwodka_grubosc / 100)
+    stroke_fill = styl.obwodka_kolor or config.CREAM_HEX
+    draw.text((cx, value_y), spec.value, font=value_font, fill=color,
+              anchor="mm", stroke_width=stroke_w, stroke_fill=stroke_fill)
+    draw.text((cx, symbol_y), spec.suit.symbol, font=symbol_font, fill=color,
+              anchor="mm", stroke_width=stroke_w, stroke_fill=stroke_fill)
     return tile
 
 
@@ -120,12 +151,24 @@ def stempluj_narozniki(obraz: Image.Image, spec: CardSpec,
                        tmasks: masks.TemplateMasks | None = None) -> Image.Image:
     """Deterministyczna warstwa narożników: wartość + symbol w obu tarczach
     (dolna obrócona o 180°, jak na kartach). Czysta funkcja — to samo wejście
-    daje identyczne piksele. Jedyne miejsce rysujące tekst na karcie."""
+    daje identyczne piksele. Jedyne miejsce rysujące tekst na karcie.
+
+    Przed stemplem tarcze są twardo czyszczone wklejką z czystego szablonu —
+    dla świeżych kart (po klampie tła) to no-op, ale stare raw z FULL_AI
+    (z pipami dorysowanymi przez model) „Przestempluj narożniki" naprawia
+    bez API."""
     if styl is None:
         styl = styl_z_presetu()
     if tmasks is None:
         tmasks = masks.get_masks(spec.suit.template_path)
     card = obraz.convert("RGBA")
+    try:
+        template = Image.open(spec.suit.template_path).convert("RGBA")
+    except (FileNotFoundError, OSError):
+        template = None
+    if template is not None and template.size == card.size:
+        for box in (tmasks.tl_box, tmasks.br_box):
+            card.paste(template.crop(box), (box[0], box[1]))
     tl_tile = _corner_tile(tmasks.tl_box, spec, styl)
     br_tile = _corner_tile(tmasks.br_box, spec, styl).rotate(180)
     card.alpha_composite(tl_tile, (tmasks.tl_box[0], tmasks.tl_box[1]))
@@ -139,6 +182,23 @@ def draw_corners(card: Image.Image, spec: CardSpec,
     return stempluj_narozniki(card, spec, tmasks=tmasks)
 
 
+def wypelnij_okno(template: Image.Image, suit: Suit) -> Image.Image:
+    """Szablon z oknem symbolu wypełnionym płasko kolorem karty (czerwień
+    kier/karo, czerń pik/trefl — z presetu „wartosci") po masce center_full:
+    wypełnienie sięga konturu ramy (erodowana maska center zostawiała kremową
+    szczelinę — „biały ślad" symbolu). Wspólne dla kolażu pop-out, wejścia
+    FULL_AI i bazy klampu — model i klamp widzą ten sam, finalny symbol."""
+    tmasks = masks.get_masks(suit.template_path)
+    styl = styl_z_presetu()
+    kolor = styl.kolor_czerwony if suit.is_red else styl.kolor_czarny
+    fill = Image.new("RGB", template.size, kolor)
+    center_full = tmasks.center_full
+    if center_full.size != template.size:
+        center_full = center_full.resize(template.size,
+                                         Image.Resampling.BILINEAR)
+    return Image.composite(fill, template, center_full)
+
+
 def wyczysc_tarcze(img: Image.Image, template: Image.Image,
                    tmasks: masks.TemplateMasks) -> Image.Image:
     """Reset narożników: wkleja piksele czystego szablonu w bboxy tarcz
@@ -150,45 +210,64 @@ def wyczysc_tarcze(img: Image.Image, template: Image.Image,
 
 
 def _scaled_assets(template_path: Path, max_side: int) \
-        -> tuple[Image.Image, Image.Image, tuple[int, int, int, int]]:
-    """(szablon, maska pop-out, bbox centrum) przeskalowane do max_side."""
+        -> tuple[Image.Image, Image.Image, tuple[int, int, int, int],
+                 tuple[tuple[int, int, int, int], tuple[int, int, int, int]]]:
+    """(szablon, maska okna center_full, bbox okna, bboxy tarcz TL/BR)
+    przeskalowane do max_side. Maska okna BEZ erozji — wypełnienie kolorem
+    symbolu ma sięgać konturu ramy (kremowa szczelina = „biały ślad")."""
     template_path = Path(template_path)
     key = (str(template_path), max_side, template_path.stat().st_mtime,
            masks.MASK_VERSION)
     if key in _scaled_cache:
         return _scaled_cache[key]
     template = Image.open(template_path).convert("RGB")
-    popout = masks.get_popout_mask(template_path)
-    center_bbox = masks.get_masks(template_path).center.getbbox()
+    tmasks = masks.get_masks(template_path)
+    center = tmasks.center_full
+    center_bbox = center.getbbox()
     if center_bbox is None:
         raise RuntimeError(f"Pusta maska centrum: {template_path.name}")
+    shield_boxes = (tmasks.tl_box, tmasks.br_box)
     if max_side and max(template.size) > max_side:
         ratio = max_side / max(template.size)
         new_size = (round(template.width * ratio), round(template.height * ratio))
         template = template.resize(new_size, Image.Resampling.LANCZOS)
         # BILINEAR + doclipowanie: LANCZOS daje ringing (niezerowe piksele)
-        # poza maską, a poza nią musi zostać czysta czerń
-        popout = popout.resize(new_size, Image.Resampling.BILINEAR)
-        popout = popout.point(lambda v: 0 if v < 8 else v)
+        # poza maską, a wypełnienie okna nie może wyjść poza kontur
+        center = center.resize(new_size, Image.Resampling.BILINEAR)
+        center = center.point(lambda v: 0 if v < 8 else v)
         center_bbox = tuple(round(v * ratio) for v in center_bbox)
-    _scaled_cache[key] = (template, popout, center_bbox)
+        shield_boxes = tuple(tuple(round(v * ratio) for v in box)
+                             for box in shield_boxes)
+    _scaled_cache[key] = (template, center, center_bbox, shield_boxes)
     return _scaled_cache[key]
 
 
 def build_init_image(suit: Suit, photo_path: Path,
                      transform: dict | None = None,
                      max_side: int = 0) -> Image.Image:
-    """Kolaż startowy pod pop-out: szablon + zdjęcie wkadrowane przez
-    użytkownika (Zoom/X/Y), widoczne wyłącznie w poszerzonej masce.
+    """Kolaż startowy pod pop-out: szablon z oknem symbolu wypełnionym
+    DETERMINISTYCZNIE kolorem tła (czerwień kier/karo, czerń pik/trefl —
+    z presetu „wartosci"), a na tym CAŁE zdjęcie (prostokąt) bez docinania
+    maską. Model widzi finalny kształt symbolu (nie wymyśla własnego serca)
+    i postać narzuconą na kartę do przerysowania; tło poza sylwetką i tak
+    wraca z szablonu przez klamp adaptacyjny. Na wierzch wracają wycinki
+    szablonu w tarczach narożnych — model zawsze widzi czyste tarcze.
 
-    Zdjęcie NIE jest przycinane do sztywnego środka — kadr ustawia
-    użytkownik, a maska sięga ponad ramę symbolu. max_side > 0 daje
-    szybki, pomniejszony kolaż (podgląd w GUI / upload do API).
+    Kadr (Zoom/X/Y) ustawia użytkownik względem bboxa symbolu, jak dotąd.
+    max_side > 0 daje szybki, pomniejszony kolaż (podgląd w GUI / upload).
     """
     t = {**DEFAULT_TRANSFORM, **(transform or {})}
-    template, popout, bbox = _scaled_assets(suit.template_path, max_side)
+    template, center, bbox, shield_boxes = _scaled_assets(
+        suit.template_path, max_side)
     bx0, by0, bx1, by1 = bbox
     bw, bh = bx1 - bx0, by1 - by0
+
+    # Deterministyczne tło okna: kolor symbolu dokładnie po kontur okna
+    # szablonu — identyczny kształt na każdej karcie
+    styl = styl_z_presetu()
+    kolor = styl.kolor_czerwony if suit.is_red else styl.kolor_czarny
+    fill = Image.new("RGB", template.size, kolor)
+    layer = Image.composite(fill, template, center)
 
     # Docelowy prostokąt zdjęcia: centrum symbolu + przesunięcie użytkownika
     target_w = max(24, round(bw * t["zoom"]))
@@ -201,9 +280,10 @@ def build_init_image(suit: Suit, photo_path: Path,
     fitted = ImageOps.fit(photo, (target_w, target_h),
                           method=Image.Resampling.LANCZOS)
 
-    layer = template.copy()
     layer.paste(fitted, (round(cx - target_w / 2), round(cy - target_h / 2)))
-    return Image.composite(layer, template, popout)
+    for box in shield_boxes:
+        layer.paste(template.crop(box), (box[0], box[1]))
+    return layer
 
 
 def compose_card_raw(spec: CardSpec, illustration: Image.Image) -> Image.Image:

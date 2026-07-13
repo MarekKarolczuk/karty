@@ -35,8 +35,15 @@ def _template_thumb(suit: Suit, w: int, h: int) -> QPixmap:
 
 
 def _template_ghost(suit: Suit, w: int, h: int) -> QPixmap:
-    """Przygaszona miniatura szablonu — stan „pusty slot”."""
-    key = (str(suit.template_path), w, h)
+    """Przygaszona miniatura szablonu — stan „pusty slot”. Brak szablonu
+    (świeży preset teł, np. w trakcie generowania kompletu) = pusty pixmap,
+    slot pokazuje sam chip i znak „＋”."""
+    try:
+        key = (str(suit.template_path), w, h)
+    except FileNotFoundError:
+        empty = QPixmap(w, h)
+        empty.fill(Qt.GlobalColor.transparent)
+        return empty
     if key not in _template_ghosts:
         base = _template_thumb(suit, w, h)
         out = QPixmap(base.size())

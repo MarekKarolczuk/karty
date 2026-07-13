@@ -25,7 +25,45 @@ from app import config
 
 # --- domyślne prompty (wartość, gdy pole presetu jest puste) ------------------
 
-DEFAULT_CHARACTER_STYLE = """\
+# UWAGA: ten tekst trafia do promptów OBU trybów (pop-out i FULL_AI), więc
+# opisuje WYŁĄCZNIE styl rysunku i wnętrze symbolu — mechanikę nachodzenia na
+# ramę (jak daleko postać wychodzi/nie wychodzi) definiują instrukcje trybu
+# (prompts.DEFAULT_POPOUT_PROMPT / full_card_prompt). Poprzednia wersja miała
+# tu własne „SLIGHT POP-OUT… ONLY SLIGHTLY" i zakaz dotykania kremu poza
+# symbolem — tłumiły efekt pop-out mimo poprawnych instrukcji trybu.
+DEFAULT_CHARACTER_STYLE = f"""\
+CRITICAL TASK: Seamless inpainting. Transform the subjects and their immediate \
+surroundings from the input photo into a stylized, full-color vector \
+illustration. Do NOT output a raw photograph.
+1. ART STYLE (STRICT):
+- Clean, sharp, black outlines around all elements.
+- Strictly cell-shaded: use vibrant, flat, defined color planes only. ZERO soft gradients.
+- ACCURATE, REALISTIC face and body proportions: the same face shape, hairstyle \
+and features as in the photo — no caricature, no exaggerated or "beautified" \
+features, no changed head-to-body ratio. The people must be instantly \
+recognizable.
+- Preserve maximum likeness to the people (faces, poses, clothing details).
+- The final look must resemble a crisp, modern graphic novel.
+2. COMPOSITION:
+- The suit symbol's colored fill and its ornate frame are ALREADY present and \
+FINAL in the card you received — reproduce them exactly as given, without \
+changing their shape, size or position. The colored fill ends exactly at the \
+window contour: never bleed it over the frame or the surrounding ornaments.
+- The subject stands on that existing backdrop inside the central suit symbol.
+- How far the subject may or must cross the symbol's frame is defined by the \
+composition instructions of the selected mode — follow THEM, not this section.
+3. CARD SURROUNDINGS:
+- DO NOT alter or blur the intricate etched scrollwork outside the central frame.
+- Leave the corner shield plaques completely empty — no letters, numbers or \
+suit pips anywhere.
+"""
+
+# Poprzednia wersja domyślnego stylu postaci — do jednorazowej migracji:
+# presety, które mają ten tekst zapisany DOSŁOWNIE, wracają do pustego pliku
+# (puste pole = aktualna wartość domyślna, patrz text()/set_text()).
+# Uwaga: zawierała sprzeczność z prompts.NO_TEXT_SUFFIX (kazała zachować
+# narożne litery/pipy, których na kartach nie ma — stempluje je compositor).
+_LEGACY_CHARACTER_STYLE = """\
 CRITICAL TASK: Seamless inpainting. Transform the subjects and their immediate \
 surroundings from the input photo into a highly stylized, full-color vector \
 illustration. Do NOT output a raw photograph.
@@ -67,8 +105,8 @@ be rendered entirely in saturated dark red ({config.ACCENT_HEX}) outlines. \
 CRITICAL: The center of the card MUST feature a large, completely blank, vintage \
 cream frame to serve as an empty canvas for placing subjects later. Absolutely NO \
 patterns, shading, or lines inside this central window. Consistent graphic novel / \
-collector card aesthetic. Output strictly the background design with no characters, \
-numbers, or suits.
+collector card aesthetic. Output strictly the background design with no characters \
+and no text.
 """
 
 DEFAULT_FRONT_BLACK = """\
@@ -79,7 +117,7 @@ be rendered entirely in deep black outlines. CRITICAL: The center of the card MU
 feature a large, completely blank, vintage cream frame to serve as an empty canvas \
 for placing subjects later. Absolutely NO patterns, shading, or lines inside this \
 central window. Consistent graphic novel / collector card aesthetic. Output \
-strictly the background design with no characters, numbers, or suits.
+strictly the background design with no characters and no text.
 """
 
 # --- definicja kategorii ------------------------------------------------------
@@ -90,8 +128,12 @@ CATEGORIES = config.STYLE_CATEGORIES   # ("postac","styl_tla","tla_przodu","rewe
 _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
     "postac": {"styl": DEFAULT_CHARACTER_STYLE},
     "styl_tla": {"styl": DEFAULT_TEMPLATE_STYLE},
-    "tla_przodu": {"front_red": DEFAULT_FRONT_RED, "front_black": DEFAULT_FRONT_BLACK},
-    "rewers": {"opis": ""},
+    # tryb_wlasny "1" = prompt presetu idzie do modelu DOSŁOWNIE, bez
+    # wbudowanych dopisków programu (np. karty do planszówek)
+    "tla_przodu": {"front_red": DEFAULT_FRONT_RED,
+                   "front_black": DEFAULT_FRONT_BLACK,
+                   "tryb_wlasny": "0"},
+    "rewers": {"opis": "", "tryb_wlasny": "0"},
     # Typografia narożników (stemplowanie lokalne, nie AI) — liczby w %
     # wysokości tarczy, kolory hex; parsowanie w compositor.styl_z_presetu()
     "wartosci": {
@@ -103,6 +145,11 @@ _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
         "offset_x": "0",
         "offset_y": "0",
         "odstep": "42",
+        # efekty stempla (0/puste = brak — pełna zgodność ze starymi presetami)
+        "obwodka_grubosc": "0",               # % wysokości tarczy
+        "obwodka_kolor": "",                  # pusty = krem (config.CREAM_HEX)
+        "cien_przesuniecie": "0",             # % wysokości tarczy
+        "cien_kolor": "",                     # pusty = czerń półprzezroczysta
     },
 }
 
@@ -250,8 +297,20 @@ def front_prompt(is_red: bool) -> str:
     return text("tla_przodu", "front_red" if is_red else "front_black")
 
 
+def front_custom_mode() -> bool:
+    """Tryb własnego promptu teł przodu: prompt presetu idzie do modelu
+    dosłownie, bez dopisków layoutu (kształt symbolu, tarcze, zakaz tekstu)."""
+    return text("tla_przodu", "tryb_wlasny").strip() == "1"
+
+
 def back_text() -> str:
     return text("rewers", "opis")
+
+
+def back_custom_mode() -> bool:
+    """Tryb własnego promptu rewersu: opis presetu idzie do modelu dosłownie,
+    bez twardych wymogów (symetria 180°, bordiura, zakaz tekstu)."""
+    return text("rewers", "tryb_wlasny").strip() == "1"
 
 
 # --- obrazy -------------------------------------------------------------------
@@ -574,6 +633,25 @@ def _migrate_working_set() -> None:
     _rmdir_quiet(legacy)
 
 
+def _migrate_character_defaults() -> None:
+    """Presety postaci ze STARYM domyślnym stylem zapisanym dosłownie wracają
+    do pustego pliku (= aktualna wartość domyślna). Presety edytowane ręcznie
+    zostają nietknięte."""
+    d = _cat_dir("postac")
+    if not d.is_dir():
+        return
+    for preset in d.iterdir():
+        f = preset / "styl.txt"
+        if not (preset.is_dir() and f.is_file()):
+            continue
+        try:
+            if f.read_text(encoding="utf-8").strip() \
+                    == _LEGACY_CHARACTER_STYLE.strip():
+                f.write_text("", encoding="utf-8")
+        except OSError:
+            continue
+
+
 def load() -> None:
     """Inicjalizacja przy starcie: struktura folderów + migracja starych danych."""
     _load_active()
@@ -581,4 +659,5 @@ def load() -> None:
     _migrate_user_folders()
     _seed_default_texts()
     _migrate_working_set()
+    _migrate_character_defaults()
     _ensure()
