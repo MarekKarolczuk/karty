@@ -37,7 +37,10 @@ surroundings from the input photo into a stylized, full-color vector \
 illustration. Do NOT output a raw photograph.
 1. ART STYLE (STRICT):
 - Clean, sharp, black outlines around all elements.
-- Strictly cell-shaded: use vibrant, flat, defined color planes only. ZERO soft gradients.
+- Cell-shaded rendering for clothing, props and background: vibrant, flat, \
+defined color planes, minimal gradients. FACES are the exception — render them \
+with soft, smooth shading and fine detail to keep an exact likeness (never a \
+few flat blocks).
 - ACCURATE, REALISTIC face and body proportions: the same face shape, hairstyle \
 and features as in the photo — no caricature, no exaggerated or "beautified" \
 features, no changed head-to-body ratio. The people must be instantly \
@@ -126,7 +129,11 @@ CATEGORIES = config.STYLE_CATEGORIES   # ("postac","styl_tla","tla_przodu","rewe
 
 # Pola tekstowe (plik <field>.txt) i ich wartości domyślne, per kategoria.
 _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
-    "postac": {"styl": DEFAULT_CHARACTER_STYLE},
+    # sceneria_kolor "1" = tło/otoczenie ze zdjęcia malowane w oknie w
+    # monochromatycznych odcieniach koloru karty zamiast płaskiego wypełnienia.
+    # Domyślnie WŁĄCZONE (wnętrze symbolu nie ma być płaskie); checkbox w GUI
+    # pozwala wrócić do płaskiego.
+    "postac": {"styl": DEFAULT_CHARACTER_STYLE, "sceneria_kolor": "1"},
     "styl_tla": {"styl": DEFAULT_TEMPLATE_STYLE},
     # tryb_wlasny "1" = prompt presetu idzie do modelu DOSŁOWNIE, bez
     # wbudowanych dopisków programu (np. karty do planszówek)
@@ -301,6 +308,12 @@ def front_custom_mode() -> bool:
     """Tryb własnego promptu teł przodu: prompt presetu idzie do modelu
     dosłownie, bez dopisków layoutu (kształt symbolu, tarcze, zakaz tekstu)."""
     return text("tla_przodu", "tryb_wlasny").strip() == "1"
+
+
+def scenery_suit_mode() -> bool:
+    """Sceneria zdjęcia (góry, horyzont) malowana w oknie symbolu w
+    monochromatycznych odcieniach koloru karty zamiast płaskiego wypełnienia."""
+    return text("postac", "sceneria_kolor").strip() == "1"
 
 
 def back_text() -> str:

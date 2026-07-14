@@ -287,6 +287,18 @@ class BackView(QWidget):
         self.character_edit.textChanged.connect(self._char_debounce.start)
         left.addWidget(self.character_edit, stretch=1)
 
+        self.scenery_check = QCheckBox(
+            "🏔️ Tło w oknie w odcieniach koloru karty (zamiast płaskiego)")
+        self.scenery_check.setToolTip(
+            "Gdy zdjęcie ma sceneria (góry, horyzont), model maluje ją w oknie "
+            "symbolu ZA postacią w monochromatycznych odcieniach koloru karty "
+            "(główne kształty = kolor karty, cienie/światła podobne odcienie). "
+            "Wyłączone = płaskie wypełnienie okna. Zapisuje się w presecie "
+            "stylu postaci.")
+        self.scenery_check.setChecked(style_store.scenery_suit_mode())
+        self.scenery_check.toggled.connect(self._on_scenery_toggled)
+        left.addWidget(self.scenery_check)
+
         reset_char = QPushButton("↺  Przywróć domyślny styl postaci")
         reset_char.setObjectName("ghostBtn")
         reset_char.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -386,6 +398,10 @@ class BackView(QWidget):
         self._update_character_caption()
         self.character_changed.emit()
 
+    def _on_scenery_toggled(self, checked: bool) -> None:
+        style_store.set_text("postac", "sceneria_kolor", "1" if checked else "0")
+        self.character_changed.emit()
+
     def _reset_character_style(self) -> None:
         default = style_store.reset("postac", "styl")
         self.character_edit.blockSignals(True)
@@ -398,6 +414,9 @@ class BackView(QWidget):
         self.character_edit.blockSignals(True)
         self.character_edit.setPlainText(style_store.character_style())
         self.character_edit.blockSignals(False)
+        self.scenery_check.blockSignals(True)
+        self.scenery_check.setChecked(style_store.scenery_suit_mode())
+        self.scenery_check.blockSignals(False)
         self._update_character_caption()
 
     def _update_character_caption(self) -> None:

@@ -108,6 +108,23 @@ KLAMP_BLEED_TOL = 30
 # rozpoznanie czerwonego wypełnienia: przewaga kanału R nad max(G,B)
 # (#801515 → 107, #1A1414 → 6)
 KLAMP_CZERWIEN_PRZEWAGA = 40
+# SYMBOL ZAWSZE IDENTYCZNY: pas wokół granicy okna (ornamentowy kontur symbolu +
+# margines na dryf re-renderu modelu) ZAWSZE wraca z bazy — nawet tam, gdzie
+# przecina go postać. Bez tego niedoskonała maska postaci przepuszczała re-render
+# konturu (pofalowany/podwojony/stray ticki) i symbol wyglądał inaczej na każdej
+# karcie. Kontur na wierzchu = „serce nienaruszone", postać pod/wokół niego.
+# Na skali config.TEMPLATE_STD_SZEROKOSC=1696. ZEW = na zewnątrz okna (kontur ma
+# ~25-30 px + dryf), WEW = mały margines do wewnątrz (płaskie wypełnienie).
+KLAMP_SYMBOL_KONTUR_ZEW_PX = 30
+KLAMP_SYMBOL_KONTUR_WEW_PX = 10
+# próg wykrycia POSTACI WEWNĄTRZ OKNA: serce (wnętrze okna) ma zostać z SZABLONU
+# (płaskie wypełnienie w bazie), a z modelu nakładamy tylko sylwetkę. Wewnątrz
+# okna postać = |wynik − kolor_wypełnienia| powyżej progu (nie różnica od kremu:
+# okno w szablonie jest kremowe, w bazie kolorowe). 50 łapie skórę/ubrania
+# (czerń, biel, szarość, denim), a dryf/cieniowanie płaskiej czerwieni modelu
+# zostawia szablonowi (płaskie serce). Ubranie w kolorze ≈ wypełnienia (np.
+# ciemna czerwień na kierach) może częściowo wrócić do wypełnienia — rzadkie
+KLAMP_OKNO_POSTAC_PROG = 50
 # maksymalna domykana dziura w sylwetce (ułamek pola karty): linie szablonu
 # prześwitujące przez twarz są małe; większe prześwity (np. tło między ręką
 # a ciałem) mają zostać szablonem (0.02 — po licie domkniętym close dziury
@@ -151,14 +168,18 @@ KLAMP_BORDIURA = 0.05
 # kartach czarnych). Próg na skali rozmytego |Laplacian| (jak KLAMP_TEKSTURA_PROG):
 # płaska farba postaci ma tex_wyn ≈ 0 « próg → sylwetka nad ornamentem przeżywa
 KLAMP_ORNAMENT_KEEP_PROG = 20.0
-# MASKA W KSZTAŁCIE SYMBOLU: sylwetka przeżywa tylko w oknie + WĄSKIM marginesie
-# tej szerokości (px na skali config.TEMPLATE_STD_SZEROKOSC=1696). To NIE „pop-out
-# na ramę", lecz mały zapas nad ornamentem — głowa może lekko wyjść nad wcięcie
-# serca / górę symbolu, a wcięcia dostają luz (głowy nie cięte). Boki i tak
-# przycina ochrona prostych linii (frame_lines_mask): okno jest ogromne (~87,9%
-# szer.), na bokach kończy się ~18 px od bordiury, więc każdy szerszy ring zjadał
-# boczną, prostą linię ramki (krzywe boki). 50 px huga symbol.
+# MASKA W KSZTAŁCIE SYMBOLU: sylwetka przeżywa w oknie + marginesie wokół niego.
+# Ring jest ANIZOTROPOWY (px na skali config.TEMPLATE_STD_SZEROKOSC=1696):
+# - POZIOMO wąski (KLAMP_POPOUT_RING_PX) — okno jest ogromne (~87,9% szer.),
+#   na bokach kończy się ~18 px od bordiury, a boczne proste linie ramki bywają
+#   lekko krzywe i frame_lines_mask ich nie łapie; szerszy ring zjadałby je.
+# - PIONOWO wysoki (KLAMP_POPOUT_RING_V_PX) — głowy, kapelusze i rekwizyty
+#   wystają PONAD symbol znacznie dalej niż w bok; izotropowy ring 50 px ucinał
+#   twarze nad symbolem. Nad oknem prostych linii ramki (poza ewentualną
+#   wewnętrzną poziomą, chronioną przez frame_lines) nie ma, więc pion może być
+#   dużo większy bez psucia ramki.
 KLAMP_POPOUT_RING_PX = 50
+KLAMP_POPOUT_RING_V_PX = 190
 # Ochrona prostych linii ramki: model re-renderuje całą kartę niedoskonale i
 # proste linie falują. Wykrywamy DŁUGIE proste linie w szablonie (kierunkowe
 # otwarcie morfologiczne) i zawsze przywracamy je z szablonu — nawet gdy leżą
@@ -172,6 +193,7 @@ KLAMP_LINIA_DYLATACJA_PX = 5
 _cache: dict[Path, "TemplateMasks"] = {}
 _popout_cache: dict[Path, Image.Image] = {}
 _frame_cache: dict[Path, np.ndarray] = {}
+_pas_cache: dict[Path, np.ndarray] = {}
 
 
 class _MaskGenerationError(Exception):
@@ -449,9 +471,20 @@ def frame_lines_mask(template_path: Path) -> np.ndarray:
         _frame_cache[template_path] = arr
         return arr
 
-    img = _read_bgr(template_path)
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lines = _wykryj_proste_linie(_read_bgr(template_path))
+    Image.fromarray(lines, mode="L").save(cache_file)
+    _frame_cache[template_path] = lines
+    return lines
+
+
+def _wykryj_proste_linie(bgr: np.ndarray) -> np.ndarray:
+    """Rdzeń frame_lines_mask na tablicy BGR: DŁUGIE proste linie (rama) przez
+    kierunkowe otwarcie morfologiczne ciemnych pikseli (pionowe/poziome jądro
+    długości ~ułamek boku), z dylatacją. Krzywy ornament (krótkie łuki) znika.
+    Używane też przez scripts.test_symbol do wykrycia linii WPROST na kompozycie
+    (weryfikacja „linie proste") — dlatego przyjmuje tablicę, nie ścieżkę."""
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     dark = (gray < KLAMP_LINIA_CIEMNOSC_PROG).astype(np.uint8) * 255
 
     len_v = max(31, int(h * KLAMP_LINIA_DL_ULAMEK) | 1)
@@ -464,11 +497,33 @@ def frame_lines_mask(template_path: Path) -> np.ndarray:
 
     dyl = max(1, round(w * KLAMP_LINIA_DYLATACJA_PX / config.TEMPLATE_STD_SZEROKOSC))
     k_d = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dyl + 1, 2 * dyl + 1))
-    lines = cv2.dilate(lines, k_d)
+    return cv2.dilate(lines, k_d)
 
-    Image.fromarray(lines, mode="L").save(cache_file)
-    _frame_cache[template_path] = lines
-    return lines
+
+def symbol_kontur_pas(template_path: Path) -> np.ndarray:
+    """Pas (0/255) wokół granicy okna symbolu: ornamentowy kontur + margines na
+    dryf re-renderu modelu (`dilate(core_bin, r_out) & ~erode(core_bin, r_in)`).
+    W tym pasie kompozyt ZAWSZE wraca z bazy → symbol identyczny na każdej karcie.
+    Wspólny dla maska_klampu i scripts.test_symbol (ta sama definicja). Cache per
+    ścieżka, unieważniany po mtime szablonu (jak get_masks)."""
+    template_path = Path(template_path)
+    cached = _pas_cache.get(template_path)
+    if cached is not None:
+        return cached
+    center = np.array(get_masks(template_path).center, dtype=np.uint8)
+    core_bin = np.where(center > 0, 255, 0).astype(np.uint8)
+    w = core_bin.shape[1]
+    r_out = max(4, round(w * KLAMP_SYMBOL_KONTUR_ZEW_PX
+                         / config.TEMPLATE_STD_SZEROKOSC))
+    r_in = max(2, round(w * KLAMP_SYMBOL_KONTUR_WEW_PX
+                        / config.TEMPLATE_STD_SZEROKOSC))
+    pas = cv2.bitwise_and(
+        cv2.dilate(core_bin, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * r_out + 1, 2 * r_out + 1))),
+        cv2.bitwise_not(cv2.erode(core_bin, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * r_in + 1, 2 * r_in + 1)))))
+    _pas_cache[template_path] = pas
+    return pas
 
 
 def maska_klampu(wynik: Image.Image, template: Image.Image,
@@ -517,13 +572,31 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
     allowed_full[:, w - bx:] = 0
     for x0, y0, x1, y1 in (base.tl_box, base.br_box):
         allowed_full[y0:y1, x0:x1] = 0
-    # Maska w kształcie symbolu: sylwetka przeżywa w oknie + wąskim marginesie,
-    # a proste linie ramki (frame_lines) ZAWSZE wracają z szablonu (boki przy
-    # oknie, wewnętrzna ramka) — nawet gdyby margines je objął
-    ring_px = max(20, round(w * KLAMP_POPOUT_RING_PX / config.TEMPLATE_STD_SZEROKOSC))
+    # Maska w kształcie symbolu: sylwetka przeżywa w oknie + marginesie, a proste
+    # linie ramki (frame_lines) ZAWSZE wracają z szablonu (boki przy oknie,
+    # wewnętrzna ramka) — nawet gdyby margines je objął
+    ring_x = max(20, round(w * KLAMP_POPOUT_RING_PX / config.TEMPLATE_STD_SZEROKOSC))
+    ring_y = max(20, round(w * KLAMP_POPOUT_RING_V_PX / config.TEMPLATE_STD_SZEROKOSC))
     ring_kernel_popout = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * ring_px + 1, 2 * ring_px + 1))
-    okno_ring = cv2.dilate(core_bin, ring_kernel_popout)
+        cv2.MORPH_ELLIPSE, (2 * ring_x + 1, 2 * ring_y + 1))
+    # Ring liczony z convex hulla okna, nie surowego serca — górna krawędź strefy
+    # jest WYPUKŁA, więc głowa/rekwizyt w rejonie wcięcia serca nie jest ucinana
+    # wzdłuż konturu „V". Hull dotyczy TYLKO bramki allowed; rdzeń (core/core_bin,
+    # np.maximum(core, extra)) bez zmian — okno renderuje się jak dotąd.
+    okno_ring = cv2.dilate(_hull_sylwetki(core_bin), ring_kernel_popout)
+    # Prostokątna strefa NAD symbolem (pełna szerokość okna + margines ring_x,
+    # od bordiury do górnej krawędzi okna): głowy, kapelusze i uniesione rekwizyty
+    # nad symbolem przeżywają w PEŁNYM kształcie zamiast być przycięte do serca.
+    # Puste partie tej strefy się nie utrwalają — tam wynik == szablon (brak
+    # kandydatów); boki i dół dalej trzyma wąski ring elipsy.
+    ys, xs = np.nonzero(core_bin)
+    strefa_gora = np.zeros((h, w), dtype=bool)   # prostokąt pop-out nad symbolem
+    if len(xs):
+        sx0, sx1, sy0 = int(xs.min()), int(xs.max()), int(ys.min())
+        rx0, rx1 = max(bx, sx0 - ring_x), min(w - bx, sx1 + ring_x)
+        if sy0 > by:
+            okno_ring[by:sy0, rx0:rx1] = 255
+            strefa_gora[by:sy0, rx0:rx1] = True
     frame_lines = frame_lines_mask(template_path)
     if frame_lines.shape != (h, w):
         frame_lines = cv2.resize(frame_lines, (w, h),
@@ -595,6 +668,12 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
     # (lap_wyn < KLAMP_PLASKOSC_PROG « KLAMP_ORNAMENT_KEEP_PROG) przeżywa.
     ornament_rerender = (tex_tpl > KLAMP_TEKSTURA_PROG) \
         & (tex_wyn > KLAMP_ORNAMENT_KEEP_PROG)
+    # W strefie NAD symbolem NIE stosuj ornament_rerender: pop-out (włosy,
+    # kapelusz) ma teksturę, a górny ornament w szablonie też — bez tego wyłączenia
+    # klamp klasyfikował czubki głów jako re-render ramy i ucinał je do konturu
+    # serca (test live: 4 osoby z głowami nad lobami). Ochrona re-renderu ramy
+    # zostaje tam, gdzie liczy się najbardziej — wokół i poniżej symbolu.
+    ornament_rerender &= ~strefa_gora
     cand[ornament_rerender] = 0
     cand2 &= ~ornament_rerender
     cand3 &= ~ornament_rerender
@@ -631,13 +710,33 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, k_most)
     cand = cv2.bitwise_and(cand, allowed)
 
-    # Tylko komponenty spójne z OKNEM — plamy „luzem" na tle to artefakty
-    union = cv2.bitwise_or(cand, core_bin)
+    # Kotwica spójności pop-outu = CIAŁO postaci w oknie (people_win = wnętrze okna
+    # różne od koloru wypełnienia). Model re-renderuje ornamentowy KONTUR symbolu
+    # tuż przy oknie — to pasmo dotyka okna i przeżywałoby jako „sylwetka" (przeciek
+    # konturu), choć NIE ma pod nim postaci. Wiążąc pop-out z ciałem postaci, pasmo
+    # konturu bez postaci pod spodem odpada. Gdy ciała nie widać (postać ≈ kolor
+    # wypełnienia) — kotwicą jest całe okno (jak dawniej). Wnętrze okna i tak wraca
+    # z modelu (rdzeń bezwarunkowy) — pokazuje AI-sceneria w odcieniach koloru karty.
+    min_pole = KLAMP_MIN_POLE * w * h
+    people_win = None
+    if kolor_tla is not None:
+        diff_fill = np.abs(wyn_rgb - np.array(kolor_tla, dtype=np.int16)).max(axis=2)
+        people_win = ((core_bin > 0) & (diff_fill > KLAMP_OKNO_POSTAC_PROG)
+                      ).astype(np.uint8) * 255
+        people_win = cv2.morphologyEx(people_win, cv2.MORPH_OPEN, k_open)
+        n_pw, lab_pw, st_pw, _ = cv2.connectedComponentsWithStats(
+            (people_win > 0).astype(np.uint8), connectivity=8)
+        for i in range(1, n_pw):
+            if st_pw[i, cv2.CC_STAT_AREA] < min_pole:
+                people_win[lab_pw == i] = 0
+    anchor = (people_win if (people_win is not None
+                             and np.count_nonzero(people_win)) else core_bin)
+    union = cv2.bitwise_or(cand, anchor)
     _, labels = cv2.connectedComponents((union > 0).astype(np.uint8),
                                         connectivity=8)
-    core_labels = np.unique(labels[core_bin > 0])
-    core_labels = core_labels[core_labels != 0]
-    component = np.isin(labels, core_labels)
+    anchor_labels = np.unique(labels[anchor > 0])
+    anchor_labels = anchor_labels[anchor_labels != 0]
+    component = np.isin(labels, anchor_labels)
     extra = np.where(component & (core_bin == 0), 255, 0).astype(np.uint8)
     extra = cv2.bitwise_and(extra, allowed)
 
@@ -646,7 +745,6 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
     # Filtr resztek kolażu: duży komponent szczelnie wypełniający własny
     # bbox to prostokątna resztka zdjęcia (postać ma nieregularny kontur)
     zone = int(np.count_nonzero((allowed_full > 0) & (core_bin == 0)))
-    min_pole = KLAMP_MIN_POLE * w * h
     n_comp, lab2, stats, _ = cv2.connectedComponentsWithStats(
         (extra > 0).astype(np.uint8), connectivity=8)
     for i in range(1, n_comp):
@@ -707,6 +805,20 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
             if stats_dz[i, cv2.CC_STAT_AREA] <= maks_dziura:
                 extra[lab_dz == i] = 255
 
+    # NA LITO: wypełnij sylwetkę WYPUKŁĄ OTOCZKĄ per komponent. Jasna skóra ≈ krem
+    # szablonu przy konturze symbolu (diff < próg detekcji), więc szablon —
+    # kontur/ornament — prześwitywał przez twarz jako „kreska". Otoczka domyka te
+    # zatoki, NIE łącząc osobnych postaci (osobne komponenty `extra`). Ograniczona
+    # do `allowed` (okno + ring, bez ramy/bordiury/tarcz) — nie zmienia symbolu.
+    n_ex, lab_ex = cv2.connectedComponents(extra)
+    hull_fill = np.zeros_like(extra)
+    for i in range(1, n_ex):
+        cnts, _ = cv2.findContours((lab_ex == i).astype(np.uint8),
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            cv2.fillConvexPoly(hull_fill, cv2.convexHull(np.vstack(cnts)), 255)
+    extra = cv2.bitwise_or(extra, cv2.bitwise_and(hull_fill, allowed))
+
     # Lekka dylatacja (antyaliasowany kontur postaci) i wąski feather
     # krawędzi (w//800 — szerszy mieszał szablon z wynikiem na obwodzie
     # sylwetki → wyprane kolory wystających części)
@@ -717,4 +829,8 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
     extra = cv2.GaussianBlur(extra, (0, 0), sigmaX=max(2, w // 800))
     extra = cv2.bitwise_and(extra, allowed)
 
+    # Maska = OKNO (rdzeń bezwarunkowo z modelu — AI-sceneria + postać w oknie)
+    # + sylwetka pop-out na wierzchu. Rama/kontur/tło POZA oknem wracają z bazy
+    # (szablon nienaruszony), a AI jest nakładane NA symbol tam, gdzie postać go
+    # przecina (bez konturu na wierzchu = bez „białych pasków" i cięcia głów).
     return Image.fromarray(np.maximum(core, extra), mode="L")

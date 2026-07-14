@@ -24,9 +24,10 @@ from app.core.models import CardSpec, GenMode, Suit
 # koszty uploadu; wynik i tak skalujemy z powrotem do rozdzielczości szablonu.
 MAX_API_SIDE = 1536
 
-# Zdjęcie-referencja twarzy: przy grupach 3+ każda twarz dostaje za mało
-# pikseli w standardowym pomniejszeniu — większa referencja ratuje rysy.
-PHOTO_REF_SIDE = 768
+# Zdjęcie-referencja twarzy: wierność rysów wymaga dużo pikseli na twarz, więc
+# także pojedyncze osoby dostają pełną referencję (768 dawało zniekształcone,
+# niepodobne twarze). Gałąź grupowa zostaje — steruje też liczbą osób w promptach.
+PHOTO_REF_SIDE = 1536
 PHOTO_REF_SIDE_GRUPA = 1536
 GRUPA_OD_OSOB = 3
 
@@ -159,8 +160,7 @@ def _build_card_raw(spec: CardSpec) -> Image.Image:
     result = gemini_client.compose_full_card(
         compositor.wypelnij_okno(template, spec.suit), spec.photo_path, prompt,
         seed=config.GEN_SEED + spec.variant,
-        photo_max_side=(PHOTO_REF_SIDE_GRUPA
-                        if (osoby or 0) >= GRUPA_OD_OSOB else 1024),
+        photo_max_side=PHOTO_REF_SIDE,   # 1536 — wierność twarzy także dla singli
     )
     # Model mimo zakazu potrafi przemalować tło/ornamenty i dorysować pipy —
     # klamp przywraca WSZYSTKO poza symbolem+ringiem (w tym tarcze) z szablonu

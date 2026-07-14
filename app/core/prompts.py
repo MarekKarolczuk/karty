@@ -74,6 +74,27 @@ MANDATORY DECK CONSISTENCY (identical on EVERY card of this deck):
 - The corner shield plaques must stay completely EMPTY — no letters, numbers
   or pips in them."""
 
+
+# Wierność twarzy — doklejana do OBU promptów kart (nadrzędna nad edytowalnym
+# stylem postaci). Testy live: twarze zbyt zniekształcone, niepodobne do zdjęcia
+# — agresywny cell-shading spłaszczał rysy. Twarze są WYJĄTKIEM od płaskiego
+# cieniowania: renderowane miękko i z detalem, reszta ilustracji zostaje
+# stylizowana. Priorytet nad instrukcjami stylu, dlatego doklejane osobno.
+FACE_FIDELITY = """\
+FACE LIKENESS (highest priority): treat this as a PORTRAIT-likeness task. Each
+person's face must be an accurate likeness of the SAME person in the reference
+photo — keep the exact face shape, eye shape and spacing, nose, mouth, jawline,
+eyebrows, facial hair and skin tone, so a viewer instantly recognizes that
+specific individual. Render FACES with soft, smooth shading and enough fine
+detail for a true likeness — faces are the EXCEPTION to the flat cell-shading:
+never reduce a face to a few flat color blocks, never caricature, "beautify",
+change age or alter proportions. Clothing, props and background may stay
+cell-shaded."""
+
+
+def face_fidelity_clause() -> str:
+    return FACE_FIDELITY
+
 # Twarde wymogi kompozycji dla stylizacji zdjęcia (tryb hybrydowy) —
 # niezbędne dla masek kompozytora, nieedytowalne.
 _CHARACTER_REQUIREMENTS = f"""\
@@ -139,13 +160,53 @@ def suit_fill_clause(suit) -> str:
     else:
         fill = f"deep black (EXACTLY {styl.kolor_czarny})"
         other = "red"
+    # W trybie scenerii wnętrze okna za postacią może zawierać uproszczone tło
+    # w odcieniach koloru karty — łagodzimy „tylko postać zakrywa symbol"
+    # (kolor/rozmiar/kształt/pozycja symbolu nadal twarde)
+    cover = ("besides the subject, only a simplified backdrop painted in shades"
+             " of this same suit color may sit inside the window behind the"
+             " subject — nothing else"
+             if style_store.scenery_suit_mode() else
+             "the ONLY thing allowed to cover the symbol is the subject")
     return f"""\
 THIS CARD'S SUIT (hard constraint): this is a {shape.upper()} card. The
 central symbol's flat fill color is {fill} — NEVER swap it for the deck's
 {other} or any other hue. The symbol's SIZE, SHAPE and POSITION are FINAL,
 exactly as shown in the input image: never enlarge, shrink, move or redraw
-it, and never spill its fill color beyond the frame contour — the ONLY
-thing allowed to cover the symbol is the subject."""
+it, and never spill its fill color beyond the frame contour — {cover}."""
+
+
+def _window_backdrop_clause(suit) -> str:
+    """Zawartość okna ZA postacią: płaskie wypełnienie (domyślnie) albo — gdy
+    włączony tryb scenerii (style_store.scenery_suit_mode) — uproszczona
+    sceneria zdjęcia malowana WYŁĄCZNIE w odcieniach koloru karty. Doklejane
+    do promptów OBU trybów kart. Wnętrze okna to rdzeń bezwarunkowy klampu
+    (masks.maska_klampu), więc ta treść przeżywa kompozycję bez zmian w klampie.
+    Funkcja (nie stała): hex koloru z aktywnego presetu „wartosci"."""
+    from app.core import compositor
+    styl = compositor.styl_z_presetu()
+    shape = SUIT_NAME_EN[suit.nazwa]
+    hex_fill = styl.kolor_czerwony if suit.is_red else styl.kolor_czarny
+    if style_store.scenery_suit_mode():
+        return f"""\
+WINDOW BACKDROP — SUIT-COLOR BACKGROUND: behind the subject, INSIDE the {shape}
+window, PAINT the photo's BACKGROUND and surroundings — the setting, scenery,
+room, objects and context behind the people, not just the people — as a
+simplified backdrop that FILLS the window (it must NOT stay a flat empty color).
+Render this backdrop ENTIRELY in shades of the suit color: the main shapes
+EXACTLY the fill color {hex_fill}, shadows a darker shade of that SAME hue,
+highlights a lighter shade, and NO other colors at all. Keep it low-detail and
+low-contrast so the {shape} symbol stays clearly recognizable. The subject stays
+in FULL natural color on top of it. Do NOT reproduce the background in its
+natural photographic colors, and never let it spill outside the window onto the
+frame or the card — outside the window the template is reproduced exactly."""
+    return f"""\
+WINDOW BACKDROP — FLAT FILL: the flat suit-color fill ({hex_fill}) is the ONLY
+backdrop inside the {shape} window; the subject (in full color) stands directly
+on the clean, flat fill, which must stay visible around the subject. NEVER
+paint the photo's scenery — sky, water, grass, ground, floor, walls, interiors
+— anywhere on the card, inside or outside the window. Scenery is NOT part of
+the subject."""
 
 
 def _full_card_size_clause(liczba_osob: int | None) -> str:
@@ -196,10 +257,8 @@ Task — bold 3D pop-out ("out of bounds") composition:
    an instrument, a pet) and repaint them in this exact style:
 {style_store.character_style().rstrip()}{count}
 2. Place that illustration standing INSIDE the central {shape} window,
-   strictly vertical, directly on the window's flat colored fill — never
-   paint the photo's scenery (sky, water, grass, ground, walls) anywhere
-   on the card; wherever the people do not stand inside the window, the
-   flat fill must show.
+   strictly vertical, filling the window; wherever the people do not stand
+   inside the window, the window backdrop (described below) must show.
 3. The subject FILLS the {shape} window. It may lightly step out: where
    they meet, the frame's contour passes BEHIND the subject's body, and a
    head, shoulder or held prop may cross the window's edge into the narrow
@@ -214,9 +273,13 @@ Task — bold 3D pop-out ("out of bounds") composition:
 4. The suit symbol must stay recognizable — the subject crosses the frame
    but never covers the window completely.
 
+{_window_backdrop_clause(suit)}
+
 {suit_fill_clause(suit)}
 
 {style_lock()}
+
+{face_fidelity_clause()}
 
 {TEMPLATE_GUARD_POPOUT}
 
@@ -370,13 +433,9 @@ wherever the photo rectangle covered it and the subject does not stand.
 The suit symbol's colored fill visible in the collage is ALREADY FINAL:
 reproduce its shape, size and position exactly — do not redraw the symbol,
 do not change its contour, and never bleed the fill over the ornate frame.
-That flat fill is the ONLY backdrop inside the symbol window: the subject
-(in full color) stands directly on the clean, flat red/black fill, which
-must stay visible around the subject. NEVER paint the photo's scenery —
-sky, water, grass, ground, floor, walls, interiors — anywhere on the card,
-inside or outside the window. Scenery is NOT part of the subject; props the
-subject holds, rides or wears (a bike, skis, a mast, a mask, handlebars)
-ARE and stay in full color.
+Props the subject holds, rides or wears (a bike, skis, a mast, a mask,
+handlebars) ARE part of the subject and stay in full color. The backdrop
+inside the window (behind the subject) is defined separately below.
 
 MAIN GOAL — the subject FILLS the suit-symbol window, with a light 3D
 pop-out at its edge:
@@ -404,17 +463,27 @@ of the card."""
 # Przypomnienie na SAM KONIEC promptu pop-out (tuż przed NO_TEXT_SUFFIX):
 # model czyta restrykcje (guard + zakaz tekstu) jako ostatnie i instrukcja
 # pop-out z początku promptu ginie — krótka repryza przywraca jej wagę.
-POPOUT_REMINDER = """\
+# Funkcja (nie stała): środkowe zdanie o tle okna zależy od trybu scenerii.
+def popout_reminder() -> str:
+    if style_store.scenery_suit_mode():
+        backdrop = ("Equally WRONG: any leftover straight photo edge, or the"
+                    " scenery in its natural photographic colors — inside the"
+                    " window the backdrop is a simplified scenery painted ONLY"
+                    " in shades of the suit color, everywhere else the card's"
+                    " own background.")
+    else:
+        backdrop = ("Equally WRONG: any leftover straight photo edge or photo"
+                    " scenery (sky, water, grass, ground) — inside the window"
+                    " the flat suit-color fill must show around the subject,"
+                    " everywhere else the card's own background.")
+    return f"""\
 FINAL CHECK — MOST IMPORTANT: the subject must FILL the suit window, with a
 head/shoulder/prop lightly crossing the window's edge into the band right
 next to it. WRONG: a subject or person standing out on the ornate frame or
 on the card away from the window (they must stay at the window). WRONG: a
 small subject floating in the middle of the window with a wide empty
-flat-fill margin around it. Equally WRONG: any leftover straight photo edge
-or photo scenery (sky, water, grass, ground) — inside the window the flat
-suit-color fill must show around the subject, everywhere else the card's own
-background. Also WRONG: any face cropped or missing, or anything touching the
-card's outer border."""
+flat-fill margin around it. {backdrop} Also WRONG: any face cropped or
+missing, or anything touching the card's outer border."""
 
 
 def popout_prompt(suit, photo_ref: bool = False,
@@ -427,13 +496,15 @@ def popout_prompt(suit, photo_ref: bool = False,
     i rekwizytów); liczba_osob wzmacnia notę twardą liczbą osób."""
     photo_note = ("\n\n" + photo_ref_note(liczba_osob)) if photo_ref else ""
     return (DEFAULT_POPOUT_PROMPT
+            + "\n\n" + _window_backdrop_clause(suit)
             + "\n\n" + suit_fill_clause(suit)
             + "\n\nSubject style details:\n"
             + style_store.character_style().strip()
             + "\n\n" + style_lock()
             + photo_note
+            + "\n\n" + face_fidelity_clause()
             + "\n\n" + TEMPLATE_GUARD_POPOUT
-            + "\n\n" + POPOUT_REMINDER
+            + "\n\n" + popout_reminder()
             + "\n\n" + NO_TEXT_SUFFIX)
 
 
