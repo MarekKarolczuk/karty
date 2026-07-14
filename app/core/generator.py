@@ -6,6 +6,7 @@ pozwala przeklikać cały pipeline GUI bez zużywania kredytów.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -216,51 +217,140 @@ def _fit_card_ratio(img: Image.Image, landscape: bool = False) -> Image.Image:
     return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS)
 
 
-# Tolerancja odchyłu proporcji tła od wybranego formatu karty: poniżej progu
-# tylko skalujemy szerokość (bez docięcia) — chroni domyślne tła 1696×2528
-# (odchył ~6% od 63:88, który drukarnia skaluje bez widocznej dystorsji)
-# przed docięciem ucinającym bordiurę
+# Próg odchyłu proporcji obrazu od wybranego formatu karty, powyżej którego
+# rozciągnięcie do formatu daje WIDOCZNĄ dystorsję — przy jawnym imporcie
+# własnego tła GUI pyta wtedy użytkownika: rozciągnąć całość czy dotnąć
+# brzegi; poniżej progu (np. domyślne tła 1696×2528, odchył ~6% od 5:7,
+# który drukarnia skaluje bez widocznej różnicy) rozciąga bez pytania
 PROG_ODCHYLU_PROPORCJI = 0.08
 
 
-def normalizuj_szablon(path: Path) -> None:
-    """Dopasowuje PLIK tła do wybranego formatu karty i standardowej
-    rozdzielczości (offline, idempotentnie) — tła wrzucone ręcznie do folderu
-    presetu lub zmiana formatu w Ustawieniach nie rozstrajają klampu, którego
-    stałe pikselowe (masks.KLAMP_*) są strojone pod szerokość
-    config.TEMPLATE_STD_SZEROKOSC.
+def _odchyl(w: int, h: int) -> float:
+    """Względny odchył proporcji w×h od proporcji wybranego formatu karty
+    (0 = idealne dopasowanie); porównywany z PROG_ODCHYLU_PROPORCJI."""
+    target = config.template_target_size()
+    ratio_target = target[0] / target[1]
+    return abs(w / h - ratio_target) / ratio_target
+
+
+def odchyl_proporcji(path: Path) -> float:
+    """Odchył proporcji PLIKU obrazu od wybranego formatu karty — GUI pyta
+    o tryb dopasowania (rozciągnięcie/docięcie) dopiero powyżej progu."""
+    with Image.open(path) as probka:
+        w, h = probka.size
+    return _odchyl(w, h)
+
+
+def normalizuj_szablon(path: Path, *, wymus: bool = False) -> bool:
+    """Rozciąga PLIK tła do DOKŁADNEJ proporcji pikseli wybranego formatu
+    karty i standardowej rozdzielczości (`config.template_target_size()`,
+    np. 1695×2373 = idealne 5:7 dla pokera; offline, idempotentnie) — tła
+    wrzucone ręcznie do folderu presetu lub zmiana formatu w Ustawieniach
+    nie rozstrajają klampu, którego stałe pikselowe (masks.KLAMP_*) są
+    strojone pod szerokość config.TEMPLATE_STD_SZEROKOSC. Cały obraz zostaje
+    (bez docinania) — przy odchyle proporcji ≤ PROG_ODCHYLU_PROPORCJI
+    dystorsja jest niezauważalna.
 
     Oryginał ląduje jednorazowo w podfolderze zrodla/ obok pliku (niewidoczny
     dla Suit.available_templates — skan tylko top-level) i kolejne
-    normalizacje liczą się od niego, bez kumulacji docięć. Nadpisanie pliku
-    podbija mtime, więc cache masek i kolażu unieważniają się same.
-    """
+    normalizacje liczą się od niego, bez kumulacji dystorsji i strat JPEG.
+    Sygnatura każdej normalizacji (rozmiar+mtime wyniku) trafia do
+    zrodla/_znormalizowane.json — plik PODMIENIONY ręcznie pod tą samą nazwą
+    (użytkownik iteruje eksporty z programu graficznego) nie pasuje do
+    sygnatury i staje się NOWYM oryginałem, zamiast zostać wskrzeszony ze
+    starego zrodla. Nadpisanie pliku podbija mtime, więc cache masek
+    i kolażu unieważniają się same.
+
+    wymus=True pomija guard idempotencji i przelicza plik od oryginału
+    w zrodla/ — tła docięte STARYM zachowaniem (przed rozciąganiem) mają już
+    docelowy rozmiar i bez wymuszenia nigdy nie odzyskałyby pełnej treści.
+    Zwraca True, jeśli plik został nadpisany."""
     path = Path(path)
     target = config.template_target_size()
     with Image.open(path) as probka:
         size = probka.size
-    ratio_target = target[0] / target[1]
-    odchyl = abs(size[0] / size[1] - ratio_target) / ratio_target
-    if size == target or (size[0] == config.TEMPLATE_STD_SZEROKOSC
-                          and odchyl <= PROG_ODCHYLU_PROPORCJI):
-        return
+    if not wymus and size == target:
+        return False
     zrodlo = path.parent / "zrodla" / path.name
-    if not zrodlo.exists():
+    mial_zrodlo = zrodlo.exists()
+    meta = _wczytaj_meta_normalizacji(path.parent)
+    podpis = [size[0], size[1], path.stat().st_mtime_ns]
+    if not mial_zrodlo:
         zrodlo.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, zrodlo)
+    elif meta.get(path.name, podpis) != podpis:
+        # plik podmieniono ręcznie po ostatniej normalizacji — NOWA treść
+        # jest oryginałem; stare zrodlo by ją nadpisało, więc je zastępujemy
+        shutil.copy2(path, zrodlo)
+        mial_zrodlo = False
     img = ImageOps.exif_transpose(Image.open(zrodlo)).convert("RGB")
-    odchyl = abs(img.width / img.height - ratio_target) / ratio_target
-    if odchyl > PROG_ODCHYLU_PROPORCJI:
-        img = ImageOps.fit(img, target, method=Image.Resampling.LANCZOS)
-    else:
-        img = img.resize(
-            (target[0], round(target[0] * img.height / img.width)),
-            Image.Resampling.LANCZOS)
+    img = img.resize(target, Image.Resampling.LANCZOS)
+    if wymus and img.size == size and (not mial_zrodlo
+                                       or meta.get(path.name) == podpis):
+        # wynik byłby identyczny (plik jest własnym oryginałem w docelowej
+        # skali albo zapisanym wynikiem normalizacji z tego samego zrodła) —
+        # nadpisanie podbiłoby tylko mtime (zbędna inwalidacja cache masek)
+        if meta.get(path.name) != podpis:
+            meta[path.name] = podpis
+            _zapisz_meta_normalizacji(path.parent, meta)
+        return False
     # quality dotyczy tylko JPEG (PNG ignoruje) — domyślne 75 dokładałoby
     # widoczne artefakty do tła, z którego klamp składa finalne karty
     img.save(path, quality=95)
+    meta[path.name] = [img.width, img.height, path.stat().st_mtime_ns]
+    _zapisz_meta_normalizacji(path.parent, meta)
     print(f"[szablony] {path.name}: znormalizowano {size[0]}x{size[1]} -> "
           f"{img.width}x{img.height} (oryginał w zrodla/)")
+    return True
+
+
+def _wczytaj_meta_normalizacji(folder: Path) -> dict:
+    """Sygnatury ostatnich normalizacji plików tego folderu teł:
+    {nazwa pliku: [szer, wys, mtime_ns]} w zrodla/_znormalizowane.json."""
+    plik = folder / "zrodla" / "_znormalizowane.json"
+    try:
+        return json.loads(plik.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _zapisz_meta_normalizacji(folder: Path, meta: dict) -> None:
+    plik = folder / "zrodla" / "_znormalizowane.json"
+    plik.parent.mkdir(parents=True, exist_ok=True)
+    plik.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+
+
+def renormalizuj_wszystkie() -> int:
+    """Wymusza ponowne dopasowanie WSZYSTKICH teł aktywnego presetu przodu
+    do bieżącego formatu karty (bez API) — liczone od oryginałów w zrodla/,
+    więc tła docięte przed wprowadzeniem rozciągania odzyskują pełną treść.
+    Zwraca liczbę nadpisanych plików."""
+    d = style_store.front_dir()
+    if not d.is_dir():
+        return 0
+    return sum(
+        normalizuj_szablon(p, wymus=True)
+        for p in sorted(d.iterdir()) if p.suffix.lower() in config.IMAGE_EXTS
+    )
+
+
+def normalizuj_aktywny_preset() -> int:
+    """Dopasowuje tła aktywnego presetu przodu do bieżącego formatu BEZ
+    forsowania (`normalizuj_szablon` bez wymus): pliki już w dokładnej
+    proporcji formatu (np. 5:7 = 1695×2373) są pomijane, a pliki o złej
+    proporcji — wrzucone ręcznie do folderu presetu lub wyeksportowane
+    z programu graficznego pod inną proporcją — zostają przeskalowane do
+    dokładnego celu. Wołane przy AKTYWACJI presetu (wybór w zakładce Style),
+    gdy w folderze mogą leżeć tła spoza programu. Zwraca liczbę nadpisanych
+    plików."""
+    d = style_store.front_dir()
+    if not d.is_dir():
+        return 0
+    return sum(
+        normalizuj_szablon(p)
+        for p in sorted(d.iterdir()) if p.suffix.lower() in config.IMAGE_EXTS
+    )
 
 
 def generate_template(suit: Suit, prompt: str | None = None, *,
@@ -311,16 +401,22 @@ def generate_template(suit: Suit, prompt: str | None = None, *,
     return path
 
 
-def import_template(suit: Suit, src: Path) -> Path:
+def import_template(suit: Suit, src: Path, *, rozciagnij: bool = False) -> Path:
     """Wgrywa WŁASNY obraz użytkownika jako tło przodu danego koloru — bez
-    API: docina do proporcji wybranego formatu karty, skaluje do standardowej
-    rozdzielczości i zapisuje do folderu aktywnego presetu teł przodu.
+    API: dopasowuje do proporcji wybranego formatu karty i standardowej
+    rozdzielczości, po czym zapisuje do folderu aktywnego presetu teł przodu.
+    rozciagnij=True — cały obraz ściśnięty/rozciągnięty do formatu (bez
+    utraty brzegów); False — docięcie środka bez dystorsji.
     Zwraca ścieżkę nowego pliku."""
     img = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
     # Jawny import zawsze dopasowuje w pełni: proporcje wybranego formatu
     # karty + standardowa rozdzielczość (skala strojenia klampu)
-    img = ImageOps.fit(img, config.template_target_size(),
-                       method=Image.Resampling.LANCZOS)
+    if rozciagnij:
+        img = img.resize(config.template_target_size(),
+                         Image.Resampling.LANCZOS)
+    else:
+        img = ImageOps.fit(img, config.template_target_size(),
+                           method=Image.Resampling.LANCZOS)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     target_dir = style_store.front_dir()
     target_dir.mkdir(parents=True, exist_ok=True)

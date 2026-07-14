@@ -212,6 +212,7 @@ class MainWindow(QMainWindow):
         self.back_view.generate_front_clicked.connect(self._start_front_generation)
         self.back_view.generate_front_set_clicked.connect(self._start_front_set)
         self.back_view.import_front_clicked.connect(self._on_front_import)
+        self.back_view.normalize_fronts_clicked.connect(self._on_front_normalize)
         self.export_view.export_clicked.connect(self._start_export)
         self.export_view.options_changed.connect(self._save_project)
 
@@ -1272,6 +1273,10 @@ class MainWindow(QMainWindow):
         if cat == "tla_przodu":
             # wybory wariantów wskazywały pliki poprzedniego presetu
             config.TEMPLATE_OVERRIDES.clear()
+            # tła spoza programu (wrzucone ręcznie do folderu presetu) mogą mieć
+            # złą proporcję — aktywacja presetu wymusza dokładny format karty
+            from app.core import generator
+            generator.normalizuj_aktywny_preset()
             card_grid.clear_template_cache()
             self._rebuild_grids(self._values())
             self.workspace.template_picker.refresh_templates()
@@ -1420,11 +1425,41 @@ class MainWindow(QMainWindow):
                              " — teraz przypisz zdjęcia na Ekranie roboczym")
 
     def _on_front_import(self, suit: Suit, src: str) -> None:
-        """Własny obraz użytkownika jako tło koloru — docięcie do proporcji
-        karty (bez API) i natychmiastowa aktywacja."""
+        """Własny obraz użytkownika jako tło koloru — dopasowanie do proporcji
+        karty (bez API) i natychmiastowa aktywacja. Przy dużym odchyle
+        proporcji użytkownik wybiera: rozciągnięcie całości czy docięcie."""
         from app.core import generator
         try:
-            path = generator.import_template(suit, Path(src))
+            odchyl = generator.odchyl_proporcji(Path(src))
+        except (OSError, ValueError) as exc:
+            show_toast(self, f"Nie wczytano obrazu: {exc}", "error")
+            return
+        # mały odchył: rozciągnięcie jest niewidoczne, a nic nie ginie —
+        # bez pytania; duży odchył: dystorsja vs utrata brzegów to wybór
+        rozciagnij = True
+        if odchyl > generator.PROG_ODCHYLU_PROPORCJI:
+            box = QMessageBox(self)
+            box.setWindowTitle("Dopasowanie tła do formatu karty")
+            box.setText(
+                f"Proporcje obrazu odbiegają od formatu karty o {odchyl:.0%}.\n\n"
+                "• Rozciągnij — cały obraz zostaje, ale będzie ściśnięty/"
+                "rozciągnięty (widoczna dystorsja).\n"
+                "• Dotnij — bez dystorsji, ale brzegi obrazu zostaną ucięte."
+            )
+            stretch_btn = box.addButton(
+                "Rozciągnij (cały obraz)", QMessageBox.ButtonRole.AcceptRole)
+            crop_btn = box.addButton(
+                "Dotnij brzegi", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(stretch_btn)
+            box.exec()
+            if box.clickedButton() is crop_btn:
+                rozciagnij = False
+            elif box.clickedButton() is not stretch_btn:
+                return
+        try:
+            path = generator.import_template(suit, Path(src),
+                                             rozciagnij=rozciagnij)
         except (OSError, ValueError) as exc:
             show_toast(self, f"Nie wczytano obrazu: {exc}", "error")
             return
@@ -1433,6 +1468,27 @@ class MainWindow(QMainWindow):
         self.back_view.refresh_front_preview()
         self._save_project()
         show_toast(self, f"✔ własne tło {suit.symbol}: {path.name}", "ok")
+
+    def _on_front_normalize(self) -> None:
+        """Wymuszone dopasowanie WSZYSTKICH teł aktywnego presetu do formatu
+        karty — tła docięte przed wprowadzeniem rozciągania odzyskują pełną
+        treść z oryginałów w zrodla/ (bez API)."""
+        from app.core import generator
+        try:
+            zmienione = generator.renormalizuj_wszystkie()
+        except (OSError, ValueError) as exc:
+            show_toast(self, f"Nie dopasowano teł: {exc}", "error")
+            return
+        if not zmienione:
+            show_toast(self, "Tła już pasują do wybranego formatu — bez zmian",
+                       "info")
+            return
+        card_grid.clear_template_cache()
+        self._rebuild_grids(self._values())
+        self.workspace.template_picker.refresh_templates()
+        self.back_view.refresh_front_preview()
+        show_toast(self, f"✔ dopasowano tła do formatu ({zmienione} plików)",
+                   "ok")
 
     # ----------------------------------------------------------------------- rewers
     def _start_back_generation(self, settings: dict) -> None:
@@ -1533,6 +1589,18 @@ class MainWindow(QMainWindow):
         show_toast(self, f"✖ podgląd: {message[:120]}", "error")
 
     def _on_card_preset_changed(self, _key: str) -> None:
+        # nowy format = nowa proporcja docelowa tła: przelicz tła aktywnego
+        # presetu od oryginałów w zrodla/ (dopasowanie do NOWEJ proporcji),
+        # unieważnij cache masek/kolażu i odśwież podglądy
+        from app.core import generator
+        try:
+            generator.renormalizuj_wszystkie()
+        except (OSError, ValueError) as exc:
+            show_toast(self, f"Nie dopasowano teł do formatu: {exc}", "error")
+        card_grid.clear_template_cache()
+        self._rebuild_grids(self._values())
+        self.workspace.template_picker.refresh_templates()
+        self.back_view.refresh_front_preview()
         self._set_status(
             f"Format talii: {config.CARD_PRESETS[config.SELECTED_CARD_PRESET][0]}"
         )

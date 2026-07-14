@@ -157,12 +157,14 @@ def _full_card_size_clause(liczba_osob: int | None) -> str:
 The GROUP must be LARGE: together the people fill about 90-95% of the
    window's width, arranged so that EVERY face is clearly visible and
    recognizable — never a small group floating in the middle of the window
-   with wide margins around it."""
+   with wide margins around it, and no one standing out on the frame or on
+   the card away from the window."""
     return """\
 The subject must be LARGE: about
    90-95% of the window's height (bust/portrait crop), the head close to the
    top of the window or slightly overlapping its notch — never a small figure
-   floating in the middle of the window with wide margins around it."""
+   floating in the middle of the window with wide margins around it, and never
+   standing out on the frame or on the card away from the window."""
 
 
 def full_card_prompt(suit, liczba_osob: int | None = None) -> str:
@@ -198,15 +200,16 @@ Task — bold 3D pop-out ("out of bounds") composition:
    paint the photo's scenery (sky, water, grass, ground, walls) anywhere
    on the card; wherever the people do not stand inside the window, the
    flat fill must show.
-3. The subject steps OUT of the {shape} window: where they meet, the
-   frame's contour passes BEHIND the subject's body, and one or two
-   prominent parts (head, hat, shoulder, elbow, hand, a held prop) MUST
-   clearly cross the frame contour onto the engraved card background.
-   EVERY face must be FULLY visible — never cropped by the frame, the
-   window edge or the card border; if the subject does not fit inside the
-   window, let it extend OVER the frame instead of shrinking or cropping
-   it. Keep a clear empty margin from the card's outer border and never
-   touch the corner shield plaques.
+3. The subject FILLS the {shape} window. It may lightly step out: where
+   they meet, the frame's contour passes BEHIND the subject's body, and a
+   head, shoulder or held prop may cross the window's edge into the narrow
+   band right next to it. But the subject must STAY at the window — it must
+   NOT walk out onto the open engraved frame, and no person may stand on the
+   ornament or on the card away from the window. EVERY face must be FULLY
+   visible — never cropped by the frame, the window edge or the card border;
+   if the subject does not fit, crop it a little at the bottom rather than
+   scattering people onto the frame. Keep a clear empty margin from the
+   card's outer border and never touch the corner shield plaques.
    {_full_card_size_clause(liczba_osob)}
 4. The suit symbol must stay recognizable — the subject crosses the frame
    but never covers the window completely.
@@ -375,20 +378,23 @@ inside or outside the window. Scenery is NOT part of the subject; props the
 subject holds, rides or wears (a bike, skis, a mast, a mask, handlebars)
 ARE and stay in full color.
 
-MAIN GOAL — a bold 3D pop-out ("out of bounds") effect:
-- The subject stands INSIDE the suit-symbol window and steps out of it:
-  wherever they meet, the frame's contour passes BEHIND the subject's body.
-- One or two prominent parts (head, hat, shoulder, elbow, hand, a held prop)
-  MUST clearly cross the frame contour; they may reach far onto the card,
-  over the engraved background — but keep a clear EMPTY margin from the
-  card's outer border (like the margin of a notebook page): nothing may
-  touch or approach the engraved edge zone, and the corner shield plaques
-  are off limits.
+MAIN GOAL — the subject FILLS the suit-symbol window, with a light 3D
+pop-out at its edge:
+- The subject stands INSIDE the suit-symbol window and fills it; where the
+  body meets the window edge, the frame's contour passes BEHIND the body.
+- A head, shoulder, elbow, hand or held prop may lightly cross the window's
+  contour into the NARROW band right next to it — but the subject must STAY
+  at the window. Do NOT let anyone reach out onto the open engraved frame,
+  and NO person may stand on the ornament or on the card away from the
+  window. Keep a clear EMPTY margin from the card's outer border and never
+  touch the corner shield plaques.
+- Fill the window: no small subject floating in the middle with a wide empty
+  flat-fill margin around it, and no people scattered onto the frame.
 - EVERY person from the photo must fit in the picture with their WHOLE head
   visible: no face may be cropped by the frame, the window edge or the
   card edge.
-- The suit symbol must stay recognizable: the subject crosses the frame but
-  never covers the window completely.
+- The suit symbol must stay recognizable: the subject fills the window but
+  never covers it completely.
 - Never treat the frame as a porthole or a clipping window — do not crop,
   fade or cut the subject at the frame edge, and never leave any straight
   photo edge visible.
@@ -399,14 +405,16 @@ of the card."""
 # model czyta restrykcje (guard + zakaz tekstu) jako ostatnie i instrukcja
 # pop-out z początku promptu ginie — krótka repryza przywraca jej wagę.
 POPOUT_REMINDER = """\
-FINAL CHECK — MOST IMPORTANT: if the subject ends up entirely inside the
-suit frame, or looks cropped by the frame's edge, the result is WRONG.
-The subject must visibly overlap and cover the frame contour. Equally
-WRONG: any leftover straight photo edge or photo scenery (sky, water,
-grass, ground) — inside the window the flat suit-color fill must show
-around the subject, everywhere else the card's own background. Also WRONG:
-any face cropped or missing, or anything touching the card's outer
-border."""
+FINAL CHECK — MOST IMPORTANT: the subject must FILL the suit window, with a
+head/shoulder/prop lightly crossing the window's edge into the band right
+next to it. WRONG: a subject or person standing out on the ornate frame or
+on the card away from the window (they must stay at the window). WRONG: a
+small subject floating in the middle of the window with a wide empty
+flat-fill margin around it. Equally WRONG: any leftover straight photo edge
+or photo scenery (sky, water, grass, ground) — inside the window the flat
+suit-color fill must show around the subject, everywhere else the card's own
+background. Also WRONG: any face cropped or missing, or anything touching the
+card's outer border."""
 
 
 def popout_prompt(suit, photo_ref: bool = False,

@@ -234,7 +234,7 @@ class SettingsView(QWidget):
         format_layout.addWidget(size_caption)
         self.size_combo = QComboBox()
         self.size_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        for key, (label, _) in config.CARD_PRESETS.items():
+        for key, (label, *_) in config.CARD_PRESETS.items():
             self.size_combo.addItem(label, key)
         self.size_combo.currentIndexChanged.connect(self._on_card_preset)
         format_layout.addWidget(self.size_combo)

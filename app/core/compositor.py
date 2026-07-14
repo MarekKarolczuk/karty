@@ -18,8 +18,11 @@ from app import config
 from app.core import masks, style_store
 from app.core.models import CardSpec, Suit
 
-# Domyślna transformacja kadru (GUI: suwaki Zoom/X/Y)
-DEFAULT_TRANSFORM = {"zoom": 1.0, "dx": 0.0, "dy": 0.0}
+# Domyślna transformacja kadru (GUI: suwaki Zoom/X/Y). Zoom 1.1 (nie 1.0) —
+# subiekt wypełnia ~110% bboxa okna, mniej pustego płaskiego tła dookoła
+# (model zostawiał małą sylwetkę pływającą w wielkim oknie „Domyślnego").
+# Umiarkowanie, żeby nie ciąć szeroko fitowanych grup; suwaki GUI nadpisują.
+DEFAULT_TRANSFORM = {"zoom": 1.1, "dx": 0.0, "dy": 0.0}
 
 # Cache przeskalowanych szablonów/bboxów dla szybkiego podglądu w GUI
 _scaled_cache: dict[tuple, tuple[Image.Image, Image.Image, tuple, tuple]] = {}
@@ -277,8 +280,12 @@ def build_init_image(suit: Suit, photo_path: Path,
 
     photo = Image.open(photo_path)
     photo = ImageOps.exif_transpose(photo).convert("RGB")
+    # centering (0.5, 0.42): przy prawie kwadratowym bboxie okna portret
+    # (kadr pionowy) fitowany symetrycznie ucinał głowę — bias ku górze
+    # trzyma twarze w kadrze (jak compose_card_raw)
     fitted = ImageOps.fit(photo, (target_w, target_h),
-                          method=Image.Resampling.LANCZOS)
+                          method=Image.Resampling.LANCZOS,
+                          centering=(0.5, 0.42))
 
     layer.paste(fitted, (round(cx - target_w / 2), round(cy - target_h / 2)))
     for box in shield_boxes:

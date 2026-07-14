@@ -122,23 +122,29 @@ GEN_TEMPERATURE = 0.3   # niska temperatura = powtarzalny styl między kartami
 GEN_SEED = 12           # seed bazowy; wywołanie karty używa GEN_SEED + wariant
 
 # --- Format karty (preset wybierany w Ustawieniach) ---
-# klucz -> (etykieta, (szerokość mm, wysokość mm))
-CARD_PRESETS: dict[str, tuple[str, tuple[float, float]]] = {
-    "poker": ("Standard Poker · 63 × 88 mm", (63.0, 88.0)),
-    "bridge": ("Bridge · 57 × 88 mm", (57.0, 88.0)),
-    "tarot": ("Tarot · 70 × 120 mm", (70.0, 120.0)),
-    "mini": ("Mini · 44 × 63 mm", (44.0, 63.0)),
+# klucz -> (etykieta, (szerokość mm, wysokość mm), DOKŁADNA proporcja pikseli)
+# Proporcja pikseli to zredukowany stosunek calowego pierwowzoru formatu
+# (poker 2.5×3.5″ = 5:7 itd.) — pliki teł/kart mają szer:wys równe jej co do
+# piksela (wymóg drukarni/serwisów przyjmujących np. dokładnie 5:7); mm to
+# zaokrąglony rozmiar WYDRUKU (eksport PDF).
+CARD_PRESETS: dict[str, tuple[str, tuple[float, float], tuple[int, int]]] = {
+    "poker": ("Standard Poker · 63 × 88 mm", (63.0, 88.0), (5, 7)),   # 2.5×3.5″
+    "bridge": ("Bridge · 57 × 88 mm", (57.0, 88.0), (9, 14)),         # 2.25×3.5″
+    "tarot": ("Tarot · 70 × 120 mm", (70.0, 120.0), (7, 12)),
+    "mini": ("Mini · 44 × 63 mm", (44.0, 63.0), (7, 10)),             # 1.75×2.5″
 }
 SELECTED_CARD_PRESET = "poker"
 CARD_MM = CARD_PRESETS[SELECTED_CARD_PRESET][1]
+CARD_RATIO = CARD_PRESETS[SELECTED_CARD_PRESET][2]
 
 
 def set_card_preset(key: str) -> None:
     """Zmienia globalny format karty (DPI eksportu liczy się z CARD_MM na żywo)."""
-    global SELECTED_CARD_PRESET, CARD_MM
+    global SELECTED_CARD_PRESET, CARD_MM, CARD_RATIO
     if key in CARD_PRESETS:
         SELECTED_CARD_PRESET = key
         CARD_MM = CARD_PRESETS[key][1]
+        CARD_RATIO = CARD_PRESETS[key][2]
 
 
 # Standardowa szerokość pliku tła (px) — jak domyślne tła; stałe pikselowe
@@ -147,10 +153,14 @@ TEMPLATE_STD_SZEROKOSC = 1696
 
 
 def template_target_size() -> tuple[int, int]:
-    """Docelowy rozmiar pliku tła: standardowa szerokość + proporcje CARD_MM
-    (liczone na żywo — preset formatu z Ustawień zmienia CARD_MM w sesji)."""
-    return (TEMPLATE_STD_SZEROKOSC,
-            round(TEMPLATE_STD_SZEROKOSC * CARD_MM[1] / CARD_MM[0]))
+    """Docelowy rozmiar pliku tła: DOKŁADNA proporcja pikseli formatu
+    (CARD_RATIO, np. 5:7 dla pokera) w skali najbliższej standardowej
+    szerokości — wymiary to wielokrotności proporcji, więc szer/wys jest
+    równe jej co do piksela (poker: 1695×2373). Liczone na żywo — preset
+    formatu z Ustawień zmienia CARD_RATIO w sesji."""
+    rw, rh = CARD_RATIO
+    k = max(1, round(TEMPLATE_STD_SZEROKOSC / rw))
+    return (rw * k, rh * k)
 
 # Rozszerzenia plików traktowane jako obrazy
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}

@@ -47,6 +47,8 @@ class BackView(QWidget):
     generate_front_set_clicked = pyqtSignal(dict)
     # własny plik użytkownika jako tło przodu: Suit, ścieżka obrazu
     import_front_clicked = pyqtSignal(object, str)
+    # wymuszone dopasowanie istniejących teł presetu do formatu karty
+    normalize_fronts_clicked = pyqtSignal()
     character_changed = pyqtSignal()   # edycja dowolnego promptu → zapis + podgląd
     style_slot_changed = pyqtSignal()  # zmiana struktury presetów (nowy/usuń/...)
     preset_applied = pyqtSignal(str)   # aktywowano preset danej kategorii (cat)
@@ -585,11 +587,23 @@ class BackView(QWidget):
         self.front_import_btn.setObjectName("ghostBtn")
         self.front_import_btn.setToolTip(
             "Użyj własnego obrazu jako tła wybranego koloru — plik zostanie "
-            "docięty do proporcji karty (bez API)"
+            "dopasowany do formatu karty (bez API); przy dużej różnicy "
+            "proporcji program zapyta: rozciągnąć całość czy dotnąć brzegi"
         )
         self.front_import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.front_import_btn.clicked.connect(self._pick_front_file)
         left.addWidget(self.front_import_btn)
+
+        self.front_norm_btn = QPushButton("📐  Dopasuj istniejące tła do formatu")
+        self.front_norm_btn.setObjectName("ghostBtn")
+        self.front_norm_btn.setToolTip(
+            "Ponownie dopasuj WSZYSTKIE tła aktywnego presetu do wybranego "
+            "formatu karty (bez API) — tła docięte wcześniej odzyskają pełną "
+            "treść z oryginałów (rozciągnięcie zamiast docięcia)"
+        )
+        self.front_norm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.front_norm_btn.clicked.connect(self.normalize_fronts_clicked)
+        left.addWidget(self.front_norm_btn)
         left.addStretch(1)
         row.addLayout(left, stretch=1)
 
