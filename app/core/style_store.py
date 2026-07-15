@@ -1,10 +1,11 @@
 """Biblioteki presetów stylu — trwałe foldery na dysku (Style/).
 
-Zamiast jednego wspólnego „zestawu" mamy CZTERY niezależne biblioteki, po jednej
+Zamiast jednego wspólnego „zestawu" mamy niezależne biblioteki, po jednej
 na komponent wyglądu talii:
-  - postac     — stylizacja postaci (pop-out) ze zdjęcia,
-  - styl_tla   — opis ornamentyki / szablonu kart,
-  - tla_przodu — prompty teł PRZODU (czerwone/czarne) + 4 obrazy kart,
+  - postac     — stylizacja postaci (pop-out) ze zdjęcia + poziom kreskówki,
+  - tla_przodu — prompty teł PRZODU (czerwone/czarne) + 4 obrazy kart
+                 + wspólny opis ornamentyki (pole `styl`, dawna kategoria
+                 „styl_tla" — scalona, migracja w load()),
   - rewers     — opis + obraz rewersu (tyłu kart).
 
 Każda kategoria to podfolder `Style/<kategoria>/`, a każdy preset to podfolder
@@ -125,7 +126,7 @@ strictly the background design with no characters and no text.
 
 # --- definicja kategorii ------------------------------------------------------
 
-CATEGORIES = config.STYLE_CATEGORIES   # ("postac","styl_tla","tla_przodu","rewers")
+CATEGORIES = config.STYLE_CATEGORIES   # ("postac","tla_przodu","rewers","wartosci")
 
 # Pola tekstowe (plik <field>.txt) i ich wartości domyślne, per kategoria.
 _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
@@ -133,12 +134,20 @@ _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
     # monochromatycznych odcieniach koloru karty zamiast płaskiego wypełnienia.
     # Domyślnie WŁĄCZONE (wnętrze symbolu nie ma być płaskie); checkbox w GUI
     # pozwala wrócić do płaskiego.
-    "postac": {"styl": DEFAULT_CHARACTER_STYLE, "sceneria_kolor": "1"},
-    "styl_tla": {"styl": DEFAULT_TEMPLATE_STYLE},
+    # poziom_kreskowki: 1-5 (5 = pełna kreskówka/cell-shading jak dotąd,
+    # 1 = blisko fotorealizmu); suwak na Ekranie roboczym; twarze zawsze
+    # realistyczne (prompts.face_fidelity_clause jest nadrzędna).
+    "postac": {"styl": DEFAULT_CHARACTER_STYLE, "sceneria_kolor": "1",
+               "poziom_kreskowki": "5"},
     # tryb_wlasny "1" = prompt presetu idzie do modelu DOSŁOWNIE, bez
-    # wbudowanych dopisków programu (np. karty do planszówek)
+    # wbudowanych dopisków programu (np. karty do planszówek);
+    # styl = wspólny opis ornamentyki szablonu (dawna kategoria "styl_tla");
+    # maska_aktywna = nazwa presetu maski pop-out z podfolderu maski/
+    # ("" = Maska automatyczna, strefa wyliczana — masks.domyslna_strefa_popout)
     "tla_przodu": {"front_red": DEFAULT_FRONT_RED,
                    "front_black": DEFAULT_FRONT_BLACK,
+                   "styl": DEFAULT_TEMPLATE_STYLE,
+                   "maska_aktywna": "",
                    "tryb_wlasny": "0"},
     "rewers": {"opis": "", "tryb_wlasny": "0"},
     # Typografia narożników (stemplowanie lokalne, nie AI) — liczby w %
@@ -169,7 +178,6 @@ _CATEGORY_IMAGES: dict[str, tuple[str, ...]] = {
 # Czytelne etykiety kategorii (dla GUI).
 CATEGORY_LABELS: dict[str, str] = {
     "postac": "styl postaci",
-    "styl_tla": "styl tła",
     "tla_przodu": "tła przodu",
     "rewers": "rewers",
     "wartosci": "wartości narożne",
@@ -297,11 +305,19 @@ def character_style() -> str:
 
 
 def template_style() -> str:
-    return text("styl_tla", "styl")
+    """Wspólny opis ornamentyki szablonu — pole `styl` presetu teł przodu
+    (dawna kategoria "styl_tla", scalona)."""
+    return text("tla_przodu", "styl")
 
 
 def front_prompt(is_red: bool) -> str:
     return text("tla_przodu", "front_red" if is_red else "front_black")
+
+
+def active_mask() -> str:
+    """Nazwa aktywnego presetu maski pop-out (podfolder maski/<nazwa>/ w
+    presecie teł przodu); "" = Maska automatyczna (strefa wyliczana)."""
+    return text("tla_przodu", "maska_aktywna").strip()
 
 
 def front_custom_mode() -> bool:
@@ -314,6 +330,16 @@ def scenery_suit_mode() -> bool:
     """Sceneria zdjęcia (góry, horyzont) malowana w oknie symbolu w
     monochromatycznych odcieniach koloru karty zamiast płaskiego wypełnienia."""
     return text("postac", "sceneria_kolor").strip() == "1"
+
+
+def cartoon_level() -> int:
+    """Poziom przeróbki zdjęcia na kreskówkę: 5 = pełna kreskówka (status quo),
+    1 = blisko fotorealizmu. Śmieciowa wartość → 5 (obecne zachowanie)."""
+    try:
+        level = int(text("postac", "poziom_kreskowki").strip())
+    except ValueError:
+        return 5
+    return min(5, max(1, level))
 
 
 def back_text() -> str:
@@ -608,7 +634,7 @@ def _seed_default_texts() -> None:
         return
     mapping = {
         ("postac", "styl"): slot.get("character"),
-        ("styl_tla", "styl"): slot.get("template"),
+        ("tla_przodu", "styl"): slot.get("template"),
         ("tla_przodu", "front_red"): slot.get("front_red"),
         ("tla_przodu", "front_black"): slot.get("front_black"),
     }
@@ -646,6 +672,52 @@ def _migrate_working_set() -> None:
     _rmdir_quiet(legacy)
 
 
+def _migrate_styl_tla() -> None:
+    """Jednorazowo scala dawną kategorię „styl_tla" z „tla_przodu": treść pola
+    `styl` dawnego AKTYWNEGO presetu styl_tla trafia do pola `styl` aktywnego
+    presetu tla_przodu (o ile ten nie ma już własnej wartości). Folder
+    Style/styl_tla/ zostaje na dysku (kategoria wypięta z CATEGORIES jest
+    ignorowana); marker _zmigrowano zapobiega ponownemu wpisaniu treści po
+    tym, jak użytkownik zresetuje pole do domyślnego."""
+    old_root = config.STYLE_ROOT / "styl_tla"
+    marker = old_root / "_zmigrowano"
+    if not old_root.is_dir() or marker.exists():
+        return
+    # dawny aktywny preset z active.json (klucz "styl_tla" jest już poza
+    # CATEGORIES, więc _load_active go ignoruje — czytamy plik wprost)
+    old_name = DEFAULT_PRESET_NAME
+    try:
+        data = json.loads(config.STYLE_ACTIVE_JSON.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("styl_tla"), str):
+            old_name = data["styl_tla"]
+    except (OSError, json.JSONDecodeError):
+        pass
+    src = old_root / old_name / "styl.txt"
+    if not src.is_file():
+        kandydaci = sorted(old_root.glob("*/styl.txt"))
+        src = kandydaci[0] if kandydaci else None
+    try:
+        value = src.read_text(encoding="utf-8") if src else ""
+    except OSError:
+        value = ""
+    # porównanie odporne na białe znaki (stare pliki bywają przewinięte
+    # inaczej niż literał DEFAULT_TEMPLATE_STYLE) — tekst domyślny NIE jest
+    # przenoszony (puste pole = wartość domyślna)
+    if value.strip() and " ".join(value.split()) \
+            != " ".join(DEFAULT_TEMPLATE_STYLE.split()):
+        dst = preset_dir("tla_przodu") / "styl.txt"
+        try:
+            if not dst.exists() or not dst.read_text(encoding="utf-8").strip():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(value, encoding="utf-8")
+        except OSError:
+            return   # bez markera — spróbujemy przy kolejnym starcie
+    try:
+        marker.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _migrate_character_defaults() -> None:
     """Presety postaci ze STARYM domyślnym stylem zapisanym dosłownie wracają
     do pustego pliku (= aktualna wartość domyślna). Presety edytowane ręcznie
@@ -673,4 +745,5 @@ def load() -> None:
     _seed_default_texts()
     _migrate_working_set()
     _migrate_character_defaults()
+    _migrate_styl_tla()
     _ensure()

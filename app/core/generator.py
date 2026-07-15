@@ -10,10 +10,12 @@ import json
 import os
 import shutil
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageOps
+import numpy as np
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 from app import config
 from app.api import gemini_client, stability_client
@@ -78,7 +80,8 @@ def _klamp_do_szablonu(wynik: Image.Image, spec: CardSpec) -> Image.Image:
     kolor_tla = (int(kolor_hex[1:3], 16), int(kolor_hex[3:5], 16),
                  int(kolor_hex[5:7], 16))
     maska = masks.maska_klampu(wynik, template, spec.suit.template_path,
-                               kolor_tla=kolor_tla)
+                               kolor_tla=kolor_tla, wartosc=spec.value,
+                               suit=spec.suit)
     # Baza kompozycji = szablon z oknem wypełnionym kolorem karty: feather
     # rdzenia i szczelina przy konturze mieszają się z kolorem wypełnienia,
     # nie z kremem szablonu („biały ślad" symbolu). Poza oknem baza jest
@@ -205,6 +208,96 @@ def przestempluj_plik(spec: CardSpec) -> Path:
     card = compositor.stempluj_narozniki(raw, spec)
     compositor.save_card(card, spec, template.size)
     return spec.output_path
+
+
+def nastepny_wariant(spec: CardSpec) -> int:
+    """Pierwszy wolny numer wariantu karty (skan output/ po value_suit.jpg
+    i value_suit_v*.jpg) — poprawki selektywne nie nadpisują historii."""
+    base = f"{spec.value}_{spec.suit.nazwa}"
+    najwyzszy = 0
+    for p in config.OUTPUT_DIR.glob(f"{base}*.jpg"):
+        if p.stem == base:
+            najwyzszy = max(najwyzszy, 1)
+        elif p.stem.startswith(f"{base}_v"):
+            try:
+                najwyzszy = max(najwyzszy, int(p.stem.rsplit("_v", 1)[1]))
+            except ValueError:
+                pass
+    return najwyzszy + 1
+
+
+# Temperatura wywołania edit_region wg suwaka „Siła poprawki" (1-5);
+# 3 celowo poza mapą → None → domyślne config.GEN_TEMPERATURE (status quo).
+# Uzupełnia klauzulę promptu prompts._FIX_SILA — prompt jest pewniejszą
+# dźwignią, temperatura tylko dokręca zachowawczość/swobodę.
+_FIX_TEMPERATURA = {1: 0.15, 2: 0.25, 4: 0.6, 5: 0.95}
+
+
+def popraw_region(spec: CardSpec, maska: np.ndarray, user_prompt: str,
+                  tryb: str = "ai", sila: int = 3) -> Path:
+    """Selektywna poprawa istniejącego wariantu karty (lightbox → „Popraw
+    selektywnie"): w trybie "ai" model przerysowuje TYLKO obszar zamalowany
+    pędzlem przez użytkownika wg jego promptu (sila 1-5 = jak mocno wolno mu
+    zmieniać istniejącą treść: klauzula promptu + temperatura wywołania);
+    w trybie "szablon" zamalowany obszar wraca piksel-w-piksel do tła
+    z szablonu (deterministycznie, ZERO API — np. krzywe linie ramki,
+    przestylizowany ornament, których klamp celowo nie cofa). Wynik zapisuje
+    się jako NOWY wariant (oryginał zostaje w historii — akceptacja przez
+    „Ustaw jako główną").
+
+    Baza = surowy PNG z output/_raw/ (bez narożników — model nie halucynuje
+    liter; narożniki stempluje potem compositor). Nienaruszalność reszty
+    karty jest DETERMINISTYCZNA: composite ogranicza zmianę do maski
+    użytkownika (feather = płynne złącze), a pełny klamp adaptacyjny
+    przywraca bordiurę, tarcze i tło z szablonu."""
+    normalizuj_szablon(spec.suit.template_path)
+    template = Image.open(spec.suit.template_path).convert("RGB")
+    if spec.raw_path.exists():
+        baza = Image.open(spec.raw_path).convert("RGB")
+    elif spec.output_path.exists():   # stare karty bez raw — jak przestempluj_plik
+        baza = compositor.wyczysc_tarcze(
+            Image.open(spec.output_path).convert("RGB").resize(
+                template.size, Image.Resampling.LANCZOS),
+            template, masks.get_masks(spec.suit.template_path))
+    else:
+        raise FileNotFoundError(f"Brak pliku karty {spec.label} do poprawy")
+    if baza.size != template.size:
+        baza = baza.resize(template.size, Image.Resampling.LANCZOS)
+
+    maska_img = Image.fromarray(maska).convert("L").resize(
+        baza.size, Image.Resampling.NEAREST)
+    if maska_img.getbbox() is None:
+        raise ValueError("Maska poprawki jest pusta — zamaluj obszar do zmiany")
+
+    nowy = replace(spec, variant=nastepny_wariant(spec))
+
+    if tryb == "szablon":
+        # przywrócenie tła: deterministycznie, bez API (działa też
+        # przy KARTY_FAKE_API)
+        wynik = template
+    elif _fake_api():
+        time.sleep(1.0)
+        wynik = ImageOps.posterize(baza, 3)   # udawana poprawka
+    else:
+        maly = baza.copy()
+        maly.thumbnail((MAX_API_SIDE, MAX_API_SIDE), Image.Resampling.LANCZOS)
+        maska_mala = maska_img.resize(maly.size, Image.Resampling.NEAREST)
+        wynik = gemini_client.edit_region(
+            maly, maska_mala, prompts.fix_region_prompt(user_prompt, sila),
+            seed=config.GEN_SEED + nowy.variant,
+            temperature=_FIX_TEMPERATURA.get(sila))
+    if wynik.size != baza.size:
+        wynik = wynik.resize(baza.size, Image.Resampling.LANCZOS)
+
+    # zmiana istnieje WYŁĄCZNIE w granicach maski użytkownika
+    zlacze = maska_img.filter(ImageFilter.GaussianBlur(4))
+    polaczony = Image.composite(wynik, baza, zlacze)
+    surowy = _klamp_do_szablonu(polaczony, nowy)
+
+    compositor.save_raw(surowy, nowy, template.size)
+    karta = compositor.stempluj_narozniki(surowy, nowy)
+    compositor.save_card(karta, nowy, template.size)
+    return nowy.output_path
 
 
 def _fit_card_ratio(img: Image.Image, landscape: bool = False) -> Image.Image:

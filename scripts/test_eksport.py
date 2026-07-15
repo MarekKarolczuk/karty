@@ -125,6 +125,44 @@ def main() -> int:
           f"{'OK' if ok else 'BLAD'}")
     failures += 0 if ok else 1
 
+    # --- Potok A4: dynamiczna siatka per format --------------------------------------
+    from app.core.eksport import UkladA4, formaty
+    fmts = formaty()
+    oczekiwane_siatki = {"poker": (3, 3), "bridge": (3, 3),
+                         "tarot": (2, 2), "mini": (4, 4)}
+    ok = True
+    for klucz, siatka in oczekiwane_siatki.items():
+        uklad = UkladA4(fmts[klucz], spad=True)
+        if (uklad.kolumny, uklad.wiersze) != siatka:
+            ok = False
+        print(f"Siatka A4 {klucz}: {uklad.kolumny}x{uklad.wiersze} "
+              f"(oczekiwane {siatka[0]}x{siatka[1]}) -> "
+              f"{'OK' if (uklad.kolumny, uklad.wiersze) == siatka else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- Potok A4: lustro duplexu (kolumny odbite, rzad bez zmian) --------------------
+    poker = UkladA4(fmts["poker"], spad=True)   # 3x3
+    ok = (poker.pozycja_rewersu(0) == poker.pozycja_komorki(2)      # 0 <-> 2
+          and poker.pozycja_rewersu(2) == poker.pozycja_komorki(0)
+          and poker.pozycja_rewersu(4) == poker.pozycja_komorki(4)  # srodek
+          and poker.pozycja_rewersu(3) == poker.pozycja_komorki(5))  # rzad 2
+    print(f"Duplex: rewers idx0->kol2, idx4->srodek, idx3->idx5 -> "
+          f"{'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- Potok A4: strony tarota (2x2 -> 4/strone, duplex przeplatany) ----------------
+    tarot_karty = [(f"k{i}", Image.new("RGB", (350, 600), "#801515"))
+                   for i in range(5)]
+    wynik = UkladA4(fmts["tarot"], spad=True).uloz(
+        tarot_karty, Image.new("RGB", (350, 600), "#3A0A0A"))
+    ok = (len(wynik.plotna) == 4          # 5 kart po 4/strone = 2 x (awers+rewers)
+          and wynik.plotna[0].size == (2480, 3508)
+          and wynik.nazwy[:2] == ["strona_01_awersy", "strona_01_rewersy"])
+    print(f"Tarot: {len(wynik.plotna)} plocien (oczekiwane 4), "
+          f"strona {wynik.plotna[0].size} (oczekiwane (2480, 3508)) -> "
+          f"{'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
     print(f"\nWynik: {'WSZYSTKO OK' if failures == 0 else f'{failures} bledow'}")
     print(f"Pliki testowe: {tmp}")
     return failures

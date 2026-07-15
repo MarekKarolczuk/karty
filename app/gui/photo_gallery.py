@@ -8,11 +8,12 @@ from PyQt6.QtGui import (
     QColor, QDrag, QIcon, QImageReader, QPainter, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from app import config
+from app.gui.widgets import NoScrollComboBox
 
 MIME_PHOTO = "application/x-karta-photo"
 THUMB = 116
@@ -235,7 +236,7 @@ class GalleryPanel(QWidget):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._on_search)
         search_row.addWidget(self.search, stretch=1)
-        self.sort_combo = QComboBox()
+        self.sort_combo = NoScrollComboBox()
         self.sort_combo.addItem("Nazwa", "name")
         self.sort_combo.addItem("Data", "date")
         self.sort_combo.setToolTip("Sortowanie miniatur")

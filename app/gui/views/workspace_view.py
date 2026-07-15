@@ -9,22 +9,26 @@ from PyQt6.QtCore import (
     QEasingCurve, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
+from app.core import style_store
 from app.core.compositor import DEFAULT_TRANSFORM
-from app.core.masks import get_masks
+from app.core.masks import get_masks, mask_presets
 from app.core.models import Suit
 from app.gui import theme
 from app.gui.card_grid import CardGrid, CardSlot
 from app.gui.deck_grid_panel import DeckGridPanel
-from app.gui.params_panel import PreviewPane, TemplatePicker
+from app.gui.mask_editor import nakladka_strefy
+from app.gui.params_panel import PreviewPane
 from app.gui.photo_gallery import GalleryPanel
 from app.gui.views import view_header
 from app.gui.views.generation_panel import GenerationPanel
-from app.gui.widgets import cover_pixmap
+from app.gui.widgets import (
+    NoScrollComboBox, NoScrollSpinBox, SnapSlider, cover_pixmap,
+)
 
 CARD_NAMES = {
     "A": "As", "K": "Król", "Q": "Dama", "J": "Walet",
@@ -104,8 +108,12 @@ class WorkspaceView(QWidget):
     transform_committed = pyqtSignal(str, str, dict)  # puszczenie suwaka → zapis
     history_navigate = pyqtSignal(str, str, int)      # suit, value, kierunek (-1/+1)
     history_set_main = pyqtSignal(str, str)           # ustaw bieżący wariant jako główny
+    fix_requested = pyqtSignal(str, str)              # popraw selektywnie POKAZYWANY wariant
     restamp_clicked = pyqtSignal()                    # przestempluj narożniki (bez API)
     auto_assign_clicked = pyqtSignal()                # auto-przydział zdjęć AI
+    edit_mask_requested = pyqtSignal(str, str)        # suit_nazwa, wartość → maska TEJ karty
+    cartoon_level_changed = pyqtSignal(int)           # poziom kreskówki 1-5 → preset postaci
+    mask_preset_selected = pyqtSignal(str)            # wybór aktywnego presetu maski ("" = auto)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -133,6 +141,30 @@ class WorkspaceView(QWidget):
         self.mask_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mask_btn.toggled.connect(self._toggle_mask_preview)
         top.addWidget(self.mask_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.mask_preset_combo = NoScrollComboBox()
+        self.mask_preset_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mask_preset_combo.setMaximumWidth(170)
+        self.mask_preset_combo.setToolTip(
+            "Aktywny preset maski pop-out (wspólny dla talii). Zarządzanie "
+            "presetami (nowa/duplikuj/usuń) — widok Style, sekcja Tła przodu."
+        )
+        self.mask_preset_combo.currentIndexChanged.connect(
+            lambda _i: self.mask_preset_selected.emit(
+                self.mask_preset_combo.currentData() or ""))
+        top.addWidget(self.mask_preset_combo,
+                      alignment=Qt.AlignmentFlag.AlignBottom)
+        self.edit_mask_btn = QPushButton("✎  Edytuj maskę")
+        self.edit_mask_btn.setObjectName("ghostBtn")
+        self.edit_mask_btn.setToolTip(
+            "Narysuj strefę pop-out dla BIEŻĄCEJ KARTY (np. A♠) — nadpisuje "
+            "maskę koloru tylko dla niej (bez API).\nMaskę wspólną całego "
+            "koloru edytujesz w widoku Style (sekcja Tła przodu)."
+        )
+        self.edit_mask_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.edit_mask_btn.clicked.connect(
+            lambda: self.edit_mask_requested.emit(
+                self._current_suit.nazwa, self._current_value))
+        top.addWidget(self.edit_mask_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         self.auto_assign_btn = QPushButton("🪄  Auto-przydział AI")
         self.auto_assign_btn.setObjectName("ghostBtn")
         self.auto_assign_btn.setToolTip(
@@ -272,6 +304,19 @@ class WorkspaceView(QWidget):
         )
         regen_row.addWidget(self.set_main_btn)
 
+        self.fix_btn = QPushButton("🩹 Popraw")
+        self.fix_btn.setObjectName("ghostBtn")
+        self.fix_btn.setToolTip(
+            "Popraw selektywnie POKAZYWANY wariant (◀ ▶ wybiera starszy/"
+            "nowszy): zamaluj obszar błędu i opisz poprawkę promptem — "
+            "model przerysuje tylko ten fragment, wynik jako nowy wariant")
+        self.fix_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fix_btn.clicked.connect(
+            lambda: self.fix_requested.emit(
+                self._current_suit.nazwa, self._current_value)
+        )
+        regen_row.addWidget(self.fix_btn)
+
         regen_row.addStretch(1)
         self.regen_btn = QPushButton("⚡  Wygeneruj")
         self.regen_btn.setObjectName("outlineBtn")
@@ -376,7 +421,7 @@ class WorkspaceView(QWidget):
         self.zoom_slider = self._make_slider(50, 250, 100)
         self.dx_slider = self._make_slider(-100, 100, 0)
         self.dy_slider = self._make_slider(-100, 100, 0)
-        self._slider_spins: dict[QSlider, QSpinBox] = {}
+        self._slider_spins: dict[QSlider, NoScrollSpinBox] = {}
         for row, (label_text, slider, suffix) in enumerate((
             ("Zoom", self.zoom_slider, "%"),
             ("Pozycja X", self.dx_slider, ""),
@@ -417,13 +462,40 @@ class WorkspaceView(QWidget):
         self.gen_panel.preview = self.preview
         right_layout.addWidget(self.gen_panel)
 
+        # --- poziom przeróbki zdjęcia na kreskówkę (pole postac/poziom_kreskowki;
+        #     dawniej była tu sekcja „TŁO KART (WYBÓR)" — wybór wariantu tła
+        #     nie pełnił realnej funkcji, tła ustawia preset w widoku Style) ----
         right_layout.addSpacing(10)
-        adv_caption = QLabel("TŁO KART (WYBÓR)")
-        adv_caption.setObjectName("sideCaption")
-        right_layout.addWidget(adv_caption)
-        # Ekran roboczy tylko WYBIERA istniejące tła — bez generowania AI
-        self.template_picker = TemplatePicker(show_generate=False)
-        right_layout.addWidget(self.template_picker)
+        cartoon_caption = QLabel("PRZERÓBKA ZDJĘCIA")
+        cartoon_caption.setObjectName("sideCaption")
+        right_layout.addWidget(cartoon_caption)
+
+        cartoon_box = QWidget()
+        cartoon_box.setObjectName("well")
+        cartoon_layout = QGridLayout(cartoon_box)
+        cartoon_layout.setContentsMargins(10, 8, 10, 8)
+        cartoon_layout.setHorizontalSpacing(8)
+        cartoon_layout.setVerticalSpacing(4)
+
+        cartoon_label = QLabel("Poziom kreskówki")
+        cartoon_label.setObjectName("propKey")
+        cartoon_layout.addWidget(cartoon_label, 0, 0)
+        self.cartoon_slider = SnapSlider(1, 5, 5)
+        self.cartoon_slider.setToolTip(
+            "5 = pełna kreskówka (cell-shading), 1 = blisko fotorealizmu.\n"
+            "Dotyczy ubrań, rekwizytów i tła — twarze zawsze pozostają "
+            "realistyczne. Zapisuje się w presecie stylu postaci."
+        )
+        self.cartoon_slider.valueChanged.connect(self._on_cartoon_changed)
+        cartoon_layout.addWidget(self.cartoon_slider, 0, 1)
+        self.cartoon_value = QLabel("5")
+        self.cartoon_value.setObjectName("propValue")
+        self.cartoon_value.setFixedWidth(18)
+        cartoon_layout.addWidget(self.cartoon_value, 0, 2)
+        cartoon_hint = QLabel("foto ◂──────▸ kreskówka   •   twarze zawsze realistyczne")
+        cartoon_hint.setObjectName("hint")
+        cartoon_layout.addWidget(cartoon_hint, 1, 0, 1, 3)
+        right_layout.addWidget(cartoon_box)
 
         right_layout.addStretch(1)
         right_scroll.setWidget(right)
@@ -450,17 +522,14 @@ class WorkspaceView(QWidget):
 
     # --- suwaki kadrowania ---------------------------------------------------------
     def _make_slider(self, minimum: int, maximum: int, value: int) -> QSlider:
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(minimum, maximum)
-        slider.setValue(value)
-        slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        slider = SnapSlider(minimum, maximum, value)
         slider.valueChanged.connect(self._on_slider_moved)
         slider.sliderReleased.connect(self._emit_transform_committed)
         return slider
 
-    def _make_spin(self, slider: QSlider, suffix: str = "") -> QSpinBox:
+    def _make_spin(self, slider: QSlider, suffix: str = "") -> NoScrollSpinBox:
         """Edytowalne pole liczbowe zsynchronizowane z suwakiem (dwukierunkowo)."""
-        spin = QSpinBox()
+        spin = NoScrollSpinBox()
         spin.setRange(slider.minimum(), slider.maximum())
         spin.setValue(slider.value())
         spin.setFixedWidth(64)
@@ -531,11 +600,13 @@ class WorkspaceView(QWidget):
             self.history_prev_btn.setEnabled(False)
             self.history_next_btn.setEnabled(False)
             self.set_main_btn.setEnabled(False)
+            self.fix_btn.setEnabled(False)
             return
         self.history_label.setText(f"wariant {index + 1} z {total}")
         self.history_prev_btn.setEnabled(index > 0)
         self.history_next_btn.setEnabled(index < total - 1)
         self.set_main_btn.setEnabled(True)
+        self.fix_btn.setEnabled(True)
 
     def _refresh_slider_labels(self) -> None:
         """Synchronizuje pola liczbowe z wartościami suwaków (bez emitowania)."""
@@ -645,16 +716,51 @@ class WorkspaceView(QWidget):
             self._apply_mask_overlay(self._current_suit)
         else:
             self.preview.canvas.set_mask_boxes(None, (1, 1))
+            self.preview.canvas.set_mask_overlay(None)
+
+    def refresh_mask_preview(self) -> None:
+        """Odświeżenie nakładki po zapisie maski w edytorze (MainWindow)."""
+        if self._mask_preview_on:
+            self._apply_mask_overlay(self._current_suit)
+
+    def refresh_mask_presets(self) -> None:
+        """Wypełnia combo presetów masek (auto + biblioteka) bez emitowania —
+        wołane przy starcie i po każdej zmianie biblioteki (MainWindow)."""
+        self.mask_preset_combo.blockSignals(True)
+        self.mask_preset_combo.clear()
+        self.mask_preset_combo.addItem("Maska automatyczna", "")
+        for name in mask_presets():
+            self.mask_preset_combo.addItem(name, name)
+        idx = self.mask_preset_combo.findData(style_store.active_mask())
+        self.mask_preset_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.mask_preset_combo.blockSignals(False)
 
     def _apply_mask_overlay(self, suit: Suit) -> None:
+        """Nakładka podglądu: strefa pop-out BIEŻĄCEJ karty (maska użytkownika
+        = złota, domyślna = akcent — mask_editor.nakladka_strefy) + ramki tarcz."""
         try:
             masks = get_masks(suit.template_path)
             with Image.open(suit.template_path) as img:
                 size = img.size
-            boxes = [masks.center.getbbox() or (0, 0, 0, 0), masks.tl_box, masks.br_box]
+            boxes = [masks.tl_box, masks.br_box]
             self.preview.canvas.set_mask_boxes(boxes, size)
+            self.preview.canvas.set_mask_overlay(
+                nakladka_strefy(suit, wartosc=self._current_value))
         except (FileNotFoundError, OSError):
             self.preview.canvas.set_mask_boxes(None, (1, 1))
+            self.preview.canvas.set_mask_overlay(None)
+
+    # --- poziom kreskówki ------------------------------------------------------
+    def _on_cartoon_changed(self, value: int) -> None:
+        self.cartoon_value.setText(str(value))
+        self.cartoon_level_changed.emit(value)
+
+    def set_cartoon_level(self, value: int) -> None:
+        """Ustawia suwak bez emitowania (start aplikacji / zmiana presetu)."""
+        self.cartoon_slider.blockSignals(True)
+        self.cartoon_slider.setValue(value)
+        self.cartoon_slider.blockSignals(False)
+        self.cartoon_value.setText(str(value))
 
     # --- siatka talii (strona 0 środka) ----------------------------------------
     def sync_deck(self, values: list[str], grids: dict[Suit, CardGrid]) -> None:

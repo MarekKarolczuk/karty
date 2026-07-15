@@ -61,8 +61,10 @@ for plik in pliki:
     kolor_hex = styl.kolor_czerwony if suit.is_red else styl.kolor_czarny
     kolor_tla = (int(kolor_hex[1:3], 16), int(kolor_hex[3:5], 16),
                  int(kolor_hex[5:7], 16))
+    # wartość karty ze stemu (K_kier_v2 → "K") — maska użytkownika per karta
     maska = masks.maska_klampu(wynik, template, suit.template_path,
-                               kolor_tla=kolor_tla)
+                               kolor_tla=kolor_tla,
+                               wartosc=plik.stem.split("_")[0], suit=suit)
     composite = Image.composite(wynik, template, maska)
 
     # (1) nakładka maski na wyniku modelu — zielone przeżywa klamp

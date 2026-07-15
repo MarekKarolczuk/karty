@@ -1,94 +1,15 @@
-"""Widgety Studia (używane w widokach): wybór tła kart, podgląd z efektem
-skanowania AI i log w stylu terminala."""
+"""Widgety Studia (używane w widokach): podgląd z efektem skanowania AI
+i log w stylu terminala. (Dawny TemplatePicker — wybór wariantu pliku tła —
+usunięty razem z sekcją „TŁO KART (WYBÓR)" Ekranu roboczego: tła ustawia
+preset w widoku Style, a override po generacji/imporcie robi MainWindow.)"""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtWidgets import (
-    QComboBox, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
-)
+from PyQt6.QtWidgets import QLabel, QPlainTextEdit, QVBoxLayout, QWidget
 
-from app.core.models import Suit
 from app.gui.animations import SweepPixmap
 from app.gui.photo_gallery import MIME_PHOTO
-
-
-class TemplatePicker(QWidget):
-    """Sekcja „Tło kart": wybór koloru i szablonu (opcjonalnie generowanie AI).
-
-    Na Ekranie roboczym służy WYŁĄCZNIE do wyboru istniejącego tła
-    (show_generate=False); generowanie nowych teł żyje w zakładce
-    „Domyślne style / Tła i rewersy"."""
-
-    template_changed = pyqtSignal(object, str)      # Suit, ścieżka szablonu
-    generate_template_clicked = pyqtSignal(object)  # Suit
-
-    def __init__(self, parent=None, show_generate: bool = True):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        title = QLabel("Tło kart")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
-
-        self.suit_combo = QComboBox()
-        for suit in Suit:
-            self.suit_combo.addItem(f"{suit.symbol} {suit.nazwa}", suit)
-        self.suit_combo.currentIndexChanged.connect(self._refresh_templates)
-        self.suit_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        layout.addWidget(self.suit_combo)
-
-        self.template_combo = QComboBox()
-        self.template_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.template_combo.activated.connect(self._on_template_picked)
-        layout.addWidget(self.template_combo)
-
-        self.gen_template_btn = QPushButton("🎨  Generuj nowe tło (AI)")
-        self.gen_template_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.gen_template_btn.clicked.connect(
-            lambda: self.generate_template_clicked.emit(self.current_suit())
-        )
-        self.gen_template_btn.setVisible(show_generate)
-        layout.addWidget(self.gen_template_btn)
-        if not show_generate:
-            hint = QLabel("Nowe tła wygenerujesz w „Domyślne style / Tła "
-                          "i rewersy".rstrip())
-            hint.setObjectName("hint")
-            hint.setWordWrap(True)
-            layout.addWidget(hint)
-
-        self._refresh_templates()
-
-    def current_suit(self) -> Suit:
-        return self.suit_combo.currentData()
-
-    def _refresh_templates(self) -> None:
-        suit = self.current_suit()
-        active = str(suit.template_path) if suit.available_templates() else ""
-        self.template_combo.blockSignals(True)
-        self.template_combo.clear()
-        for path in suit.available_templates():
-            self.template_combo.addItem(path.name, str(path))
-            if str(path) == active:
-                self.template_combo.setCurrentIndex(self.template_combo.count() - 1)
-        self.template_combo.blockSignals(False)
-
-    def _on_template_picked(self, index: int) -> None:
-        path = self.template_combo.itemData(index)
-        if path:
-            self.template_changed.emit(self.current_suit(), path)
-
-    def refresh_templates(self) -> None:
-        """Do wywołania z zewnątrz po wygenerowaniu nowego tła."""
-        self._refresh_templates()
-
-    def set_template_busy(self, busy: bool) -> None:
-        self.gen_template_btn.setEnabled(not busy)
-        self.gen_template_btn.setText(
-            "⏳  Generuję tło..." if busy else "🎨  Generuj nowe tło (AI)"
-        )
 
 
 class PreviewPane(QWidget):

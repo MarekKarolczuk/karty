@@ -592,9 +592,45 @@ QLabel#toast[kind="ok"] {{ border-left: 3px solid {GREEN}; }}
 QLabel#toast[kind="error"] {{ border-left: 3px solid {RED}; }}
 
 /* ---------- suwaki / menu / splitter ---------- */
-/* Nowoczesne, cienkie, dyskretne paski: uchwyt ledwo widoczny w spoczynku,
-   akcentowany po najechaniu (QSS nie animuje szerokości, więc chowamy uchwyt
-   kolorem — tor jest przezroczysty). */
+/* QSlider (widgets.SnapSlider): tor 6 px na SURFACE_INPUT, wypełnienie do
+   uchwytu gradientem akcentu (jak QProgressBar::chunk), duży okrągły uchwyt
+   łatwy do złapania — bez stylu Qt rysował natywny, jasny suwak obcy dla
+   motywu. Ujemne marginesy uchwytu pozwalają mu nachodzić na tor. */
+QSlider {{ min-height: 24px; }}
+QSlider::groove:horizontal {{
+    background: {SURFACE_INPUT};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    height: 6px;
+}}
+QSlider::sub-page:horizontal {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 {ACCENT_DEEP}, stop:1 {ACCENT_HOVER});
+    border: 1px solid {ACCENT_DEEP};
+    border-radius: 3px;
+    height: 6px;
+}}
+QSlider::handle:horizontal {{
+    background: {TEXT};
+    border: 2px solid {ACCENT_DEEP};
+    border-radius: 9px;
+    width: 14px;
+    height: 14px;
+    margin: -7px 0;
+}}
+QSlider::handle:horizontal:hover {{ background: {ACCENT_HOVER};
+    border-color: {ACCENT_HOVER}; }}
+QSlider::handle:horizontal:pressed {{ background: {ACCENT};
+    border-color: {ACCENT}; }}
+QSlider::groove:horizontal:disabled {{ background: {SURFACE};
+    border-color: {BORDER}; }}
+QSlider::sub-page:horizontal:disabled {{ background: {BORDER};
+    border-color: {BORDER}; }}
+QSlider::handle:horizontal:disabled {{ background: {MUTED};
+    border-color: {BORDER}; }}
+/* Paski przewijania: uchwyt ledwo widoczny w spoczynku, akcentowany po
+   najechaniu (QSS nie animuje szerokości, więc chowamy uchwyt kolorem —
+   tor jest przezroczysty). */
 QScrollBar:vertical {{ background: transparent; width: 7px; margin: 2px; }}
 QScrollBar::handle:vertical {{ background: rgba(122, 106, 84, 55);
     border-radius: 3px; min-height: 30px; }}

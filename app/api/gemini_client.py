@@ -57,21 +57,24 @@ def _model_name() -> str:
     return "gemini-2.5-flash-image"  # fallback, gdy wybrany model nie jest z Gemini
 
 
-def _generation_config(seed: int | None,
-                       poziom: int = 0) -> types.GenerateContentConfig:
+def _generation_config(seed: int | None, poziom: int = 0,
+                       temperature: float | None = None,
+                       ) -> types.GenerateContentConfig:
     """Config stabilizujący spójność talii: niska temperatura + seed.
+
+    temperature — nadpisanie per wywołanie (suwak „Siła poprawki" w poprawce
+    selektywnej); None = domyślne config.GEN_TEMPERATURE.
 
     Dwustopniowa degradacja dla backendów odrzucających pola (INVALID_ARGUMENT):
     poziom 0 — pełny config; poziom 1 — bez response_modalities, ale SEED
     ZOSTAJE (spójność talii); poziom 2 — tylko temperatura."""
+    temp = config.GEN_TEMPERATURE if temperature is None else temperature
     if poziom >= 2:
-        return types.GenerateContentConfig(temperature=config.GEN_TEMPERATURE)
+        return types.GenerateContentConfig(temperature=temp)
     if poziom == 1:
-        return types.GenerateContentConfig(
-            temperature=config.GEN_TEMPERATURE, seed=seed
-        )
+        return types.GenerateContentConfig(temperature=temp, seed=seed)
     return types.GenerateContentConfig(
-        temperature=config.GEN_TEMPERATURE,
+        temperature=temp,
         seed=seed,
         response_modalities=["TEXT", "IMAGE"],
     )
@@ -119,11 +122,14 @@ def _raise_if_fatal(exc: Exception, model: str) -> None:
 
 
 def generate_image(contents: list, retries: int = 3,
-                   seed: int | None = None) -> Image.Image:
+                   seed: int | None = None,
+                   temperature: float | None = None) -> Image.Image:
     """Wysyła prompt (tekst + obrazy PIL) i zwraca pierwszy obraz z odpowiedzi.
 
     seed — deterministyczny wariant (spójność talii); None = losowo
-    (tła/rewers, gdzie warianty MAJĄ się różnić)."""
+    (tła/rewers, gdzie warianty MAJĄ się różnić).
+    temperature — nadpisanie per wywołanie (siła poprawki selektywnej);
+    None = config.GEN_TEMPERATURE."""
     last_error: Exception | None = None
     model = _model_name()
     poziom_configu = 0
@@ -132,7 +138,8 @@ def generate_image(contents: list, retries: int = 3,
             response = get_client(config.vertex_location_for(model)).models.generate_content(
                 model=model,
                 contents=contents,
-                config=_generation_config(seed, poziom=poziom_configu),
+                config=_generation_config(seed, poziom=poziom_configu,
+                                          temperature=temperature),
             )
             for candidate in response.candidates or []:
                 if candidate.content is None:
@@ -236,6 +243,18 @@ def compose_full_card(template: Image.Image, photo_path, prompt: str,
     contents: list = [prompt, template,
                       _load_photo(photo_path, max_side=photo_max_side)]
     return generate_image(contents, seed=seed)
+
+
+def edit_region(card: Image.Image, mask: Image.Image, prompt: str,
+                seed: int | None = None,
+                temperature: float | None = None) -> Image.Image:
+    """Korekcyjny inpainting: karta + maska (obraz czarno-biały, biały obszar
+    = region do przerysowania) + prompt użytkownika. Gemini nie ma twardej
+    maski API — maska idzie jako drugi obraz, a deterministyczną ochronę
+    reszty karty robi generator (composite po masce + klamp).
+    temperature — z suwaka „Siła poprawki" (generator._FIX_TEMPERATURA)."""
+    return generate_image([prompt, card, mask.convert("RGB")], seed=seed,
+                          temperature=temperature)
 
 
 def edit_card_image(init: Image.Image, prompt: str,

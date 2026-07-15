@@ -6,7 +6,10 @@ i ornamenty zawsze z szablonu → identyczny symbol na każdej karcie),
 a ponad oknem adaptacyjna sylwetka postaci — z wyniku modelu zostaje to,
 co ZNACZĄCO różni się od szablonu, jest spójne z oknem i dość duże
 (postać „narzucona" na kartę bez limitu); tło, tarcze narożne i pas
-bordiury zawsze wracają do szablonu. Maska pop-out (sylwetka symbolu
+bordiury zawsze wracają do szablonu. Strefę pop-out (gdzie sylwetka może
+przeżyć) wyznacza domyslna_strefa_popout() albo maska narysowana ręcznie
+w GUI (maska_uzytkownika — Style/tla_przodu/<preset>/maski/<stem>.png).
+Maska pop-out (sylwetka symbolu
 z wklęsłościami domkniętymi convex hullem + ring dylatacji ~60-90 px)
 służy dziś degradacji guardraila i ścieżce inpaintingu Stability.
 Maski szablonów są cache'owane w assets/masks/ (pliki wersjonowane
@@ -178,8 +181,13 @@ KLAMP_ORNAMENT_KEEP_PROG = 20.0
 #   twarze nad symbolem. Nad oknem prostych linii ramki (poza ewentualną
 #   wewnętrzną poziomą, chronioną przez frame_lines) nie ma, więc pion może być
 #   dużo większy bez psucia ramki.
-KLAMP_POPOUT_RING_PX = 50
-KLAMP_POPOUT_RING_V_PX = 190
+# (35/260 — poprzednie 50/190 wciąż ucinało postacie w pionie pod symbolem
+# i na skosach hulla, a poziomo podchodziło niepotrzebnie blisko bocznych
+# linii ramki; strefa NAD symbolem i tak sięga bordiury niezależnie od pionu)
+# Użytkownik może ZASTĄPIĆ całą strefę własną maską rysowaną w GUI
+# (maska_uzytkownika / Style/tla_przodu/<preset>/maski/<stem>.png).
+KLAMP_POPOUT_RING_PX = 35
+KLAMP_POPOUT_RING_V_PX = 260
 # Ochrona prostych linii ramki: model re-renderuje całą kartę niedoskonale i
 # proste linie falują. Wykrywamy DŁUGIE proste linie w szablonie (kierunkowe
 # otwarcie morfologiczne) i zawsze przywracamy je z szablonu — nawet gdy leżą
@@ -194,6 +202,9 @@ _cache: dict[Path, "TemplateMasks"] = {}
 _popout_cache: dict[Path, Image.Image] = {}
 _frame_cache: dict[Path, np.ndarray] = {}
 _pas_cache: dict[Path, np.ndarray] = {}
+# cache masek użytkownika kluczowany ścieżką PLIKU MASKI (nie szablonu —
+# jeden szablon może mieć maskę koloru i maski per karta)
+_user_mask_cache: dict[Path, tuple[float, np.ndarray]] = {}
 
 
 class _MaskGenerationError(Exception):
@@ -526,9 +537,231 @@ def symbol_kontur_pas(template_path: Path) -> np.ndarray:
     return pas
 
 
+# --- biblioteka presetów masek pop-out ----------------------------------------
+# Presety masek żyją w podfolderach maski/<nazwa>/ AKTYWNEGO presetu teł przodu
+# (Style/tla_przodu/<preset>/maski/maska 1/kier.png, ...__A.png = nadpisanie
+# karty). Pliki kluczowane KOLOREM (nie stemem tła — maska przeżywa podmianę
+# pliku tła). Aktywny preset maski = pole tla_przodu/maska_aktywna
+# (style_store.active_mask(); "" = Maska automatyczna, strefa wyliczana).
+
+MASKA_AUTO = ""            # pseudo-preset „Maska automatyczna"
+_KOLORY = ("kier", "karo", "pik", "trefl")
+
+
+def _suit_nazwa(suit) -> str:
+    """Nazwa koloru z Suit albo stringa (masks nie importuje models)."""
+    return str(getattr(suit, "nazwa", suit)).lower()
+
+
+def _kolor_ze_stemu(stem: str) -> str | None:
+    stem = stem.lower()
+    return next((k for k in _KOLORY if k in stem), None)
+
+
+def _maski_root() -> Path:
+    """Folder maski/ aktywnego presetu teł przodu (+ jednorazowa migracja
+    starych bezimiennych plików do presetu „maska 1")."""
+    from app.core import style_store
+    root = style_store.front_dir() / "maski"
+    _migruj_maski_legacy(root)
+    return root
+
+
+def _migruj_maski_legacy(root: Path) -> None:
+    """Stare maski leżały luzem: maski/<stem tła>[__wartość].png. Przenosi je
+    do presetu maska 1/<kolor>[__wartość].png i ustawia go aktywnym.
+    Idempotentna — brak plików top-level = nic do zrobienia."""
+    if not root.is_dir():
+        return
+    legacy = [p for p in root.iterdir()
+              if p.is_file() and p.suffix.lower() == ".png"]
+    if not legacy:
+        return
+    from app.core import style_store
+    dst_dir = root / "maska 1"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for p in legacy:
+        stem, _, wart = p.stem.partition("__")
+        kolor = _kolor_ze_stemu(stem)
+        if kolor is None:
+            continue
+        target = dst_dir / f"{kolor}{('__' + wart) if wart else ''}.png"
+        try:
+            if target.exists():
+                p.unlink()          # kolizja wariantów tła — pierwszy wygrywa
+            else:
+                p.rename(target)
+        except OSError:
+            continue
+    if not style_store.active_mask():
+        style_store.set_text("tla_przodu", "maska_aktywna", "maska 1")
+    print(f"[maski] zmigrowano {len(legacy)} starych masek do presetu "
+          f"„maska 1” ({dst_dir})")
+
+
+def mask_presets() -> list[str]:
+    """Nazwy presetów masek aktywnego presetu teł (bez „Maski automatycznej")."""
+    root = _maski_root()
+    if not root.is_dir():
+        return []
+    return sorted(p.name for p in root.iterdir() if p.is_dir())
+
+
+def _unikalna_nazwa_maski(base: str) -> str:
+    existing = set(mask_presets())
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base} ({i})" in existing:
+        i += 1
+    return f"{base} ({i})"
+
+
+def utworz_maske(nazwa: str = "") -> str:
+    """Tworzy pusty preset maski (edytor wystartuje ze strefy automatycznej);
+    zwraca ostateczną nazwę."""
+    base = (nazwa or f"maska {len(mask_presets()) + 1}").strip()
+    unique = _unikalna_nazwa_maski(base)
+    (_maski_root() / unique).mkdir(parents=True, exist_ok=True)
+    return unique
+
+
+def duplikuj_maske(nazwa: str) -> str | None:
+    """Kopiuje preset maski; zwraca nazwę kopii (None gdy źródła brak)."""
+    import shutil
+    src = _maski_root() / nazwa
+    if not src.is_dir():
+        return None
+    unique = _unikalna_nazwa_maski(f"{nazwa} — kopia")
+    try:
+        shutil.copytree(src, _maski_root() / unique)
+    except OSError:
+        return None
+    return unique
+
+
+def zmien_nazwe_maski(stara: str, nowa: str) -> str:
+    """Zmienia nazwę presetu maski; zwraca ostateczną nazwę."""
+    nowa = "".join(c for c in (nowa or "").strip() if c not in '\\/:*?"<>|')
+    src = _maski_root() / stara
+    if not nowa or nowa == stara or not src.is_dir():
+        return stara
+    unique = _unikalna_nazwa_maski(nowa)
+    try:
+        src.rename(_maski_root() / unique)
+    except OSError:
+        return stara
+    return unique
+
+
+def usun_maske(nazwa: str) -> None:
+    import shutil
+    d = _maski_root() / nazwa
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def sciezka_maski_uzytkownika(suit, wartosc: str | None = None,
+                              preset: str | None = None) -> Path | None:
+    """Plik maski w presecie masek: maski/<preset>/<kolor>[__wartość].png.
+    preset=None → aktywny (style_store.active_mask()); zwraca None, gdy
+    aktywna jest „Maska automatyczna" (strefa wyliczana, bez pliku)."""
+    from app.core import style_store
+    if preset is None:
+        preset = style_store.active_mask()
+    if not preset:
+        return None
+    sufiks = f"__{wartosc}" if wartosc else ""
+    return _maski_root() / preset / f"{_suit_nazwa(suit)}{sufiks}.png"
+
+
+def _wczytaj_maske_uzytkownika(path: Path | None) -> np.ndarray | None:
+    """Jeden plik maski (0/255) z cache po mtime, None gdy brak/nieczytelny."""
+    if path is None:
+        return None
+    if not path.exists():
+        _user_mask_cache.pop(path, None)
+        return None
+    mtime = path.stat().st_mtime
+    cached = _user_mask_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    data = np.fromfile(str(path), dtype=np.uint8)
+    arr = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+    if arr is None:
+        print(f"[maski] nie można wczytać maski użytkownika: {path} "
+              "— użyta zostanie strefa domyślna")
+        return None
+    arr = np.where(arr >= 128, 255, 0).astype(np.uint8)
+    _user_mask_cache[path] = (mtime, arr)
+    return arr
+
+
+def maska_uzytkownika(suit, size: tuple[int, int] | None = None,
+                      wartosc: str | None = None) -> np.ndarray | None:
+    """Binarna maska pop-out (0/255) z AKTYWNEGO presetu masek albo None
+    (aktywna „Maska automatyczna" / brak plików). Fallback: plik KARTY (gdy
+    `wartosc` podana) → plik KOLORU → None (strefa domyślna). ZASTĘPUJE
+    domyślną strefę hull+ring+strefa_gora w maska_klampu; twarde gwarancje
+    (bordiura, tarcze, frame_lines, rdzeń okna) nakładają się na nią tak samo
+    jak na strefę domyślną. Resize NEAREST przy niezgodności rozmiaru (maska
+    przeżywa normalizację tła). Cache w pamięci inwalidowany po mtime pliku."""
+    arr = None
+    if wartosc:
+        arr = _wczytaj_maske_uzytkownika(
+            sciezka_maski_uzytkownika(suit, wartosc))
+    if arr is None:
+        arr = _wczytaj_maske_uzytkownika(sciezka_maski_uzytkownika(suit))
+    if arr is None:
+        return None
+    if size is not None and (arr.shape[1], arr.shape[0]) != size:
+        arr = cv2.resize(arr, size, interpolation=cv2.INTER_NEAREST)
+    return arr
+
+
+def domyslna_strefa_popout(template_path: Path
+                           ) -> tuple[np.ndarray, np.ndarray]:
+    """Domyślna strefa pop-out klampu: (okno_ring, strefa_gora).
+
+    okno_ring (0/255) = convex hull okna symbolu + ANIZOTROPOWY ring dylatacji
+    (KLAMP_POPOUT_RING_PX poziomo / _V_PX pionowo) + prostokątna strefa NAD
+    symbolem (pełna szerokość okna + margines, od bordiury do górnej krawędzi
+    okna — głowy/kapelusze nad symbolem w pełnym kształcie). strefa_gora (bool)
+    = sam prostokąt nad symbolem (wyłącza filtr ornament_rerender, żeby
+    teksturowane włosy nie były cięte jako „re-render ramy").
+
+    Współdzielona przez maska_klampu i edytor maski w GUI (stan startowy
+    rysowania). Hull dotyczy TYLKO tej bramki; rdzeń okna liczy się osobno."""
+    center = np.array(get_masks(template_path).center, dtype=np.uint8)
+    core_bin = np.where(center > 0, 255, 0).astype(np.uint8)
+    h, w = core_bin.shape
+    bx, by = round(w * KLAMP_BORDIURA), round(h * KLAMP_BORDIURA)
+    ring_x = max(20, round(w * KLAMP_POPOUT_RING_PX
+                           / config.TEMPLATE_STD_SZEROKOSC))
+    ring_y = max(20, round(w * KLAMP_POPOUT_RING_V_PX
+                           / config.TEMPLATE_STD_SZEROKOSC))
+    ring_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * ring_x + 1, 2 * ring_y + 1))
+    # Ring liczony z convex hulla okna, nie surowego serca — górna krawędź
+    # strefy jest WYPUKŁA, więc głowa/rekwizyt w rejonie wcięcia serca nie jest
+    # ucinana wzdłuż konturu „V".
+    okno_ring = cv2.dilate(_hull_sylwetki(core_bin), ring_kernel)
+    strefa_gora = np.zeros((h, w), dtype=bool)
+    ys, xs = np.nonzero(core_bin)
+    if len(xs):
+        sx0, sx1, sy0 = int(xs.min()), int(xs.max()), int(ys.min())
+        rx0, rx1 = max(bx, sx0 - ring_x), min(w - bx, sx1 + ring_x)
+        if sy0 > by:
+            okno_ring[by:sy0, rx0:rx1] = 255
+            strefa_gora[by:sy0, rx0:rx1] = True
+    return okno_ring, strefa_gora
+
+
 def maska_klampu(wynik: Image.Image, template: Image.Image,
                  template_path: Path,
-                 kolor_tla: tuple[int, int, int] | None = None) -> Image.Image:
+                 kolor_tla: tuple[int, int, int] | None = None,
+                 wartosc: str | None = None,
+                 suit=None) -> Image.Image:
     """Adaptacyjna maska klampu: rdzeń bezwarunkowy = OKNO symbolu (maska
     centrum, miękka krawędź do wewnątrz) — tło namalowane przez model jest
     przycinane dokładnie do konturu okna szablonu, a rama i ornamenty wokół
@@ -546,6 +779,10 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
 
     kolor_tla — kolor wypełnienia okna z kolażu (anty-bleed: płaskie rozlanie
     tego koloru na ramę nie może udawać postaci).
+    wartosc — wartość karty (np. "A"): pozwala użyć maski użytkownika
+    narysowanej dla TEJ karty (fallback: maska koloru → strefa domyślna).
+    suit — kolor karty (Suit albo nazwa); None = wyprowadzany ze stemu
+    pliku szablonu (nazwa tła zawiera kolor).
 
     Guardrail: gdy „sylwetka" pokrywa większość strefy poza oknem (model
     przemalował tło hurtem albo zostawił prostokąt zdjęcia z kolażu),
@@ -574,29 +811,30 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
         allowed_full[y0:y1, x0:x1] = 0
     # Maska w kształcie symbolu: sylwetka przeżywa w oknie + marginesie, a proste
     # linie ramki (frame_lines) ZAWSZE wracają z szablonu (boki przy oknie,
-    # wewnętrzna ramka) — nawet gdyby margines je objął
-    ring_x = max(20, round(w * KLAMP_POPOUT_RING_PX / config.TEMPLATE_STD_SZEROKOSC))
-    ring_y = max(20, round(w * KLAMP_POPOUT_RING_V_PX / config.TEMPLATE_STD_SZEROKOSC))
-    ring_kernel_popout = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * ring_x + 1, 2 * ring_y + 1))
-    # Ring liczony z convex hulla okna, nie surowego serca — górna krawędź strefy
-    # jest WYPUKŁA, więc głowa/rekwizyt w rejonie wcięcia serca nie jest ucinana
-    # wzdłuż konturu „V". Hull dotyczy TYLKO bramki allowed; rdzeń (core/core_bin,
-    # np.maximum(core, extra)) bez zmian — okno renderuje się jak dotąd.
-    okno_ring = cv2.dilate(_hull_sylwetki(core_bin), ring_kernel_popout)
-    # Prostokątna strefa NAD symbolem (pełna szerokość okna + margines ring_x,
-    # od bordiury do górnej krawędzi okna): głowy, kapelusze i uniesione rekwizyty
-    # nad symbolem przeżywają w PEŁNYM kształcie zamiast być przycięte do serca.
-    # Puste partie tej strefy się nie utrwalają — tam wynik == szablon (brak
-    # kandydatów); boki i dół dalej trzyma wąski ring elipsy.
-    ys, xs = np.nonzero(core_bin)
-    strefa_gora = np.zeros((h, w), dtype=bool)   # prostokąt pop-out nad symbolem
-    if len(xs):
-        sx0, sx1, sy0 = int(xs.min()), int(xs.max()), int(ys.min())
-        rx0, rx1 = max(bx, sx0 - ring_x), min(w - bx, sx1 + ring_x)
-        if sy0 > by:
-            okno_ring[by:sy0, rx0:rx1] = 255
-            strefa_gora[by:sy0, rx0:rx1] = True
+    # wewnętrzna ramka) — nawet gdyby margines je objął. Maska narysowana przez
+    # użytkownika w GUI ZASTĘPUJE strefę domyślną (hull+ring+strefa_gora);
+    # strefa_gora = jej część nad górną krawędzią okna (ten sam efekt: włosy
+    # i kapelusze nie są cięte jako „re-render ramy"). Puste partie strefy się
+    # nie utrwalają — tam wynik == szablon (brak kandydatów).
+    suit_n = (_suit_nazwa(suit) if suit is not None
+              else _kolor_ze_stemu(Path(template_path).stem))
+    user_mask = (maska_uzytkownika(suit_n, (w, h), wartosc)
+                 if suit_n else None)
+    if user_mask is not None:
+        okno_ring = user_mask
+        strefa_gora = np.zeros((h, w), dtype=bool)
+        ys, _ = np.nonzero(core_bin)
+        if len(ys):
+            sy0 = int(ys.min())
+            strefa_gora[:sy0, :] = okno_ring[:sy0, :] > 0
+    else:
+        okno_ring, strefa_gora = domyslna_strefa_popout(template_path)
+        if okno_ring.shape != (h, w):
+            okno_ring = cv2.resize(okno_ring, (w, h),
+                                   interpolation=cv2.INTER_NEAREST)
+            strefa_gora = cv2.resize(
+                strefa_gora.astype(np.uint8), (w, h),
+                interpolation=cv2.INTER_NEAREST).astype(bool)
     frame_lines = frame_lines_mask(template_path)
     if frame_lines.shape != (h, w):
         frame_lines = cv2.resize(frame_lines, (w, h),
@@ -828,6 +1066,26 @@ def maska_klampu(wynik: Image.Image, template: Image.Image,
     extra = cv2.dilate(extra, k_dil)
     extra = cv2.GaussianBlur(extra, (0, 0), sigmaX=max(2, w // 800))
     extra = cv2.bitwise_and(extra, allowed)
+
+    # KREM W OKNIE → WYPEŁNIENIE: w trybie HYBRID kolaż zakrywa wypełnione okno
+    # prostokątem zdjęcia, więc model odtwarza wypełnienie „z pamięci" i bywa,
+    # że maluje WŁASNY, MNIEJSZY symbol z kremową obwódką do konturu (FULL_AI
+    # też potrafi niedomalować). Piksele okna, w których wynik ≈ krem szablonu
+    # (mała różnica RGB i mała chroma — sceneria w odcieniach koloru karty ma
+    # oba sygnały wysokie, więc przeżywa), oddają miejsce BAZIE, czyli płaskiemu
+    # wypełnieniu kolorem karty. Otwarcie + filtr min. pola chronią jasną skórę
+    # twarzy (punktowo ≈ krem) przed dziurami — obwódka jest duża i zwarta.
+    if kolor_tla is not None:
+        krem_okno = np.where(
+            (core_bin > 0) & (diff <= KLAMP_PROG_PLASKI)
+            & (chroma <= KLAMP_PROG_CHROMA), 255, 0).astype(np.uint8)
+        krem_okno = cv2.morphologyEx(krem_okno, cv2.MORPH_OPEN, k_open)
+        n_kr, lab_kr, st_kr, _ = cv2.connectedComponentsWithStats(
+            (krem_okno > 0).astype(np.uint8), connectivity=8)
+        for i in range(1, n_kr):
+            if st_kr[i, cv2.CC_STAT_AREA] < min_pole:
+                krem_okno[lab_kr == i] = 0
+        core[krem_okno > 0] = 0
 
     # Maska = OKNO (rdzeń bezwarunkowo z modelu — AI-sceneria + postać w oknie)
     # + sylwetka pop-out na wierzchu. Rama/kontur/tło POZA oknem wracają z bazy

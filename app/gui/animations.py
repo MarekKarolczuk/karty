@@ -11,7 +11,7 @@ from PyQt6.QtCore import (
     Qt, QVariantAnimation, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QColor, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+    QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
     QRadialGradient,
 )
 from PyQt6.QtWidgets import (
@@ -219,6 +219,7 @@ class SweepPixmap(QWidget):
         self._sweep_pos = -1.0     # <0 = brak efektu
         self._mask_boxes: list[tuple[int, int, int, int]] | None = None
         self._mask_source_size: tuple[int, int] = (1, 1)
+        self._mask_overlay: QImage | None = None
         self._anim = QVariantAnimation(self)
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
@@ -239,6 +240,13 @@ class SweepPixmap(QWidget):
         rysowane na podglądzie jako kreskowane ramki akcentu."""
         self._mask_boxes = boxes
         self._mask_source_size = source_size
+        self.update()
+
+    def set_mask_overlay(self, image: QImage | None) -> None:
+        """Nakładka strefy pop-out (półprzezroczysty QImage w proporcji
+        obrazu — mask_editor.nakladka_strefy) rysowana rozciągnięta na cały
+        podgląd; None = brak nakładki."""
+        self._mask_overlay = image
         self.update()
 
     def start_sweep(self) -> None:

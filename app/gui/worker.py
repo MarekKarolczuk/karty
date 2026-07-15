@@ -293,6 +293,42 @@ class SampleWorker(QThread):
                 self.failed.emit(str(exc))
 
 
+class FixWorker(QThread):
+    """Selektywna poprawa jednego wariantu karty (lightbox → „Popraw
+    selektywnie"): generator.popraw_region — zmiana tylko w masce
+    użytkownika, wynik = NOWY wariant. tryb "ai" (prompt + siła 1-5)
+    albo "szablon" (przywrócenie tła, bez API)."""
+
+    done = pyqtSignal(object, str)   # CardSpec (poprawiany), ścieżka nowego wariantu
+    failed = pyqtSignal(str)         # komunikat błędu
+
+    def __init__(self, spec: CardSpec, maska, prompt_text: str,
+                 tryb: str = "ai", sila: int = 3, parent=None):
+        super().__init__(parent)
+        self.spec = spec
+        self.maska = maska
+        self.prompt_text = prompt_text
+        self.tryb = tryb
+        self.sila = sila
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        try:
+            path = generator.popraw_region(self.spec, self.maska,
+                                           self.prompt_text,
+                                           tryb=self.tryb, sila=self.sila)
+            if not self._cancelled:
+                self.done.emit(self.spec, str(path))
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+
+
 class RestampWorker(QThread):
     """Przestemplowuje narożniki kart z output/_raw/ (lub finalnych z resetem
     tarcz) wg aktywnego presetu „wartosci" — ZERO wywołań API."""

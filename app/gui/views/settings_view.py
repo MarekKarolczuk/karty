@@ -6,7 +6,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QApplication, QButtonGroup, QComboBox, QGridLayout,
+    QApplication, QButtonGroup, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
@@ -15,7 +15,7 @@ from app import config
 from app.core import style_store
 from app.gui.animations import Spinner
 from app.gui.views import view_header
-from app.gui.widgets import SegmentedControl, show_toast
+from app.gui.widgets import NoScrollComboBox, SegmentedControl, show_toast
 
 MODEL_DESCRIPTIONS = {
     "gemini-2.5-flash-image": "Szybki inpainting image-to-image. "
@@ -232,7 +232,7 @@ class SettingsView(QWidget):
         size_caption = QLabel("⌗  FORMAT TALII")
         size_caption.setObjectName("sectionTitle")
         format_layout.addWidget(size_caption)
-        self.size_combo = QComboBox()
+        self.size_combo = NoScrollComboBox()
         self.size_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         for key, (label, *_) in config.CARD_PRESETS.items():
             self.size_combo.addItem(label, key)
@@ -407,7 +407,8 @@ class SettingsView(QWidget):
             f"AKTYWNE PRESETY:  {actives}\n\n"
             "STYL POSTACI:\n"
             + style_store.character_style().strip()
-            + "\n\nSTYL TŁA / SZABLONU (edycja w zakładce Style):\n"
+            + "\n\nSTYL ORNAMENTYKI (edycja w zakładce Style, sekcja Tła "
+              "przodu):\n"
             + style_store.template_style().strip()
             + f"\n\nTŁO PRZODU — CZERWONE (Kier/Karo){front_mode}:\n"
             + style_store.front_prompt(True).strip()

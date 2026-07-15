@@ -12,8 +12,8 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QCursor, QDesktopServices
 from PyQt6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
 from app import config
@@ -23,6 +23,8 @@ from app.core.models import CardSpec, GenMode, Suit
 from app.gui import card_grid
 from app.gui.animations import BusyOverlay, FadingStackedWidget
 from app.gui.auto_assign_dialog import AutoAssignDialog
+from app.gui.fix_dialog import FixRegionDialog
+from app.gui.mask_editor import MaskEditorDialog
 from app.gui.card_grid import CardSlot
 from app.gui.lightbox import CardLightbox, LightboxContext
 from app.gui.photo_gallery import load_thumbnail
@@ -36,8 +38,8 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.workspace_view import WorkspaceView
 from app.gui.widgets import show_toast
 from app.gui.worker import (
-    AnalysisWorker, BackWorker, ExportWorker, GenerationWorker, RestampWorker,
-    SampleWorker, TemplateSetWorker, TemplateWorker,
+    AnalysisWorker, BackWorker, ExportWorker, FixWorker, GenerationWorker,
+    RestampWorker, SampleWorker, TemplateSetWorker, TemplateWorker,
 )
 
 class MainWindow(QMainWindow):
@@ -76,6 +78,7 @@ class MainWindow(QMainWindow):
         self.export_worker: ExportWorker | None = None
         self.sample_worker: SampleWorker | None = None
         self.restamp_worker: RestampWorker | None = None
+        self.fix_worker: FixWorker | None = None
         self.analysis_worker: AnalysisWorker | None = None
         # auto-przydział: edytowalne motywy kolorów + stan bieżącej sesji
         self.auto_motywy: dict[str, str] = dict(photo_analyzer.DOMYSLNE_MOTYWY)
@@ -134,6 +137,9 @@ class MainWindow(QMainWindow):
         self._lightbox: CardLightbox | None = None
         self._wire_views()
         self._load_project()
+        # suwak kreskówki czyta pole aktywnego presetu postaci (po load)
+        self.workspace.set_cartoon_level(style_store.cartoon_level())
+        self.workspace.refresh_mask_presets()
         self._rebuild_grids(self._values())
         self._load_generated_state()   # pokaż karty z poprzednich sesji
         self._refresh_overview()
@@ -156,8 +162,6 @@ class MainWindow(QMainWindow):
     def _wire_views(self) -> None:
         ws = self.workspace
         ws.gallery_panel.photo_deleted.connect(self._on_photo_deleted)
-        # Ekran roboczy tylko WYBIERA tło (generowanie żyje w „Tła i rewersy")
-        ws.template_picker.template_changed.connect(self._on_template_changed)
         ws.card_picked.connect(self._select_card)
         ws.regenerate_clicked.connect(self._regenerate_single)
         ws.generate_deck_clicked.connect(self._generate_from_workspace)
@@ -168,8 +172,12 @@ class MainWindow(QMainWindow):
         ws.transform_committed.connect(self._on_transform_committed)
         ws.history_navigate.connect(self._on_history_navigate)
         ws.history_set_main.connect(self._on_history_set_main)
+        ws.fix_requested.connect(self._on_workspace_fix)
         ws.restamp_clicked.connect(self._start_restamp)
         ws.auto_assign_clicked.connect(self._start_auto_assign)
+        ws.edit_mask_requested.connect(self._open_mask_editor)
+        ws.cartoon_level_changed.connect(self._on_cartoon_level_changed)
+        ws.mask_preset_selected.connect(self._on_mask_preset_selected)
 
         self.photo_library.photo_deleted.connect(self._on_photo_deleted)
         self.photo_library.photos_imported.connect(self._on_photos_imported)
@@ -213,6 +221,12 @@ class MainWindow(QMainWindow):
         self.back_view.generate_front_set_clicked.connect(self._start_front_set)
         self.back_view.import_front_clicked.connect(self._on_front_import)
         self.back_view.normalize_fronts_clicked.connect(self._on_front_normalize)
+        # maska pop-out CAŁEGO koloru (widok Style) — wspólny handler z maską
+        # per karta z Ekranu roboczego (pusta wartość = zakres koloru)
+        self.back_view.edit_mask_clicked.connect(
+            lambda suit_nazwa: self._open_mask_editor(suit_nazwa, ""))
+        self.back_view.mask_library_changed.connect(
+            self._on_mask_library_changed)
         self.export_view.export_clicked.connect(self._start_export)
         self.export_view.options_changed.connect(self._save_project)
 
@@ -721,6 +735,7 @@ class MainWindow(QMainWindow):
         box.set_main_requested.connect(self._on_lightbox_set_main)
         box.delete_requested.connect(self._on_lightbox_delete)
         box.restamp_requested.connect(self._on_lightbox_restamp)
+        box.fix_requested.connect(self._on_lightbox_fix)
         box.open_folder_requested.connect(self._open_in_folder)
         self._lightbox = box
         try:
@@ -793,6 +808,64 @@ class MainWindow(QMainWindow):
             targets.append(CardSpec(value=value, suit=suit, variant=variant))
         self._start_restamp(targets)
 
+    def _on_workspace_fix(self, suit_nazwa: str, value: str) -> None:
+        """Poprawa selektywna z Ekranu roboczego: działa na wariancie
+        POKAZYWANYM w nawigatorze historii (◀ ▶ pozwala wskazać np.
+        przedostatni) — reszta przepływu wspólna z lightboxem."""
+        variants = self._card_variants(suit_nazwa, value)
+        if not variants:
+            show_toast(self, "Brak wygenerowanych wariantów tej karty", "info")
+            return
+        key = f"{suit_nazwa}:{value}"
+        pos = max(0, min(self.card_history_pos.get(key, len(variants) - 1),
+                         len(variants) - 1))
+        self._on_lightbox_fix(suit_nazwa, value, str(variants[pos]))
+
+    def _on_lightbox_fix(self, suit_nazwa: str, value: str, path: str) -> None:
+        """Selektywna poprawa OGLĄDANEGO wariantu: dialog maski+promptu →
+        FixWorker → generator.popraw_region (wynik = nowy wariant)."""
+        if self.fix_worker is not None:
+            show_toast(self, "Poczekaj — trwa poprzednia poprawka", "info")
+            return
+        p = Path(path)
+        variant = 1
+        if "_v" in p.stem:
+            try:
+                variant = int(p.stem.rsplit("_v", 1)[1])
+            except ValueError:
+                pass
+        spec = CardSpec(value=value, suit=Suit.from_nazwa(suit_nazwa),
+                        variant=variant)
+        dialog = FixRegionDialog(p, spec.label,
+                                 parent=self._lightbox or self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        worker = FixWorker(spec, dialog.maska(), dialog.prompt_uzytkownika(),
+                           tryb=dialog.tryb(), sila=dialog.sila())
+        worker.done.connect(self._on_fix_done)
+        worker.failed.connect(self._on_fix_failed)
+        self.fix_worker = worker
+        self._set_status(f"Przywracam tło {spec.label}…"
+                         if dialog.tryb() == "szablon"
+                         else f"Poprawiam {spec.label}…")
+        worker.start()
+
+    def _on_fix_done(self, spec: CardSpec, path: str) -> None:
+        self.fix_worker = None
+        self._after_card_files_changed(spec.suit.nazwa, spec.value)
+        self.deck.mark_dirty()
+        if self._lightbox is not None:
+            self._lightbox.refresh()
+        self._set_status(f"✔ poprawka: {Path(path).name}")
+        show_toast(self, "✔ Poprawka zapisana jako nowy wariant — "
+                         "zaakceptuj przez „Ustaw jako główną”", "ok")
+
+    def _on_fix_failed(self, message: str) -> None:
+        self.fix_worker = None
+        self._set_status("✖ poprawka nieudana")
+        self.generation.log_pane.log_line(f"✖ poprawka selektywna: {message}")
+        show_toast(self, f"Błąd poprawki: {message}", "error")
+
     def _open_in_folder(self, path: str) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
 
@@ -859,6 +932,61 @@ class MainWindow(QMainWindow):
         self._auto_dialog = dialog
         dialog.exec()
         self._auto_dialog = None
+
+    # ---------------------------------------------- edytor maski pop-out
+    def _open_mask_editor(self, suit_nazwa: str, wartosc: str = "") -> None:
+        """Rysowanie strefy pop-out pędzlem (bez API) w AKTYWNYM presecie
+        masek. Z Ekranu roboczego przychodzi wartość karty (maska TEJ karty,
+        np. A♠); z widoku Style pusta wartość = maska CAŁEGO koloru. Przy
+        aktywnej „Masce automatycznej" najpierw powstaje nowy preset.
+        Zapis/reset w dialogu, tu odświeżenie comb i nakładki podglądu."""
+        from app.core import masks
+        suit = Suit.from_nazwa(suit_nazwa)
+        try:
+            template_path = suit.template_path
+        except FileNotFoundError:
+            show_toast(self, f"Brak szablonu tła dla koloru {suit.nazwa} — "
+                       "wygeneruj lub zaimportuj tło", "error")
+            return
+        if not style_store.active_mask():
+            nowa = masks.utworz_maske()
+            style_store.set_text("tla_przodu", "maska_aktywna", nowa)
+            self._sync_mask_widgets()
+            show_toast(self, f"Utworzono preset maski „{nowa}” — rysujesz "
+                       "w nim (nie w automatycznej)", "info")
+        dialog = MaskEditorDialog(suit, template_path,
+                                  wartosc=wartosc or None, parent=self)
+        if dialog.exec():
+            self.workspace.refresh_mask_preview()
+            zakres = f"{wartosc}{suit.symbol}" if wartosc else suit.nazwa
+            show_toast(self, f"✓ Maska „{style_store.active_mask()}” "
+                       f"({zakres}) zapisana", "success")
+        self._save_project()
+
+    def _sync_mask_widgets(self) -> None:
+        """Comba presetów masek (Ekran roboczy + Style) po każdej zmianie
+        biblioteki/aktywnego presetu + nakładka podglądu."""
+        self.workspace.refresh_mask_presets()
+        self.back_view.refresh_mask_presets()
+        self.workspace.refresh_mask_preview()
+
+    def _on_mask_preset_selected(self, nazwa: str) -> None:
+        """Combo na Ekranie roboczym → aktywny preset maski."""
+        style_store.set_text("tla_przodu", "maska_aktywna", nazwa)
+        self._sync_mask_widgets()
+        self._save_project()
+
+    def _on_mask_library_changed(self) -> None:
+        """CRUD/wybór maski w widoku Style → sync + zapis."""
+        self._sync_mask_widgets()
+        self._save_project()
+
+    def _on_cartoon_level_changed(self, level: int) -> None:
+        """Suwak „Poziom kreskówki" na Ekranie roboczym → pole presetu
+        postaci (postac/poziom_kreskowki); wpływa na prompty obu trybów."""
+        style_store.set_text("postac", "poziom_kreskowki", str(level))
+        self.settings_view.refresh_prompt()
+        self._save_project()
         # dialog zamknięty w trakcie analizy bez „Anuluj" nie zostawia workera
         if self.analysis_worker is not None:
             self._cancel_analysis()
@@ -1279,8 +1407,13 @@ class MainWindow(QMainWindow):
             generator.normalizuj_aktywny_preset()
             card_grid.clear_template_cache()
             self._rebuild_grids(self._values())
-            self.workspace.template_picker.refresh_templates()
             self.back_view.refresh_front_preview()
+            # inny preset teł = inna biblioteka masek + pole maska_aktywna
+            self.workspace.refresh_mask_presets()
+            self.workspace.refresh_mask_preview()
+        elif cat == "postac":
+            # inny preset = inny poziom kreskówki — zsynchronizuj suwak
+            self.workspace.set_cartoon_level(style_store.cartoon_level())
         elif cat == "rewers":
             self.back_view.refresh_back_preview()
             self.gallery.mark_dirty()
@@ -1326,7 +1459,6 @@ class MainWindow(QMainWindow):
         # (plik leży już w folderze aktywnego presetu teł przodu)
         if self._front_made == 1:
             self._on_template_changed(suit, path)
-        self.workspace.template_picker.refresh_templates()
         self.back_view.refresh_front_preview()
         self._show_preview(load_thumbnail(Path(path), 900))
 
@@ -1393,7 +1525,6 @@ class MainWindow(QMainWindow):
             return
         # każde tło kompletu od razu staje się aktywnym tłem swojego koloru
         self._on_template_changed(suit, path)
-        self.workspace.template_picker.refresh_templates()
         self.back_view.refresh_front_preview()
         self._show_preview(load_thumbnail(Path(path), 900))
         show_toast(self, f"✔ tło {suit.symbol}: {Path(path).name}", "ok")
@@ -1464,7 +1595,6 @@ class MainWindow(QMainWindow):
             show_toast(self, f"Nie wczytano obrazu: {exc}", "error")
             return
         self._on_template_changed(suit, str(path))
-        self.workspace.template_picker.refresh_templates()
         self.back_view.refresh_front_preview()
         self._save_project()
         show_toast(self, f"✔ własne tło {suit.symbol}: {path.name}", "ok")
@@ -1485,7 +1615,6 @@ class MainWindow(QMainWindow):
             return
         card_grid.clear_template_cache()
         self._rebuild_grids(self._values())
-        self.workspace.template_picker.refresh_templates()
         self.back_view.refresh_front_preview()
         show_toast(self, f"✔ dopasowano tła do formatu ({zmienione} plików)",
                    "ok")
@@ -1599,7 +1728,6 @@ class MainWindow(QMainWindow):
             show_toast(self, f"Nie dopasowano teł do formatu: {exc}", "error")
         card_grid.clear_template_cache()
         self._rebuild_grids(self._values())
-        self.workspace.template_picker.refresh_templates()
         self.back_view.refresh_front_preview()
         self._set_status(
             f"Format talii: {config.CARD_PRESETS[config.SELECTED_CARD_PRESET][0]}"
@@ -1792,4 +1920,3 @@ class MainWindow(QMainWindow):
                 card_grid.clear_template_cache()
                 self.settings_view.refresh_prompt()
                 self.back_view.reload_style_slot()
-        self.workspace.template_picker.refresh_templates()

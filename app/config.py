@@ -19,6 +19,8 @@ ASSETS_DIR = ROOT / "assets"
 MASKS_DIR = ASSETS_DIR / "masks"
 FONTS_DIR = ASSETS_DIR / "fonts"
 UI_FONTS_DIR = FONTS_DIR / "ui"      # fonty interfejsu (NIE do rysowania kart!)
+CARD_FONTS_DIR = FONTS_DIR / "karty"  # biblioteka czcionek narożników
+                                      # (podfoldery = grupy; licencje w LICENSES.md)
 PROJEKT_JSON = ROOT / "projekt.json"
 STYLES_JSON = ROOT / "styles.json"   # STARY format (migrowany do Style/)
 ANALIZA_JSON = ROOT / "analiza_zdjec.json"   # cache analiz AI zdjęć (auto-przydział)
@@ -29,7 +31,9 @@ ANALIZA_JSON = ROOT / "analiza_zdjec.json"   # cache analiz AI zdjęć (auto-prz
 # Każda kategoria to podfolder Style/<kategoria>/, a każdy preset to podfolder
 # z jego nazwą. Aktywny preset per kategoria zapisywany w Style/active.json.
 STYLE_ROOT = ROOT / "Style"
-STYLE_CATEGORIES = ("postac", "styl_tla", "tla_przodu", "rewers", "wartosci")
+# (dawna kategoria "styl_tla" scalona z "tla_przodu" jako pole `styl` —
+# stary folder Style/styl_tla/ jest ignorowany, treść migruje style_store.load())
+STYLE_CATEGORIES = ("postac", "tla_przodu", "rewers", "wartosci")
 STYLE_ACTIVE_JSON = STYLE_ROOT / "active.json"
 
 # --- API ---

@@ -9,13 +9,13 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QProgressBar,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from app import config
 from app.core.models import CardSpec
 from app.gui.params_panel import LogPane, PreviewPane
-from app.gui.widgets import SegmentedControl
+from app.gui.widgets import NoScrollSpinBox, SegmentedControl
 
 
 class GenerationPanel(QWidget):
@@ -45,7 +45,7 @@ class GenerationPanel(QWidget):
         spins = QHBoxLayout()
         spins.setSpacing(6)
 
-        def spin_group(label_text: str, spin: QSpinBox) -> QWidget:
+        def spin_group(label_text: str, spin: NoScrollSpinBox) -> QWidget:
             box = QWidget()
             box_layout = QHBoxLayout(box)
             box_layout.setContentsMargins(0, 0, 0, 0)
@@ -56,7 +56,7 @@ class GenerationPanel(QWidget):
             box_layout.addWidget(spin)
             return box
 
-        self.limit_spin = QSpinBox()
+        self.limit_spin = NoScrollSpinBox()
         self.limit_spin.setRange(0, 999)
         self.limit_spin.setSpecialValueText("wszystkie")
         self.limit_spin.setToolTip(
@@ -64,7 +64,7 @@ class GenerationPanel(QWidget):
         )
         spins.addWidget(spin_group("Karty:", self.limit_spin))
 
-        self.versions_spin = QSpinBox()
+        self.versions_spin = NoScrollSpinBox()
         self.versions_spin.setRange(1, 10)
         self.versions_spin.setToolTip("Ile wariantów każdej karty naraz "
                                       "(v2+ → K_kier_v2.jpg, potem wybór w historii)")

@@ -59,6 +59,16 @@ must never touch the corner shields or the card's outer border."""
 def style_lock() -> str:
     from app.core import compositor
     styl = compositor.styl_z_presetu()
+    # Technika rysunku spójna z poziomem kreskówki: przy poziomie 5 twarde
+    # cell-shading jak dotąd; niżej zostaje tylko wymóg JEDNEJ spójnej
+    # techniki (samą technikę definiuje cartoon_level_clause) — inaczej ten
+    # blok wymuszałby płaskie plamy wbrew wybranemu realizmowi.
+    if style_store.cartoon_level() >= 5:
+        technika = ("flat cell-shaded color planes, medium saturation, "
+                    "uniform black outline weight")
+    else:
+        technika = ("one consistent rendering technique and saturation "
+                    "(follow the STYLIZATION LEVEL instructions)")
     return f"""\
 MANDATORY DECK CONSISTENCY (identical on EVERY card of this deck):
 - Any NEWLY painted content (the subject illustration and its immediate
@@ -68,8 +78,7 @@ MANDATORY DECK CONSISTENCY (identical on EVERY card of this deck):
   elements.
 - Do NOT repaint existing card elements to match these colors — they already
   match; leave them exactly as they are.
-- Subjects: flat cell-shaded color planes, medium saturation, uniform black
-  outline weight — every card must look drawn by the same artist in one
+- Subjects: {technika} — every card must look drawn by the same artist in one
   session (same palette, same line weight, same shading).
 - The corner shield plaques must stay completely EMPTY — no letters, numbers
   or pips in them."""
@@ -94,6 +103,98 @@ cell-shaded."""
 
 def face_fidelity_clause() -> str:
     return FACE_FIDELITY
+
+
+# Klauzula siły poprawki (suwak „Siła poprawki" 1-5 w FixRegionDialog):
+# 1-2 = zachowawczy retusz (zmień jak najmniej), 3 = brak klauzuli (status
+# quo), 4-5 = wolna ręka w masce. Uzupełnia temperaturę wywołania
+# (generator._FIX_TEMPERATURA) — prompt jest pewniejszą dźwignią.
+_FIX_SILA = {
+    1: """\
+CHANGE STRENGTH: minimal touch-up — change as FEW pixels as possible inside
+the masked region; preserve the existing composition, lines, colors and
+shapes, and only fix the exact defect described above.""",
+    2: """\
+CHANGE STRENGTH: conservative — keep the existing composition and colors of
+the masked region; adjust only what is necessary to fix the defect described
+above.""",
+    4: """\
+CHANGE STRENGTH: strong — you may noticeably rework the masked region
+(shapes, shading, details) as long as it satisfies the instruction and stays
+consistent with the surrounding artwork.""",
+    5: """\
+CHANGE STRENGTH: free repaint — you may repaint the masked region from
+scratch to best satisfy the instruction, keeping only the style, palette and
+line weight of the surrounding artwork.""",
+}
+
+
+def fix_region_prompt(user_prompt: str, sila: int = 3) -> str:
+    """Prompt korekcyjnego inpaintingu (lightbox → „Popraw selektywnie"):
+    model dostaje kartę + maskę (drugi obraz, biały obszar = region do
+    przerysowania) i instrukcję użytkownika DOSŁOWNIE; sila (1-5) dokleja
+    klauzulę zachowawczości/swobody zmian. Twardą gwarancję nienaruszalności
+    reszty karty daje generator (composite po masce + klamp), prompt jest
+    tylko wsparciem."""
+    sila_clause = _FIX_SILA.get(sila, "")
+    return f"""\
+You are given TWO images: (1) a playing-card illustration, (2) a MASK — the
+WHITE area of the mask marks the ONLY region of the card you may repaint.
+Redraw the card with the masked region corrected.
+
+Required style: precise, multi-color vector-style illustration, cell-shaded,
+consistent with the rest of the card.
+{style_lock()}
+
+Modification instruction for the masked region:
+{user_prompt.strip()}
+
+{sila_clause}
+
+IMPORTANT: Focus exclusively on repairing the masked region according to the
+instruction, blending seamlessly with the style, palette, lighting and line
+weight of the surrounding artwork. Everything OUTSIDE the white mask area must
+remain pixel-identical to the first image.
+
+{NO_TEXT_SUFFIX}"""
+
+
+# Poziom przeróbki zdjęcia na kreskówkę (suwak na Ekranie roboczym, pole
+# postac/poziom_kreskowki): 5 = pełna kreskówka — BRAK klauzuli (pełny styl
+# presetu postaci, status quo); 4→1 stopniowo łagodzą stylizację ubrań,
+# rekwizytów i tła w stronę fotorealizmu. Twarze ZAWSZE pod nadrzędną
+# face_fidelity_clause — klauzula nie dotyka rysów.
+_CARTOON_LEVELS = {
+    4: """\
+STYLIZATION LEVEL 4/5 (softened cartoon) — this OVERRIDES the rendering
+technique in the subject style above (faces still follow FACE LIKENESS):
+keep clean outlines, but soften the cell-shading — allow gentle gradients
+and more color variation in clothing, props and the backdrop.""",
+    3: """\
+STYLIZATION LEVEL 3/5 (semi-realistic) — this OVERRIDES the rendering
+technique in the subject style above (faces still follow FACE LIKENESS):
+halfway between comic and photo — soft painterly light, thinner and less
+prominent outlines, natural color transitions in clothing, props and the
+backdrop instead of flat color planes.""",
+    2: """\
+STYLIZATION LEVEL 2/5 (painterly realism) — this OVERRIDES the rendering
+technique in the subject style above (faces still follow FACE LIKENESS):
+render clothing, props and the backdrop with realistic materials, soft
+natural lighting and NO visible comic outlines — a detailed digital
+painting, clearly not a cartoon.""",
+    1: """\
+STYLIZATION LEVEL 1/5 (near-photorealistic) — this OVERRIDES the rendering
+technique in the subject style above (faces still follow FACE LIKENESS):
+keep the subjects almost photographic — realistic skin, fabrics and
+lighting with only the slightest illustrative cleanup; absolutely no comic
+outlines and no flat color planes.""",
+}
+
+
+def cartoon_level_clause() -> str:
+    """Klauzula poziomu kreskówki — pusty string przy poziomie 5 (pełna
+    kreskówka = styl presetu bez modyfikacji)."""
+    return _CARTOON_LEVELS.get(style_store.cartoon_level(), "")
 
 # Twarde wymogi kompozycji dla stylizacji zdjęcia (tryb hybrydowy) —
 # niezbędne dla masek kompozytora, nieedytowalne.
@@ -237,6 +338,8 @@ def full_card_prompt(suit, liczba_osob: int | None = None) -> str:
     liczba_osob (z cache analizy auto-przydziału, None = nieznana) przełącza
     klauzulę kompozycji na wariant grupowy i dokleja twardą liczbę osób."""
     shape = SUIT_NAME_EN[suit.nazwa]
+    cartoon = cartoon_level_clause()
+    cartoon_block = (cartoon + "\n\n") if cartoon else ""
     count = ""
     if liczba_osob and liczba_osob > 1:
         count = (f" The photo shows exactly {liczba_osob} people — the"
@@ -277,6 +380,7 @@ Task — bold 3D pop-out ("out of bounds") composition:
 
 {suit_fill_clause(suit)}
 
+{cartoon_block}\
 {style_lock()}
 
 {face_fidelity_clause()}
@@ -495,11 +599,13 @@ def popout_prompt(suit, photo_ref: bool = False,
     o oryginalnym zdjęciu (drugi załączony obraz — wierność twarzy
     i rekwizytów); liczba_osob wzmacnia notę twardą liczbą osób."""
     photo_note = ("\n\n" + photo_ref_note(liczba_osob)) if photo_ref else ""
+    cartoon = cartoon_level_clause()
     return (DEFAULT_POPOUT_PROMPT
             + "\n\n" + _window_backdrop_clause(suit)
             + "\n\n" + suit_fill_clause(suit)
             + "\n\nSubject style details:\n"
             + style_store.character_style().strip()
+            + (("\n\n" + cartoon) if cartoon else "")
             + "\n\n" + style_lock()
             + photo_note
             + "\n\n" + face_fidelity_clause()

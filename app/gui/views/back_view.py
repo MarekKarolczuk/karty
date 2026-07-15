@@ -1,27 +1,30 @@
-"""Widok „Style": cztery niezależne biblioteki presetów (postać, styl tła,
-tła przodu, rewers). Każda ma wybór presetu + pełny CRUD (nowy/duplikuj/zmień
+"""Widok „Style": niezależne biblioteki presetów (postać, tła przodu, rewers,
+wartości narożne). Każda ma wybór presetu + pełny CRUD (nowy/duplikuj/zmień
 nazwę/zapisz/wczytaj/usuń), edytor promptu i podgląd. Wybór presetu teł przodu /
-rewersu od razu staje się aktywnym wyglądem talii (sygnał preset_applied)."""
+rewersu od razu staje się aktywnym wyglądem talii (sygnał preset_applied).
+Dawna sekcja „styl tła / szablonu" jest scalona z tłami przodu jako pole
+„styl ornamentyki" (style_store: tla_przodu/styl)."""
 from __future__ import annotations
 
 import zipfile
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase
 from PyQt6.QtWidgets import (
-    QCheckBox, QColorDialog, QComboBox, QFileDialog, QHBoxLayout,
+    QCheckBox, QColorDialog, QFileDialog, QHBoxLayout,
     QInputDialog, QLabel, QListWidget, QListWidgetItem, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from app import config
-from app.core import prompts, style_store
+from app.core import masks, prompts, style_store
 from app.core.models import CardSpec, Suit
 from app.gui.animations import Spinner
 from app.gui.views import view_header
 from app.gui.widgets import (
-    SegmentedControl, cover_pixmap, pil_to_pixmap, show_toast,
+    NoScrollComboBox, NoScrollSpinBox, SegmentedControl, cover_pixmap,
+    pil_to_pixmap, show_toast,
 )
 
 BACK_W, BACK_H = 200, 279
@@ -37,6 +40,39 @@ _CRUD_BUTTONS = (
 )
 
 
+def _czcionki_wbudowane() -> list[tuple[str, list[Path]]]:
+    """Biblioteka wbudowanych czcionek narożników: pary (grupa, pliki)
+    wg podfolderów config.CARD_FONTS_DIR (źródła/licencje w LICENSES.md)."""
+    grupy: list[tuple[str, list[Path]]] = []
+    root = config.CARD_FONTS_DIR
+    if root.is_dir():
+        for folder in sorted(root.iterdir()):
+            if not folder.is_dir():
+                continue
+            pliki = sorted(
+                (p for p in folder.iterdir()
+                 if p.suffix.lower() in (".ttf", ".otf")),
+                key=lambda p: p.stem.lower())
+            if pliki:
+                grupy.append((folder.name, pliki))
+    return grupy
+
+
+# ścieżka → rodzina Qt (podgląd pozycji combo własną czcionką); "" = nie dało
+# się zarejestrować pliku w QFontDatabase
+_rodziny_czcionek: dict[str, str] = {}
+
+
+def _rodzina_czcionki(path: Path) -> str:
+    key = str(path)
+    if key not in _rodziny_czcionek:
+        font_id = QFontDatabase.addApplicationFont(key)
+        rodziny = (QFontDatabase.applicationFontFamilies(font_id)
+                   if font_id >= 0 else [])
+        _rodziny_czcionek[key] = rodziny[0] if rodziny else ""
+    return _rodziny_czcionek[key]
+
+
 class BackView(QWidget):
     # {"mode": "t2i"|"i2i", "orientation": "portrait"|"landscape",
     #  "preset": str, "custom": str, "source_photo": str|None}
@@ -47,6 +83,10 @@ class BackView(QWidget):
     generate_front_set_clicked = pyqtSignal(dict)
     # własny plik użytkownika jako tło przodu: Suit, ścieżka obrazu
     import_front_clicked = pyqtSignal(object, str)
+    # edycja maski pop-out CAŁEGO KOLORU (suit_nazwa) — dialog otwiera MainWindow
+    edit_mask_clicked = pyqtSignal(str)
+    # zmiana biblioteki/aktywnego presetu masek (combo/CRUD) — sync + zapis
+    mask_library_changed = pyqtSignal()
     # wymuszone dopasowanie istniejących teł presetu do formatu karty
     normalize_fronts_clicked = pyqtSignal()
     character_changed = pyqtSignal()   # edycja dowolnego promptu → zapis + podgląd
@@ -59,7 +99,7 @@ class BackView(QWidget):
         super().__init__(parent)
         self._source_photo: Path | None = None
         self._sample_photo: Path | None = None
-        self._cat_combos: dict[str, QComboBox] = {}
+        self._cat_combos: dict[str, NoScrollComboBox] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -79,7 +119,6 @@ class BackView(QWidget):
         layout.setSpacing(10)
 
         layout.addWidget(self._build_character_panel())
-        layout.addWidget(self._build_template_panel())
         layout.addWidget(self._build_front_panel())
         layout.addWidget(self._build_back_panel())
         layout.addWidget(self._build_wartosci_panel())
@@ -102,7 +141,7 @@ class BackView(QWidget):
         cap.setObjectName("sideCaption")
         v.addWidget(cap)
 
-        combo = QComboBox()
+        combo = NoScrollComboBox()
         combo.setCursor(Qt.CursorShape.PointingHandCursor)
         combo.currentIndexChanged.connect(
             lambda _i, c=cat: self._on_preset_selected(c)
@@ -231,8 +270,6 @@ class BackView(QWidget):
         if cat == "postac":
             self._reload_character_edit()
             self.refresh_style_preview()
-        elif cat == "styl_tla":
-            self._reload_template_edit()
         elif cat == "tla_przodu":
             self._reload_front_prompt()
             self.refresh_front_preview()
@@ -437,78 +474,6 @@ class BackView(QWidget):
         else:
             self.style_preview.setText("Wygeneruj kartę,\naby zobaczyć\npodgląd stylu")
 
-    # ======================= SEKCJA: STYL TŁA / SZABLONU ======================
-    def _build_template_panel(self) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName("panel")
-        pl = QVBoxLayout(panel)
-        pl.setContentsMargins(14, 12, 14, 12)
-        pl.setSpacing(8)
-
-        self.tmpl_caption = QLabel("▦  STYL TŁA / SZABLONU KART")
-        self.tmpl_caption.setObjectName("sectionTitle")
-        pl.addWidget(self.tmpl_caption)
-        pl.addWidget(self._library_header("styl_tla"))
-
-        hint = QLabel("Wspólny opis ornamentyki — używany przy generowaniu nowych "
-                      "teł kart i rewersu w stylu domyślnym. Zapisuje się w wybranym "
-                      "presecie.")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        pl.addWidget(hint)
-
-        self._tmpl_debounce = QTimer(self)
-        self._tmpl_debounce.setSingleShot(True)
-        self._tmpl_debounce.setInterval(400)
-        self._tmpl_debounce.timeout.connect(self._apply_template_style)
-
-        self.template_edit = QPlainTextEdit()
-        self.template_edit.setObjectName("styleEdit")
-        self.template_edit.setPlainText(style_store.template_style())
-        self.template_edit.textChanged.connect(self._tmpl_debounce.start)
-        pl.addWidget(self.template_edit, stretch=1)
-
-        reset_btn = QPushButton("↺  Przywróć domyślny styl tła")
-        reset_btn.setObjectName("ghostBtn")
-        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        reset_btn.clicked.connect(self._reset_template_style)
-        pl.addWidget(reset_btn)
-
-        self._update_template_caption()
-        return panel
-
-    def _apply_template_style(self) -> None:
-        style_store.set_text("styl_tla", "styl", self.template_edit.toPlainText())
-        self._update_template_caption()
-        self.character_changed.emit()
-
-    def _reset_template_style(self) -> None:
-        answer = QMessageBox.question(
-            self, "Przywrócić domyślny styl tła?",
-            "Opis stylu tła/szablonu wróci do wartości domyślnej.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        default = style_store.reset("styl_tla", "styl")
-        self.template_edit.blockSignals(True)
-        self.template_edit.setPlainText(default)
-        self.template_edit.blockSignals(False)
-        self._update_template_caption()
-        self.character_changed.emit()
-        show_toast(self, "Przywrócono domyślny styl tła", "ok")
-
-    def _reload_template_edit(self) -> None:
-        self.template_edit.blockSignals(True)
-        self.template_edit.setPlainText(style_store.template_style())
-        self.template_edit.blockSignals(False)
-        self._update_template_caption()
-
-    def _update_template_caption(self) -> None:
-        self.tmpl_caption.setText(
-            "▦  STYL TŁA / SZABLONU KART"
-            + ("" if style_store.is_default("styl_tla", "styl") else "   • zmieniony")
-        )
-
     # ======================= SEKCJA: TŁA PRZODU KART ==========================
     def _build_front_panel(self) -> QWidget:
         panel = QWidget()
@@ -552,7 +517,7 @@ class BackView(QWidget):
         suit_cap = QLabel("KOLOR")
         suit_cap.setObjectName("sideCaption")
         left.addWidget(suit_cap)
-        self.front_suit_combo = QComboBox()
+        self.front_suit_combo = NoScrollComboBox()
         self.front_suit_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         for suit in Suit:
             self.front_suit_combo.addItem(f"{suit.symbol} {suit.nazwa}", suit)
@@ -623,6 +588,52 @@ class BackView(QWidget):
         self.front_norm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.front_norm_btn.clicked.connect(self.normalize_fronts_clicked)
         left.addWidget(self.front_norm_btn)
+
+        # --- biblioteka presetów masek pop-out (wzorzec pasków presetów) ------
+        mask_cap = QLabel("PRESET — MASKA POP-OUT")
+        mask_cap.setObjectName("sideCaption")
+        left.addWidget(mask_cap)
+        self.mask_combo = NoScrollComboBox()
+        self.mask_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mask_combo.setToolTip(
+            "Aktywny preset maski pop-out (strefa, w której postać może "
+            "wychodzić poza symbol). „Maska automatyczna” = strefa wyliczana; "
+            "własne maski leżą w podfolderze maski/ presetu teł i wędrują "
+            "razem z nim.")
+        self.mask_combo.currentIndexChanged.connect(self._on_mask_selected)
+        left.addWidget(self.mask_combo)
+        mask_actions = QHBoxLayout()
+        mask_actions.setSpacing(6)
+        for text, tip, handler in (
+            ("＋ Nowa", "Utwórz pusty preset maski", self._mask_new),
+            ("⧉ Duplikuj", "Skopiuj aktywny preset maski",
+             self._mask_duplicate),
+            ("✎ Zmień nazwę", "Zmień nazwę aktywnego presetu maski",
+             self._mask_rename),
+            ("🗑 Usuń", "Usuń aktywny preset maski (powrót do automatycznej)",
+             self._mask_delete),
+        ):
+            btn = QPushButton(text)
+            btn.setObjectName("ghostBtn")
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, h=handler: h())
+            mask_actions.addWidget(btn)
+        mask_actions.addStretch(1)
+        left.addLayout(mask_actions)
+
+        self.front_mask_btn = QPushButton("✎  Edytuj maskę pop-out (kolor)")
+        self.front_mask_btn.setObjectName("ghostBtn")
+        self.front_mask_btn.setToolTip(
+            "Narysuj pędzlem maskę WSZYSTKICH kart wybranego koloru w "
+            "aktywnym presecie masek (bez API). Pojedynczą kartę nadpiszesz "
+            "na Ekranie roboczym. Przy „Masce automatycznej” program "
+            "najpierw utworzy nowy preset."
+        )
+        self.front_mask_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.front_mask_btn.clicked.connect(
+            lambda: self.edit_mask_clicked.emit(self._current_front_suit().nazwa))
+        left.addWidget(self.front_mask_btn)
         left.addStretch(1)
         row.addLayout(left, stretch=1)
 
@@ -646,6 +657,35 @@ class BackView(QWidget):
         reset_front.setCursor(Qt.CursorShape.PointingHandCursor)
         reset_front.clicked.connect(self._reset_front_prompt)
         right.addWidget(reset_front)
+
+        # --- wspólny opis ornamentyki (dawna kategoria "styl_tla") -----------
+        self.tmpl_caption = QLabel("STYL ORNAMENTYKI (WSPÓLNY OPIS)")
+        self.tmpl_caption.setObjectName("sideCaption")
+        right.addWidget(self.tmpl_caption)
+        tmpl_hint = QLabel(
+            "Używany przy generowaniu nowych teł, kompozycji karty (Pełne AI) "
+            "i rewersu w stylu domyślnym. Zapisuje się w presecie teł przodu.")
+        tmpl_hint.setObjectName("hint")
+        tmpl_hint.setWordWrap(True)
+        right.addWidget(tmpl_hint)
+
+        self._tmpl_debounce = QTimer(self)
+        self._tmpl_debounce.setSingleShot(True)
+        self._tmpl_debounce.setInterval(400)
+        self._tmpl_debounce.timeout.connect(self._apply_template_style)
+
+        self.template_edit = QPlainTextEdit()
+        self.template_edit.setObjectName("styleEdit")
+        self.template_edit.setPlainText(style_store.template_style())
+        self.template_edit.setMaximumHeight(110)
+        self.template_edit.textChanged.connect(self._tmpl_debounce.start)
+        right.addWidget(self.template_edit)
+
+        reset_tmpl = QPushButton("↺  Przywróć domyślny styl ornamentyki")
+        reset_tmpl.setObjectName("ghostBtn")
+        reset_tmpl.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_tmpl.clicked.connect(self._reset_template_style)
+        right.addWidget(reset_tmpl)
         row.addLayout(right, stretch=2)
 
         pl.addLayout(row)
@@ -668,6 +708,8 @@ class BackView(QWidget):
         self.front_custom_check.setChecked(style_store.front_custom_mode())
         self.front_custom_check.blockSignals(False)
         self._update_front_caption()
+        self._reload_template_edit()
+        self.refresh_mask_presets()   # maski żyją w folderze presetu teł
 
     def _update_front_caption(self) -> None:
         is_red = self._current_front_suit().is_red
@@ -699,6 +741,114 @@ class BackView(QWidget):
         self.front_prompt.blockSignals(False)
         self._update_front_caption()
         self.character_changed.emit()
+
+    # --- biblioteka presetów masek pop-out -------------------------------------
+    def refresh_mask_presets(self) -> None:
+        """Odświeża combo masek (wołane też z MainWindow po auto-utworzeniu
+        presetu przy edycji z aktywną „Maską automatyczną")."""
+        self.mask_combo.blockSignals(True)
+        self.mask_combo.clear()
+        self.mask_combo.addItem("Maska automatyczna", "")
+        for name in masks.mask_presets():
+            self.mask_combo.addItem(name, name)
+        idx = self.mask_combo.findData(style_store.active_mask())
+        self.mask_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.mask_combo.blockSignals(False)
+
+    def _on_mask_selected(self, _index: int) -> None:
+        style_store.set_text("tla_przodu", "maska_aktywna",
+                             self.mask_combo.currentData() or "")
+        self.mask_library_changed.emit()
+
+    def _mask_new(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Nowa maska", "Nazwa presetu maski:")
+        if not ok:
+            return
+        final = masks.utworz_maske(name)
+        style_store.set_text("tla_przodu", "maska_aktywna", final)
+        self.refresh_mask_presets()
+        self.mask_library_changed.emit()
+        show_toast(self, f"Utworzono maskę „{final}” — narysuj strefy "
+                   "przyciskiem „Edytuj maskę”", "ok")
+
+    def _mask_duplicate(self) -> None:
+        aktywna = style_store.active_mask()
+        if not aktywna:
+            show_toast(self, "„Maski automatycznej” nie da się duplikować — "
+                       "utwórz nową", "info")
+            return
+        kopia = masks.duplikuj_maske(aktywna)
+        if kopia is None:
+            show_toast(self, "Nie udało się zduplikować maski", "error")
+            return
+        style_store.set_text("tla_przodu", "maska_aktywna", kopia)
+        self.refresh_mask_presets()
+        self.mask_library_changed.emit()
+
+    def _mask_rename(self) -> None:
+        aktywna = style_store.active_mask()
+        if not aktywna:
+            show_toast(self, "Wybierz własną maskę (nie automatyczną)", "info")
+            return
+        nowa, ok = QInputDialog.getText(
+            self, "Zmień nazwę maski", "Nowa nazwa:", text=aktywna)
+        if not ok:
+            return
+        final = masks.zmien_nazwe_maski(aktywna, nowa)
+        style_store.set_text("tla_przodu", "maska_aktywna", final)
+        self.refresh_mask_presets()
+        self.mask_library_changed.emit()
+
+    def _mask_delete(self) -> None:
+        aktywna = style_store.active_mask()
+        if not aktywna:
+            return
+        answer = QMessageBox.question(
+            self, "Usunąć maskę?",
+            f"Preset maski „{aktywna}” zostanie usunięty (wszystkie kolory "
+            "i nadpisania kart). Talia wróci do „Maski automatycznej”.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        masks.usun_maske(aktywna)
+        style_store.set_text("tla_przodu", "maska_aktywna", "")
+        self.refresh_mask_presets()
+        self.mask_library_changed.emit()
+
+    # --- wspólny opis ornamentyki (pole tla_przodu/styl) ----------------------
+    def _apply_template_style(self) -> None:
+        style_store.set_text("tla_przodu", "styl", self.template_edit.toPlainText())
+        self._update_template_caption()
+        self.character_changed.emit()
+
+    def _reset_template_style(self) -> None:
+        answer = QMessageBox.question(
+            self, "Przywrócić domyślny styl ornamentyki?",
+            "Wspólny opis ornamentyki wróci do wartości domyślnej.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        default = style_store.reset("tla_przodu", "styl")
+        self.template_edit.blockSignals(True)
+        self.template_edit.setPlainText(default)
+        self.template_edit.blockSignals(False)
+        self._update_template_caption()
+        self.character_changed.emit()
+        show_toast(self, "Przywrócono domyślny styl ornamentyki", "ok")
+
+    def _reload_template_edit(self) -> None:
+        self.template_edit.blockSignals(True)
+        self.template_edit.setPlainText(style_store.template_style())
+        self.template_edit.blockSignals(False)
+        self._update_template_caption()
+
+    def _update_template_caption(self) -> None:
+        self.tmpl_caption.setText(
+            "STYL ORNAMENTYKI (WSPÓLNY OPIS)"
+            + ("" if style_store.is_default("tla_przodu", "styl")
+               else "   • zmieniony")
+        )
 
     def _emit_generate_front(self) -> None:
         prompt = self.front_prompt.toPlainText().strip() \
@@ -808,7 +958,7 @@ class BackView(QWidget):
         preset_caption = QLabel("SZYBKI STYL REWERSU")
         preset_caption.setObjectName("sideCaption")
         controls_layout.addWidget(preset_caption)
-        self.preset_combo = QComboBox()
+        self.preset_combo = NoScrollComboBox()
         self.preset_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         for key, (label, _) in prompts.BACK_PRESETS.items():
             self.preset_combo.addItem(label, key)
@@ -1009,10 +1159,16 @@ class BackView(QWidget):
         font_cap = QLabel("CZCIONKA")
         font_cap.setObjectName("sideCaption")
         font_row.addWidget(font_cap)
-        self.wart_font_label = QLabel()
-        self.wart_font_label.setObjectName("propValue")
-        font_row.addWidget(self.wart_font_label, stretch=1)
-        pick_font = QPushButton("📁 Wybierz plik (.ttf)")
+        self.wart_font_combo = NoScrollComboBox()
+        self.wart_font_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wart_font_combo.setToolTip(
+            "Wbudowana biblioteka czcionek narożników (assets/fonts/karty) — "
+            "wybór kopiuje plik do aktywnego presetu, więc preset jest "
+            "samowystarczalny (eksport .zip zabiera czcionkę)")
+        self.wart_font_combo.currentIndexChanged.connect(
+            self._on_wartosci_font_selected)
+        font_row.addWidget(self.wart_font_combo, stretch=1)
+        pick_font = QPushButton("📁 Własny plik (.ttf)")
         pick_font.setObjectName("ghostBtn")
         pick_font.setCursor(Qt.CursorShape.PointingHandCursor)
         pick_font.clicked.connect(self._pick_wartosci_font)
@@ -1026,7 +1182,7 @@ class BackView(QWidget):
         pl.addLayout(font_row)
 
         # --- rozmiary / offsety (spinboxy w dwóch rzędach) ---
-        self._wart_spins: dict[str, QSpinBox] = {}
+        self._wart_spins: dict[str, NoScrollSpinBox] = {}
         rows = (
             (("rozmiar_wartosci", "Rozmiar wartości", 10, 90),
              ("rozmiar_symbolu", "Rozmiar symbolu", 10, 90),
@@ -1043,7 +1199,7 @@ class BackView(QWidget):
                 lab = QLabel(label.upper())
                 lab.setObjectName("sideCaption")
                 row.addWidget(lab)
-                spin = QSpinBox()
+                spin = NoScrollSpinBox()
                 spin.setRange(lo, hi)
                 spin.setSuffix(" %")
                 spin.valueChanged.connect(
@@ -1096,10 +1252,35 @@ class BackView(QWidget):
         self._reload_wartosci()
         return panel
 
+    def _wypelnij_font_combo(self, aktywna: str) -> None:
+        """Przebudowuje combo czcionek: „Domyślna" + biblioteka wbudowana
+        grupami (nagłówki wyłączone, pozycje rysowane WŁASNĄ czcionką) +
+        ewentualna pozycja „Własna" dla pliku spoza biblioteki. Bez emitowania."""
+        combo = self.wart_font_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Domyślna (serif systemowy)", "")
+        for grupa, pliki in _czcionki_wbudowane():
+            naglowek = combo.count()
+            combo.addItem(f"— {grupa} —", None)
+            combo.model().item(naglowek).setEnabled(False)
+            for plik in pliki:
+                idx = combo.count()
+                combo.addItem(plik.stem, plik.name)
+                rodzina = _rodzina_czcionki(plik)
+                if rodzina:
+                    font = QFont(rodzina)
+                    font.setPixelSize(17)
+                    combo.setItemData(idx, font, Qt.ItemDataRole.FontRole)
+        if aktywna and combo.findData(aktywna) < 0:
+            combo.addItem(f"Własna: {aktywna}", aktywna)
+        combo.setCurrentIndex(max(0, combo.findData(aktywna)))
+        combo.blockSignals(False)
+
     def _reload_wartosci(self) -> None:
         """Ustawia kontrolki wg aktywnego presetu „wartosci" (bez emitowania)."""
-        czcionka = style_store.text("wartosci", "czcionka").strip()
-        self.wart_font_label.setText(czcionka or "domyślna (serif systemowy)")
+        self._wypelnij_font_combo(
+            style_store.text("wartosci", "czcionka").strip())
         for field, spin in self._wart_spins.items():
             spin.blockSignals(True)
             try:
@@ -1128,6 +1309,27 @@ class BackView(QWidget):
         self._refresh_wartosci_preview()
         self.character_changed.emit()
 
+    def _on_wartosci_font_selected(self) -> None:
+        """Wybór z combo: pozycja biblioteki → kopia pliku do presetu;
+        „Domyślna"/„Własna" → sam zapis pola."""
+        nazwa = self.wart_font_combo.currentData()
+        if nazwa is None:       # nagłówek grupy (wyłączony — na wszelki wypadek)
+            return
+        zrodlo = next(
+            (p for _grupa, pliki in _czcionki_wbudowane() for p in pliki
+             if p.name == nazwa), None)
+        if zrodlo is not None:
+            try:
+                nazwa = style_store.save_font_file("wartosci", zrodlo)
+            except OSError as exc:
+                show_toast(self, f"Nie skopiowano czcionki: {exc}", "error")
+                self._wypelnij_font_combo(
+                    style_store.text("wartosci", "czcionka").strip())
+                return
+        style_store.set_text("wartosci", "czcionka", nazwa)
+        self._refresh_wartosci_preview()
+        self.character_changed.emit()
+
     def _pick_wartosci_font(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Wybierz czcionkę wartości", r"C:\Windows\Fonts",
@@ -1141,13 +1343,13 @@ class BackView(QWidget):
             show_toast(self, f"Nie skopiowano czcionki: {exc}", "error")
             return
         style_store.set_text("wartosci", "czcionka", name)
-        self.wart_font_label.setText(name)
+        self._wypelnij_font_combo(name)
         self._refresh_wartosci_preview()
         self.character_changed.emit()
 
     def _reset_wartosci_font(self) -> None:
         style_store.set_text("wartosci", "czcionka", "")
-        self.wart_font_label.setText("domyślna (serif systemowy)")
+        self._wypelnij_font_combo("")
         self._refresh_wartosci_preview()
         self.character_changed.emit()
 

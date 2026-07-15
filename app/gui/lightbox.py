@@ -116,6 +116,7 @@ class CardLightbox(QDialog):
     set_main_requested = pyqtSignal(str, str, str)    # suit, value, ścieżka
     delete_requested = pyqtSignal(str, str, str)      # suit, value, ścieżka
     restamp_requested = pyqtSignal(str, str)          # suit, value
+    fix_requested = pyqtSignal(str, str, str)         # suit, value, ścieżka wariantu
     open_folder_requested = pyqtSignal(str)           # ścieżka bieżącego pliku
 
     def __init__(self, ctx: LightboxContext, suit_nazwa: str, value: str,
@@ -194,10 +195,15 @@ class CardLightbox(QDialog):
         self.restamp_btn = QPushButton("♻  Przestempluj narożniki")
         self.restamp_btn.clicked.connect(
             lambda: self.restamp_requested.emit(self._suit, self._value))
+        self.fix_btn = QPushButton("🩹  Popraw selektywnie")
+        self.fix_btn.setToolTip(
+            "Zamaluj obszar błędu i opisz poprawkę — model przerysuje TYLKO "
+            "ten fragment (wynik jako nowy wariant)")
+        self.fix_btn.clicked.connect(self._on_fix)
         self.folder_btn = QPushButton("📁  Otwórz folder")
         self.folder_btn.clicked.connect(self._on_open_folder)
         for btn in (self.set_main_btn, self.delete_btn,
-                    self.restamp_btn, self.folder_btn):
+                    self.restamp_btn, self.fix_btn, self.folder_btn):
             btn.setObjectName("ghostBtn")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -371,6 +377,11 @@ class CardLightbox(QDialog):
         path = self.current_path()
         if path is not None:
             self.delete_requested.emit(self._suit, self._value, str(path))
+
+    def _on_fix(self) -> None:
+        path = self.current_path()
+        if path is not None:
+            self.fix_requested.emit(self._suit, self._value, str(path))
 
     def _on_open_folder(self) -> None:
         path = self.current_path()

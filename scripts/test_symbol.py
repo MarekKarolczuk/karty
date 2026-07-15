@@ -60,8 +60,10 @@ def _kompozyt(suit: Suit, plik: Path, styl) -> Image.Image | None:
     kolor_hex = styl.kolor_czerwony if suit.is_red else styl.kolor_czarny
     kolor_tla = (int(kolor_hex[1:3], 16), int(kolor_hex[3:5], 16),
                  int(kolor_hex[5:7], 16))
+    # wartość karty ze stemu (K_kier_v2 → "K") — maska użytkownika per karta
     maska = masks.maska_klampu(wynik, template, suit.template_path,
-                               kolor_tla=kolor_tla)
+                               kolor_tla=kolor_tla,
+                               wartosc=plik.stem.split("_")[0], suit=suit)
     baza = compositor.wypelnij_okno(template, suit)
     return Image.composite(wynik, baza, maska)
 
@@ -112,19 +114,34 @@ for nazwa, karty in sorted(wg_koloru.items()):
     core_full = np.array(tmasks.center_full) > 0
     h, w = tpl_arr.shape[:2]
     # TŁO NIENARUSZONE: obszar POZA symbolem i strefą pop-out kompozyt musi ==
-    # szablon (rama/ornament/tło nie ruszone przez AI). Pomijamy pas NAD symbolem
-    # (tam głowy pop-out legalnie zasłaniają ornament — to zamierzone; prostość
-    # górnej ramki weryfikuje TEST 1) oraz tarcze (stempel wartości).
-    r_poza = max(20, round(w * (masks.KLAMP_POPOUT_RING_V_PX + 20)
-                           / config.TEMPLATE_STD_SZEROKOSC))
-    poza_symbol = cv2.dilate(core_full.astype(np.uint8) * 255,
-                             cv2.getStructuringElement(
-                                 cv2.MORPH_ELLIPSE, (2 * r_poza + 1, 2 * r_poza + 1)))
-    poza_symbol = poza_symbol == 0
-    sy0 = int(np.nonzero(core_full.any(axis=1))[0].min())
-    poza_symbol[:sy0, :] = False   # nad symbolem: pop-out głów (zamierzone)
-    for x0, y0, x1, y1 in (tmasks.tl_box, tmasks.br_box):
-        poza_symbol[y0:y1, x0:x1] = False   # tarcze: tam ląduje stempel wartości
+    # szablon (rama/ornament/tło nie ruszone przez AI). Przy masce UŻYTKOWNIKA
+    # (narysowanej w GUI; per karta > per kolor) strefa pop-out = ta maska +
+    # margines na dylatację sylwetki i feather; przy domyślnej — ring z hulla.
+    # Pomijamy pas NAD symbolem tylko w wariancie domyślnym (prostokątna
+    # strefa głów sięga bordiury; prostość górnej ramki weryfikuje TEST 1)
+    # oraz tarcze (stempel wartości).
+    def _strefa_poza(user_strefa: np.ndarray | None) -> np.ndarray:
+        if user_strefa is not None:
+            r_m = max(4, round(w * 24 / config.TEMPLATE_STD_SZEROKOSC))
+            strefa = cv2.bitwise_or(user_strefa,
+                                    core_full.astype(np.uint8) * 255)
+            strefa = cv2.dilate(strefa, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * r_m + 1, 2 * r_m + 1)))
+            poza = strefa == 0
+        else:
+            r_poza = max(20, round(w * (masks.KLAMP_POPOUT_RING_V_PX + 20)
+                                   / config.TEMPLATE_STD_SZEROKOSC))
+            poza = cv2.dilate(core_full.astype(np.uint8) * 255,
+                              cv2.getStructuringElement(
+                                  cv2.MORPH_ELLIPSE,
+                                  (2 * r_poza + 1, 2 * r_poza + 1))) == 0
+            sy0 = int(np.nonzero(core_full.any(axis=1))[0].min())
+            poza[:sy0, :] = False   # nad symbolem: pop-out głów (zamierzone)
+        for x0, y0, x1, y1 in (tmasks.tl_box, tmasks.br_box):
+            poza[y0:y1, x0:x1] = False   # tarcze: tam ląduje stempel wartości
+        return poza
+
+    poza_symbol_koloru = _strefa_poza(masks.maska_uzytkownika(suit, (w, h)))
     fill_hex = styl.kolor_czerwony if suit.is_red else styl.kolor_czarny
     fill_rgb = np.array([int(fill_hex[i:i + 2], 16) for i in (1, 3, 5)], np.int16)
 
@@ -149,6 +166,15 @@ for nazwa, karty in sorted(wg_koloru.items()):
           f"wypełnienie: {fill_odc} odcień [{'OK' if fill_ok else 'FAIL'}]")
 
     for plik in karty:
+        # maska per KARTA (jeśli narysowana) zmienia strefę pop-out tej karty
+        wart = plik.stem.split("_")[0]
+        sciezka_karty = masks.sciezka_maski_uzytkownika(suit, wart)
+        if sciezka_karty is not None and sciezka_karty.exists():
+            poza_symbol = _strefa_poza(
+                masks.maska_uzytkownika(suit, (w, h), wart))
+        else:
+            poza_symbol = poza_symbol_koloru
+
         comp = _kompozyt(suit, plik, styl)
         comp_arr = np.asarray(comp, dtype=np.int16)
         comp_bgr = cv2.cvtColor(np.asarray(comp), cv2.COLOR_RGB2BGR)

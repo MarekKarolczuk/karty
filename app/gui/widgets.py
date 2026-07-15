@@ -1,4 +1,5 @@
-"""Nowoczesne kontrolki wielokrotnego użytku: SegmentedControl, Toast, cover_pixmap."""
+"""Nowoczesne kontrolki wielokrotnego użytku: SnapSlider, NoScrollComboBox,
+NoScrollSpinBox, SegmentedControl, Toast, cover_pixmap."""
 from __future__ import annotations
 
 import io
@@ -9,9 +10,69 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QImageReader, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
-    QButtonGroup, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-    QPushButton, QWidget,
+    QButtonGroup, QComboBox, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
+    QPushButton, QSlider, QSpinBox, QStyle, QWidget,
 )
+
+
+class SnapSlider(QSlider):
+    """Poziomy suwak dla całej aplikacji (NIE używać surowego QSlider):
+    klik w tor = natychmiastowy skok uchwytu do klikniętego miejsca (domyślny
+    QSlider ruszał się tylko o page-step — trzeba było celować w mały uchwyt),
+    potem normalne przeciąganie; pageStep ~10% zakresu; kursor wskazujący.
+    Wygląd stylizuje sekcja QSlider w theme.QSS (tor + akcentowe wypełnienie
+    + duży okrągły uchwyt)."""
+
+    def __init__(self, minimum: int = 0, maximum: int = 100,
+                 value: int = 0, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setRange(minimum, maximum)
+        self.setValue(value)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setPageStep(max(1, (maximum - minimum) // 10))
+
+    def mousePressEvent(self, event):  # noqa: N802 (API Qt)
+        if event.button() == Qt.MouseButton.LeftButton:
+            # skok do klikniętej pozycji PRZED standardową obsługą — uchwyt
+            # ląduje pod kursorem, więc super() od razu zaczyna przeciąganie
+            self.setValue(QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(),
+                round(event.position().x()), max(1, self.width())))
+        super().mousePressEvent(event)
+
+    def wheelEvent(self, event):  # noqa: N802 (API Qt)
+        # kółko myszy NIE rusza suwaka — zdarzenie idzie do QScrollArea
+        # (ochrona przed przypadkową zmianą wartości przy przewijaniu strony)
+        event.ignore()
+
+
+class NoScrollComboBox(QComboBox):
+    """Lista wyboru dla całej aplikacji (NIE używać surowego QComboBox):
+    kółko myszy NIE zmienia wyboru — zdarzenie propaguje do QScrollArea
+    i strona się przewija (przewijanie nad combo zmieniało preset/kolor
+    przypadkiem). Zmiana tylko przez rozwinięcie listy; przewijanie
+    WEWNĄTRZ rozwiniętej listy działa normalnie (popup to osobny widżet)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # domyślne WheelFocus dawało fokus od samego kółka
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):  # noqa: N802 (API Qt)
+        event.ignore()
+
+
+class NoScrollSpinBox(QSpinBox):
+    """Pole liczbowe dla całej aplikacji (NIE używać surowego QSpinBox):
+    kółko myszy NIE zmienia wartości (jak NoScrollComboBox); strzałki ▲▼,
+    klawiatura i wpisywanie działają bez zmian."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):  # noqa: N802 (API Qt)
+        event.ignore()
 
 
 def cover_pixmap(path: Path | str, w: int, h: int, radius: int = 10) -> QPixmap:
