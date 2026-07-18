@@ -8,15 +8,25 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from app.core.models import Suit
+from app.core.models import Suit, wartosci_dla
 from app.gui.card_grid import CardGrid
 from app.gui.widgets import SegmentedControl
 
 ROW_SCALE = 0.56   # kompaktowe sloty, żeby 13 kart mieściło się w wierszu
 
+# Definicja filtra kolorów: (etykieta, grupa suitów lub None=wszystkie, red).
+# Jedno źródło prawdy dla segmentów, widoczności wierszy i badge'ów
+# (main_window._update_badges).
+FILTRY: list[tuple[str, tuple[Suit, ...] | None, bool]] = [
+    ("Wszystkie", None, False),
+    *[(f"{s.symbol} {s.etykieta}", (s,), s.is_red) for s in Suit.kolory()],
+    ("🃏 Jokery", tuple(Suit.jokery()), False),
+]
+
 
 class DeckGridPanel(QWidget):
-    """Filtr kolorów + 4 wiersze CardGrid (po jednym na kolor) + pusty stan."""
+    """Filtr kolorów + 4 wiersze CardGrid (po jednym na kolor) + wiersz
+    Jokerów (2 sloty) + pusty stan."""
 
     slot_clicked = pyqtSignal(object)          # CardSlot
     slot_right_clicked = pyqtSignal(object)    # CardSlot
@@ -32,8 +42,8 @@ class DeckGridPanel(QWidget):
 
         filter_row = QHBoxLayout()
         self.suit_seg = SegmentedControl(
-            ["Wszystkie"] + [f"{s.symbol} {s.nazwa.capitalize()}" for s in Suit],
-            red_flags=[False] + [s.is_red for s in Suit],
+            [f[0] for f in FILTRY],
+            red_flags=[f[2] for f in FILTRY],
         )
         self.suit_seg.changed.connect(self._on_filter_changed)
         filter_row.addWidget(self.suit_seg)
@@ -48,36 +58,19 @@ class DeckGridPanel(QWidget):
         host_layout.setSpacing(14)
 
         self.grids: dict[Suit, CardGrid] = {}
-        self._rows: dict[Suit, QWidget] = {}
-        for suit in Suit:
+        self._rows: list[tuple[tuple[Suit, ...], QWidget]] = []
+        for suit in Suit.kolory():
             row = QWidget()
             row.setObjectName("panel")
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(12, 10, 12, 10)
             row_layout.setSpacing(10)
+            row_layout.addWidget(self._label_box(suit.symbol,
+                                                 suit.nazwa.capitalize(),
+                                                 suit.is_red))
 
-            label_box = QWidget()
-            label_box.setFixedWidth(52)
-            label_layout = QVBoxLayout(label_box)
-            label_layout.setContentsMargins(0, 8, 0, 0)
-            label_layout.setSpacing(0)
-            symbol = QLabel(suit.symbol)
-            symbol.setObjectName("suitRowSymbol")
-            symbol.setProperty("red", suit.is_red)
-            symbol.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            label_layout.addWidget(symbol)
-            name = QLabel(suit.nazwa.capitalize())
-            name.setObjectName("hint")
-            name.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            label_layout.addWidget(name)
-            label_layout.addStretch(1)
-            row_layout.addWidget(label_box)
-
-            grid = CardGrid(suit, columns=13, scale=scale, spacing=8,
-                            droppable=droppable)
-            grid.slot_clicked.connect(self.slot_clicked.emit)
-            grid.slot_right_clicked.connect(self.slot_right_clicked.emit)
-            grid.photo_dropped.connect(self.photo_dropped.emit)
+            grid = self._make_grid(suit, columns=13, scale=scale,
+                                   droppable=droppable)
             grid_scroll = QScrollArea()
             grid_scroll.setWidgetResizable(True)
             grid_scroll.setWidget(grid)
@@ -88,8 +81,24 @@ class DeckGridPanel(QWidget):
             row_layout.addWidget(grid_scroll, stretch=1)
 
             host_layout.addWidget(row)
-            self.grids[suit] = grid
-            self._rows[suit] = row
+            self._rows.append(((suit,), row))
+
+        # Wiersz Jokerów: dwa pojedyncze sloty (czerwony i czarny) obok siebie
+        joker_row = QWidget()
+        joker_row.setObjectName("panel")
+        joker_layout = QHBoxLayout(joker_row)
+        joker_layout.setContentsMargins(12, 10, 12, 10)
+        joker_layout.setSpacing(10)
+        for suit in Suit.jokery():
+            joker_layout.addWidget(self._label_box(suit.symbol,
+                                                   suit.nazwa.split("_")[1],
+                                                   suit.is_red))
+            joker_layout.addWidget(self._make_grid(suit, columns=1,
+                                                   scale=scale,
+                                                   droppable=droppable))
+        joker_layout.addStretch(1)
+        host_layout.addWidget(joker_row)
+        self._rows.append((tuple(Suit.jokery()), joker_row))
 
         self.empty_state = QLabel(
             "Jeszcze brak wygenerowanych kart.\n"
@@ -109,21 +118,53 @@ class DeckGridPanel(QWidget):
         scroll.setWidget(host)
         layout.addWidget(scroll, stretch=1)
 
+    # --- budowa pomocnicza ------------------------------------------------------
+    def _label_box(self, symbol_txt: str, nazwa: str, red: bool) -> QWidget:
+        """Etykieta wiersza: symbol koloru + nazwa pod spodem."""
+        box = QWidget()
+        box.setFixedWidth(52)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(0)
+        symbol = QLabel(symbol_txt)
+        symbol.setObjectName("suitRowSymbol")
+        symbol.setProperty("red", red)
+        symbol.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(symbol)
+        name = QLabel(nazwa)
+        name.setObjectName("hint")
+        name.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(name)
+        layout.addStretch(1)
+        return box
+
+    def _make_grid(self, suit: Suit, columns: int, scale: float,
+                   droppable: bool) -> CardGrid:
+        grid = CardGrid(suit, columns=columns, scale=scale, spacing=8,
+                        droppable=droppable)
+        grid.slot_clicked.connect(self.slot_clicked.emit)
+        grid.slot_right_clicked.connect(self.slot_right_clicked.emit)
+        grid.photo_dropped.connect(self.photo_dropped.emit)
+        self.grids[suit] = grid
+        return grid
+
     # --- filtr ----------------------------------------------------------------
     def _on_filter_changed(self, index: int) -> None:
-        selected = None if index == 0 else list(Suit)[index - 1]
-        for suit, row in self._rows.items():
-            row.setVisible(selected is None or suit is selected)
+        selected = FILTRY[index][1]
+        for suits, row in self._rows:
+            row.setVisible(selected is None
+                           or any(s in selected for s in suits))
 
-    def current_filter(self) -> Suit | None:
-        """Aktywny filtr koloru (None = wszystkie)."""
-        index = self.suit_seg.current()
-        return None if index == 0 else list(Suit)[index - 1]
+    def current_filter(self) -> tuple[Suit, ...] | None:
+        """Aktywna grupa filtra kolorów (None = wszystkie)."""
+        return FILTRY[self.suit_seg.current()][1]
 
     # --- budowa / stan ----------------------------------------------------------
     def rebuild(self, values: list[str], assignments: dict[str, str]) -> None:
+        """Przebudowa slotów: jokery dostają jedną „wartość" JOKER,
+        kolory pełną listę talii."""
         for grid in self.grids.values():
-            grid.rebuild(values, assignments)
+            grid.rebuild(wartosci_dla(grid.suit, values), assignments)
 
     def refresh_empty_state(self) -> None:
         any_generated = any(

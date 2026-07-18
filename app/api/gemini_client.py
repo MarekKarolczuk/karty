@@ -245,16 +245,23 @@ def compose_full_card(template: Image.Image, photo_path, prompt: str,
     return generate_image(contents, seed=seed)
 
 
-def edit_region(card: Image.Image, mask: Image.Image, prompt: str,
+def edit_region(card: Image.Image, zaznaczenie: Image.Image, prompt: str,
                 seed: int | None = None,
-                temperature: float | None = None) -> Image.Image:
-    """Korekcyjny inpainting: karta + maska (obraz czarno-biały, biały obszar
-    = region do przerysowania) + prompt użytkownika. Gemini nie ma twardej
-    maski API — maska idzie jako drugi obraz, a deterministyczną ochronę
-    reszty karty robi generator (composite po masce + klamp).
-    temperature — z suwaka „Siła poprawki" (generator._FIX_TEMPERATURA)."""
-    return generate_image([prompt, card, mask.convert("RGB")], seed=seed,
-                          temperature=temperature)
+                temperature: float | None = None,
+                photo: Image.Image | None = None) -> Image.Image:
+    """Korekcyjny inpainting: wycinek karty + TEN SAM wycinek z regionem
+    poprawki zaznaczonym magentą (compositor.zaznacz_region_poprawki) +
+    prompt użytkownika. Gemini nie ma twardej maski API — wizualna adnotacja
+    na drugim obrazie działa lepiej niż czarno-biała maska, a deterministyczną
+    ochronę reszty karty robi generator (composite po masce + strefy twarde).
+    photo (opcjonalne) — oryginalne zdjęcie karty jako OSTATNI obraz
+    (prompts._FIX_PHOTO_REF: uzupełnianie uciętych elementów sceny wiernie
+    do oryginału). temperature — z suwaka „Siła poprawki"
+    (generator._FIX_TEMPERATURA)."""
+    contents: list = [prompt, card, zaznaczenie.convert("RGB")]
+    if photo is not None:
+        contents.append(photo)
+    return generate_image(contents, seed=seed, temperature=temperature)
 
 
 def edit_card_image(init: Image.Image, prompt: str,

@@ -19,8 +19,8 @@ from PyQt6.QtWidgets import (
 from app import config
 from app.core import photo_analyzer, prompts, style_store
 from app.core.exporter import ExportJob
-from app.core.models import CardSpec, GenMode, Suit
-from app.gui import card_grid
+from app.core.models import CardSpec, GenMode, Suit, wartosci_dla
+from app.gui import card_grid, deck_grid_panel
 from app.gui.animations import BusyOverlay, FadingStackedWidget
 from app.gui.auto_assign_dialog import AutoAssignDialog
 from app.gui.fix_dialog import FixRegionDialog
@@ -54,6 +54,8 @@ class MainWindow(QMainWindow):
 
         # przypisania: "kier:A" -> ścieżka zdjęcia
         self.assignments: dict[str, str] = {}
+        # ostatni folder importu przypisań z nazw plików (zapamiętany w projekcie)
+        self._import_folder: str = ""
         # kadrowanie per karta: "kier:A" -> {"zoom","dx","dy"}
         self.transforms: dict[str, dict] = {}
         # pozycja w historii wariantów per karta: "kier:A" -> index
@@ -175,6 +177,7 @@ class MainWindow(QMainWindow):
         ws.fix_requested.connect(self._on_workspace_fix)
         ws.restamp_clicked.connect(self._start_restamp)
         ws.auto_assign_clicked.connect(self._start_auto_assign)
+        ws.folder_import_clicked.connect(self._import_assignments_from_folder)
         ws.edit_mask_requested.connect(self._open_mask_editor)
         ws.cartoon_level_changed.connect(self._on_cartoon_level_changed)
         ws.mask_preset_selected.connect(self._on_mask_preset_selected)
@@ -320,10 +323,12 @@ class MainWindow(QMainWindow):
                 self._set_status(f"Talia: {len(values)} wartości × 4 kolory")
 
     def _update_badges(self) -> None:
-        # indeks 0 filtra to "Wszystkie" — badge'e kolorów zaczynają się od 1
-        for i, suit in enumerate(Suit, start=1):
+        # indeks 0 filtra to "Wszystkie" — badge'e grup zaczynają się od 1
+        # (4 kolory + wspólna pozycja Jokerów; definicja w deck_grid_panel.FILTRY)
+        for i, (_, suits, _) in enumerate(deck_grid_panel.FILTRY[1:], start=1):
             count = sum(
-                1 for slot in self.grids[suit].slots.values()
+                1 for suit in (suits or ())
+                for slot in self.grids[suit].slots.values()
                 if slot.photo_path is not None
             )
             badge = str(count) if count else ""
@@ -332,18 +337,34 @@ class MainWindow(QMainWindow):
 
     def _deck_progress(self) -> tuple[int, int, int]:
         """(gotowe, wszystkie, w toku) — karta gotowa, gdy istnieje jej wybrany
-        wariant; w toku = ma przypisane zdjęcie, ale jeszcze nie wygenerowana."""
-        values = self._values()
-        total = len(values) * len(Suit)
+        wariant; w toku = ma przypisane zdjęcie, ale jeszcze nie wygenerowana.
+        Jokery liczą się do talii tylko, gdy są wygenerowane lub mają
+        przypisane zdjęcie."""
+        total = len(self._values()) * len(Suit.kolory())
         done = pending = 0
         for suit in Suit:
-            for value in values:
-                slot = self.grids[suit].slots.get(value)
-                if self._selected_variant(suit.nazwa, value) is not None:
+            for value, slot in self.grids[suit].slots.items():
+                generated = self._selected_variant(suit.nazwa, value) is not None
+                if suit.czy_joker:
+                    if generated:
+                        total += 1
+                        done += 1
+                    elif slot.photo_path is not None:
+                        total += 1
+                        pending += 1
+                elif generated:
                     done += 1
-                elif slot is not None and slot.photo_path is not None:
+                elif slot.photo_path is not None:
                     pending += 1
         return done, total, pending
+
+    def _liczba_jokerow_wygenerowanych(self) -> int:
+        """Jokery liczą się do talii tylko, gdy istnieje wygenerowany plik."""
+        from app.core.models import JOKER_WARTOSC
+        return sum(
+            1 for s in Suit.jokery()
+            if self._selected_variant(s.nazwa, JOKER_WARTOSC) is not None
+        )
 
     def _load_generated_state(self) -> None:
         """Wczytuje z dysku stan wygenerowanych kart do slotów siatki — dzięki
@@ -365,6 +386,9 @@ class MainWindow(QMainWindow):
         self.sidebar.set_badge(2, done)       # Talie — gotowe
         self.workspace.sync_deck(self._values(), self.grids)
         self.export_view.set_ready_info(done, total)
+        # licznik kart w nagłówku Talii rośnie o wygenerowane jokery
+        self.deck.set_card_count(len(self._values()) * len(Suit.kolory())
+                                 + self._liczba_jokerow_wygenerowanych())
 
     # --------------------------------------------------------------- nowa talia
     def _new_deck(self) -> None:
@@ -426,9 +450,12 @@ class MainWindow(QMainWindow):
         self._after_assignment_change()
         self.workspace.show_card(slot)
         # natychmiast czyścimy podgląd do samego szablonu
-        self.workspace.preview.show_preview(
-            load_thumbnail(slot.suit.template_path, 900)
-        )
+        try:
+            self.workspace.preview.show_preview(
+                load_thumbnail(slot.suit.template_path, 900)
+            )
+        except FileNotFoundError:   # brak tła tego koloru (np. joker)
+            self.workspace.preview.clear_preview()
 
     def _on_grid_photo_dropped(self, key: str, path: str) -> None:
         """Upuszczenie zdjęcia na slot siatki talii Ekranu roboczego."""
@@ -654,7 +681,7 @@ class MainWindow(QMainWindow):
         """CardSpec dla KAŻDEGO istniejącego pliku karty (wszystkie warianty)."""
         targets: list[CardSpec] = []
         for suit in Suit:
-            for value in self._values():
+            for value in wartosci_dla(suit, self._values()):
                 for path in self._card_variants(suit.nazwa, value):
                     variant = 1
                     stem = path.stem
@@ -719,13 +746,14 @@ class MainWindow(QMainWindow):
         )
 
     def _lightbox_cards(self) -> list[tuple[str, str]]:
-        """Karty z wygenerowanymi plikami, wg aktywnego filtra koloru Talii."""
-        selected_suit = self.deck.current_filter()
+        """Karty z wygenerowanymi plikami, wg aktywnego filtra koloru Talii
+        (filtr to grupa suitów — pozycja „Jokery" obejmuje oba jokery)."""
+        selected = self.deck.current_filter()
         cards: list[tuple[str, str]] = []
         for suit in Suit:
-            if selected_suit is not None and suit is not selected_suit:
+            if selected is not None and suit not in selected:
                 continue
-            for value in self._values():
+            for value in wartosci_dla(suit, self._values()):
                 if self._card_variants(suit.nazwa, value):
                     cards.append((suit.nazwa, value))
         return cards
@@ -834,9 +862,18 @@ class MainWindow(QMainWindow):
                 variant = int(p.stem.rsplit("_v", 1)[1])
             except ValueError:
                 pass
+        # zdjęcie przypisane karcie → referencja poprawki (model uzupełnia
+        # ucięte elementy sceny wiernie do oryginału)
+        foto = self.assignments.get(f"{suit_nazwa}:{value}")
         spec = CardSpec(value=value, suit=Suit.from_nazwa(suit_nazwa),
-                        variant=variant)
-        dialog = FixRegionDialog(p, spec.label,
+                        variant=variant,
+                        photo_path=(Path(foto) if foto
+                                    and Path(foto).exists() else None))
+        # WYSIWYG: maluje się po BAZIE poprawki (raw bez narożników — model
+        # nie widzi znaków narożnych, te stempluje preset po poprawce)
+        baza = spec.raw_path if spec.raw_path.exists() else p
+        dialog = FixRegionDialog(baza, spec.label,
+                                 template_path=spec.suit.template_path,
                                  parent=self._lightbox or self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -932,6 +969,63 @@ class MainWindow(QMainWindow):
         self._auto_dialog = dialog
         dialog.exec()
         self._auto_dialog = None
+
+    # ---------------------------------------------- import przypisań z folderu
+    def _import_assignments_from_folder(self) -> None:
+        """Przycisk „Przypisz z folderu" — przypisania z NAZW PLIKÓW
+        (`Kier_A.jpg`, `Trefl_10 opis.jpg`, `Joker_czerwony.jpg`), bez API.
+        Podsumowanie przed zastosowaniem; masowy wpis wzorem
+        _apply_auto_assign (jedno _after_assignment_change na końcu)."""
+        start = self._import_folder
+        if not start or not Path(start).is_dir():
+            domyslny = config.ROOT / "Przypisane"
+            start = str(domyslny if domyslny.is_dir() else config.ROOT)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder ze zdjęciami nazwanymi <Kolor>_<Wartość>", start
+        )
+        if not folder:
+            return
+        wynik = photo_analyzer.przypisania_z_folderu(Path(folder),
+                                                     self._values())
+        if not wynik.przypisania:
+            show_toast(self, "Żaden plik w tym folderze nie pasuje do "
+                       "konwencji <Kolor>_<Wartość> (np. Kier_A.jpg)", "error")
+            return
+        nadpisze = sum(1 for k in wynik.przypisania if k in self.assignments)
+        tekst = (f"Dopasowano {len(wynik.przypisania)} plików do kart"
+                 + (f" (nadpisze {nadpisze} istniejących przypisań)"
+                    if nadpisze else "") + ".")
+        if wynik.pominiete:
+            lista = "\n".join(f"• {nazwa} — {powod}"
+                              for nazwa, powod in wynik.pominiete[:12])
+            if len(wynik.pominiete) > 12:
+                lista += f"\n… i {len(wynik.pominiete) - 12} więcej"
+            tekst += f"\n\nPominięte pliki:\n{lista}"
+        tekst += "\n\nZastosować przypisania?"
+        answer = QMessageBox.question(
+            self, "Przypisz z folderu", tekst,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        zastosowane = 0
+        for klucz, sciezka in wynik.przypisania.items():
+            suit_nazwa, value = klucz.split(":", 1)
+            try:
+                suit = Suit.from_nazwa(suit_nazwa)
+            except ValueError:
+                continue
+            slot = self.grids[suit].slots.get(value)
+            if slot is None:   # wartość spoza aktualnej talii
+                continue
+            self.assignments[klucz] = sciezka
+            self.transforms.pop(klucz, None)  # stary kadr ≠ nowe zdjęcie
+            slot.set_photo(Path(sciezka))
+            zastosowane += 1
+        self._import_folder = folder
+        self._after_assignment_change()
+        show_toast(self, f"Przypisano z folderu: {zastosowane} kart", "ok")
 
     # ---------------------------------------------- edytor maski pop-out
     def _open_mask_editor(self, suit_nazwa: str, wartosc: str = "") -> None:
@@ -1089,13 +1183,14 @@ class MainWindow(QMainWindow):
 
     def _rebuild_grids(self, values: list[str]) -> None:
         self._deck_values = list(values)
-        for suit, grid in self.grids.items():
-            grid.rebuild(values, self.assignments)
+        # panele same stosują wartosci_dla (jokery = 1 slot JOKER na kolor);
         # druga instancja siatki na Ekranie roboczym — te same wartości
         # i przypisania; stan generacji dosypie sync_deck w _refresh_overview
+        self.deck.grid_panel.rebuild(values, self.assignments)
         self.workspace.deck_panel.rebuild(values, self.assignments)
         self.workspace.set_available_values(values)
-        self.deck.set_card_count(len(values) * len(Suit))
+        self.deck.set_card_count(len(values) * len(Suit.kolory())
+                                 + self._liczba_jokerow_wygenerowanych())
         self._update_badges()
         self._refresh_overview()
         self._refresh_estimate()
@@ -1481,8 +1576,9 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------- komplet wyglądu talii (4 tła)
     def _start_front_set(self, opts: dict) -> None:
-        """Komplet 4 teł jednym stylem (+ opcjonalnie rewers) — spójny zestaw:
-        pierwsze tło kotwiczy pozostałe kolory (referencja + wspólny seed)."""
+        """Komplet 4 teł jednym stylem (+ opcjonalnie tła Jokerów i rewers) —
+        spójny zestaw: pierwsze tło kotwiczy pozostałe kolory (referencja +
+        wspólny seed)."""
         if self.template_worker is not None or self.back_worker is not None:
             return
         if not self._guard_api_ready():
@@ -1505,9 +1601,13 @@ class MainWindow(QMainWindow):
         self._gen_cancelled = False
         self.back_view.set_front_busy(True)
         self.cancel_btn.setVisible(True)
-        total = len(Suit) + (1 if back_prompt else 0)
+        suits = list(Suit.kolory())
+        if opts.get("include_jokers"):
+            suits += Suit.jokery()
+        total = len(suits) + (1 if back_prompt else 0)
         self._set_status(f"Komplet wyglądu talii: 0 / {total}…")
-        worker = TemplateSetWorker(back_prompt=back_prompt,
+        worker = TemplateSetWorker(suits=suits,
+                                   back_prompt=back_prompt,
                                    back_source=back_source,
                                    back_orientation=orientation)
         worker.variant_done.connect(self._on_set_variant_done)
@@ -1744,12 +1844,18 @@ class MainWindow(QMainWindow):
     }
 
     def _deck_fronts(self) -> list[tuple[str, Path | None]]:
+        from app.core.models import JOKER_WARTOSC
         fronts: list[tuple[str, Path | None]] = []
-        for suit in Suit:
+        for suit in Suit.kolory():
             for value in self._values():
                 name = f"{value}_{suit.nazwa}"
                 # eksport bierze WYBRANY wariant (nazwa logiczna karty bez zmian)
                 fronts.append((name, self._selected_variant(suit.nazwa, value)))
+        # jokery na końcu i TYLKO wygenerowane — bez pliku nie ma ich w talii
+        for suit in Suit.jokery():
+            sel = self._selected_variant(suit.nazwa, JOKER_WARTOSC)
+            if sel is not None:
+                fronts.append((f"{JOKER_WARTOSC}_{suit.nazwa}", sel))
         return fronts
 
     def _start_export(self, kind: str) -> None:
@@ -1846,6 +1952,7 @@ class MainWindow(QMainWindow):
             "back": self.back_view.settings(),
             "export": self.export_view.settings(),
             "auto_przydzial": {"motywy": self.auto_motywy},
+            "import_folder": self._import_folder,
         }
         config.PROJEKT_JSON.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -1891,6 +1998,8 @@ class MainWindow(QMainWindow):
         if data.get("card_preset") in config.CARD_PRESETS:
             config.set_card_preset(data["card_preset"])
             self.settings_view.sync_styles()
+        if isinstance(data.get("import_folder"), str):
+            self._import_folder = data["import_folder"]
         auto = data.get("auto_przydzial")
         if isinstance(auto, dict) and isinstance(auto.get("motywy"), dict):
             for kolor in photo_analyzer.DOMYSLNE_MOTYWY:

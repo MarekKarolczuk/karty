@@ -115,12 +115,16 @@ def styl_z_presetu() -> StylNaroznika:
 
 def _corner_tile(box: tuple[int, int, int, int], spec: CardSpec,
                  styl: StylNaroznika) -> Image.Image:
-    """Tarcza narożna: wartość i pod nią symbol koloru, w pionie."""
+    """Tarcza narożna: wartość i pod nią symbol koloru, w pionie.
+    Joker: litery J-O-K-E-R jedna pod drugą, bez symbolu."""
     w, h = box[2] - box[0], box[3] - box[1]
     tile = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(tile)
     color = styl.kolor_czerwony if spec.suit.is_red else styl.kolor_czarny
     font_path = styl.czcionka or config.find_serif_font()
+
+    if spec.suit.czy_joker:
+        return _corner_tile_joker(tile, draw, spec, styl, color, font_path, w, h)
 
     value_font = _fit_text_size(spec.value, font_path,
                                 int(h * styl.rozmiar_wartosci / 100), int(w * 0.82))
@@ -146,6 +150,33 @@ def _corner_tile(box: tuple[int, int, int, int], spec: CardSpec,
               anchor="mm", stroke_width=stroke_w, stroke_fill=stroke_fill)
     draw.text((cx, symbol_y), spec.suit.symbol, font=symbol_font, fill=color,
               anchor="mm", stroke_width=stroke_w, stroke_fill=stroke_fill)
+    return tile
+
+
+def _corner_tile_joker(tile: Image.Image, draw: ImageDraw.ImageDraw,
+                       spec: CardSpec, styl: StylNaroznika, color: str,
+                       font_path, w: int, h: int) -> Image.Image:
+    """Pionowy napis J-O-K-E-R w tarczy: litery rozłożone równomiernie
+    w pasie 12–88% wysokości, rozmiar ograniczony krokiem między literami
+    (5 liter zawsze się mieści niezależnie od presetu)."""
+    litery = list(spec.value)
+    y0, y1 = h * 0.12, h * 0.88
+    krok = (y1 - y0) / max(1, len(litery) - 1)
+    size = min(int(h * styl.rozmiar_wartosci / 100), int(krok * 0.95))
+    font = _fit_text_size("W", font_path, max(10, size), int(w * 0.82))
+
+    cx = w / 2 + w * styl.offset_x / 100
+    stroke_w = round(h * styl.obwodka_grubosc / 100)
+    stroke_fill = styl.obwodka_kolor or config.CREAM_HEX
+    for i, litera in enumerate(litery):
+        y = y0 + i * krok + h * styl.offset_y / 100
+        if styl.cien_przesuniecie > 0:
+            off = h * styl.cien_przesuniecie / 100
+            shadow = _rgba(styl.cien_kolor or "#000000", 110)
+            draw.text((cx + off, y + off), litera, font=font,
+                      fill=shadow, anchor="mm")
+        draw.text((cx, y), litera, font=font, fill=color, anchor="mm",
+                  stroke_width=stroke_w, stroke_fill=stroke_fill)
     return tile
 
 
@@ -200,6 +231,32 @@ def wypelnij_okno(template: Image.Image, suit: Suit) -> Image.Image:
         center_full = center_full.resize(template.size,
                                          Image.Resampling.BILINEAR)
     return Image.composite(fill, template, center_full)
+
+
+# Kolor adnotacji regionu poprawki — magenta nie występuje w palecie talii,
+# więc model jednoznacznie widzi zaznaczenie (prompt zakazuje malowania nim)
+_ZAZNACZENIE_KOLOR = (255, 0, 204)
+_ZAZNACZENIE_ALFA = 115   # ~45% — treść pod tintem pozostaje czytelna
+
+
+def zaznacz_region_poprawki(crop: Image.Image,
+                            maska: Image.Image) -> Image.Image:
+    """Crop z regionem poprawki ZAZNACZONYM wizualnie (półprzezroczysty
+    magenta tint + kontur) — drugi obraz dla gemini_client.edit_region
+    i podgląd „co zobaczy model" w FixRegionDialog (jedno źródło = podgląd
+    identyczny z rzeczywistością). maska — L, biały = region poprawki,
+    rozmiar cropa."""
+    import numpy as np
+    import cv2
+    tint = Image.new("RGB", crop.size, _ZAZNACZENIE_KOLOR)
+    alfa = maska.point(lambda v: _ZAZNACZENIE_ALFA if v > 0 else 0)
+    zaznaczony = Image.composite(tint, crop, alfa)
+    # gruby kontur maski — twarda granica regionu widoczna mimo tintu
+    m = np.asarray(maska, np.uint8)
+    kontur = cv2.morphologyEx(np.where(m > 0, 255, 0).astype(np.uint8),
+                              cv2.MORPH_GRADIENT, np.ones((5, 5), np.uint8))
+    return Image.composite(tint, zaznaczony,
+                           Image.fromarray(kontur).convert("L"))
 
 
 def wyczysc_tarcze(img: Image.Image, template: Image.Image,

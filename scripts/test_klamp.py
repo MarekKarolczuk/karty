@@ -11,6 +11,7 @@ UWAGA: szablon i kolory brane są z AKTYWNYCH presetów — jeśli preset teł l
 „wartosci" zmienił się od wygenerowania karty, maska nie odda stanu z generacji.
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -31,14 +32,14 @@ out_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _kolor_z_nazwy(path: Path) -> Suit | None:
-    """Kolor karty ze stemu pliku (wzorzec CardSpec.raw_name: K_kier_v2)."""
-    czesci = path.stem.split("_")
-    if len(czesci) < 2:
-        return None
-    try:
-        return Suit.from_nazwa(czesci[1])
-    except ValueError:
-        return None
+    """Kolor karty ze stemu pliku (wzorzec CardSpec.raw_name: K_kier_v2) —
+    dopasowanie sufiksem, bo nazwy jokerów zawierają podkreślnik
+    (JOKER_joker_czerwony_v2)."""
+    base = re.sub(r"_v\d+$", "", path.stem)
+    for suit in Suit:
+        if base.endswith(f"_{suit.nazwa}"):
+            return suit
+    return None
 
 
 pliki = ([Path(p) for p in sys.argv[1:]] if len(sys.argv) > 1

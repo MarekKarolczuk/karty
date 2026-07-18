@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 from app.core import style_store
 from app.core.compositor import DEFAULT_TRANSFORM
 from app.core.masks import get_masks, mask_presets
-from app.core.models import Suit
+from app.core.models import JOKER_WARTOSC, Suit
 from app.gui import theme
 from app.gui.card_grid import CardGrid, CardSlot
 from app.gui.deck_grid_panel import DeckGridPanel
@@ -34,6 +34,7 @@ CARD_NAMES = {
     "A": "As", "K": "Król", "Q": "Dama", "J": "Walet",
     "10": "Dziesiątka", "9": "Dziewiątka", "8": "Ósemka", "7": "Siódemka",
     "6": "Szóstka", "5": "Piątka", "4": "Czwórka", "3": "Trójka", "2": "Dwójka",
+    "JOKER": "Joker",
 }
 
 STATUS_STYLES = {
@@ -111,6 +112,7 @@ class WorkspaceView(QWidget):
     fix_requested = pyqtSignal(str, str)              # popraw selektywnie POKAZYWANY wariant
     restamp_clicked = pyqtSignal()                    # przestempluj narożniki (bez API)
     auto_assign_clicked = pyqtSignal()                # auto-przydział zdjęć AI
+    folder_import_clicked = pyqtSignal()              # przypisania z nazw plików folderu
     edit_mask_requested = pyqtSignal(str, str)        # suit_nazwa, wartość → maska TEJ karty
     cartoon_level_changed = pyqtSignal(int)           # poziom kreskówki 1-5 → preset postaci
     mask_preset_selected = pyqtSignal(str)            # wybór aktywnego presetu maski ("" = auto)
@@ -165,6 +167,18 @@ class WorkspaceView(QWidget):
             lambda: self.edit_mask_requested.emit(
                 self._current_suit.nazwa, self._current_value))
         top.addWidget(self.edit_mask_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.folder_import_btn = QPushButton("📁  Przypisz z folderu")
+        self.folder_import_btn.setObjectName("ghostBtn")
+        self.folder_import_btn.setToolTip(
+            "Przypisuje zdjęcia do kart z NAZW PLIKÓW wybranego folderu — "
+            "bez API.\nKonwencja: Kier_A.jpg, Trefl_10.jpg (dopisek po spacji "
+            "dozwolony),\nJoker_czerwony.jpg / Joker_czarny.jpg; dama jako D "
+            "lub Q, walet jako W lub J."
+        )
+        self.folder_import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.folder_import_btn.clicked.connect(self.folder_import_clicked.emit)
+        top.addWidget(self.folder_import_btn,
+                      alignment=Qt.AlignmentFlag.AlignBottom)
         self.auto_assign_btn = QPushButton("🪄  Auto-przydział AI")
         self.auto_assign_btn.setObjectName("ghostBtn")
         self.auto_assign_btn.setToolTip(
@@ -363,13 +377,15 @@ class WorkspaceView(QWidget):
         suit_grid.setSpacing(6)
         self._suit_buttons: dict[Suit, QPushButton] = {}
         for i, suit in enumerate(Suit):
-            btn = QPushButton(f"{suit.symbol}  {suit.nazwa.capitalize()}")
+            btn = QPushButton(f"{suit.symbol}  {suit.etykieta}")
             btn.setObjectName("suitPickBtn")
             btn.setProperty("red", suit.is_red)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # joker ma jedyną „wartość" JOKER — klik z bieżącą wartością talii
+            # (np. "A") trafiałby w nieistniejący slot
             btn.clicked.connect(lambda _=False, s=suit: self.card_picked.emit(
-                s.nazwa, self._current_value
+                s.nazwa, JOKER_WARTOSC if s.czy_joker else self._current_value
             ))
             suit_grid.addWidget(btn, i // 2, i % 2)
             self._suit_buttons[suit] = btn
@@ -665,8 +681,12 @@ class WorkspaceView(QWidget):
         color = theme.ACCENT_HOVER if slot.suit.is_red else theme.CREAM
         self.value_badge.setText(f"{slot.value}{slot.suit.symbol}")
         self.value_badge.setStyleSheet(f"color: {color};")
-        name = CARD_NAMES.get(slot.value, slot.value)
-        self.card_name.setText(f"{name} {slot.suit.nazwa.capitalize()}")
+        if slot.suit.czy_joker:
+            # „Joker czerwony" zamiast „Joker Joker_czerwony"
+            self.card_name.setText(slot.suit.etykieta)
+        else:
+            name = CARD_NAMES.get(slot.value, slot.value)
+            self.card_name.setText(f"{name} {slot.suit.nazwa.capitalize()}")
         self.card_filename.setText(
             (slot.generated_path or slot.photo_path).name
             if (slot.generated_path or slot.photo_path) else "brak przypisanego zdjęcia"

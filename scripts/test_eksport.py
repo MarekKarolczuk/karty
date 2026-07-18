@@ -52,6 +52,14 @@ def main() -> int:
                 _make_fake_card(fake, "#F5EFE0" if i % 2 else "#801515")
                 fronts.append((name, fake))
             i += 1
+    # jokery: zawsze na końcu listy frontów (jak main_window._deck_fronts),
+    # w odróżnialnym kolorze — test pól 52-53 atlasu
+    joker_color = "#156080"
+    for suit in ("joker_czerwony", "joker_czarny"):
+        name = f"JOKER_{suit}"
+        fake = fake_dir / f"{name}.jpg"
+        _make_fake_card(fake, joker_color)
+        fronts.append((name, fake))
     back = tmp / "rewers.png"
     Image.new("RGB", (744, 1039), "#3A0A0A").save(back)
     present = sum(1 for _n, p in fronts if p is not None)
@@ -107,9 +115,17 @@ def main() -> int:
                             10 * CELL[0], 7 * CELL[1]))
     back_color = (0x3A, 0x0A, 0x0A)
     center = last_cell.getpixel((CELL[0] // 2, CELL[1] // 2))
-    ok = atlas.size == expected_size and center == back_color
+    # jokery (fronty 52-53) trafiają do pól 52-53 (wiersz 5, kolumny 2-3);
+    # tolerancja na stratną kompresję JPEG sztucznej karty
+    joker_rgb = (0x15, 0x60, 0x80)
+    joker_cell = atlas.crop((2 * CELL[0], 5 * CELL[1],
+                             3 * CELL[0], 6 * CELL[1]))
+    joker_center = joker_cell.getpixel((CELL[0] // 2, CELL[1] // 2))
+    joker_ok = all(abs(a - b) <= 6 for a, b in zip(joker_center, joker_rgb))
+    ok = atlas.size == expected_size and center == back_color and joker_ok
     print(f"Atlas: {atlas.size} (oczekiwane {expected_size}), "
-          f"pole 69 środek={center} (rewers {back_color}) -> "
+          f"pole 69 środek={center} (rewers {back_color}), "
+          f"pole 52 środek={joker_center} (joker {joker_rgb}) -> "
           f"{'OK' if ok else 'BLAD'}")
     failures += 0 if ok else 1
 

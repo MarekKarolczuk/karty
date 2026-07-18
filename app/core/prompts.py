@@ -106,57 +106,108 @@ def face_fidelity_clause() -> str:
 
 
 # Klauzula siły poprawki (suwak „Siła poprawki" 1-5 w FixRegionDialog):
-# 1-2 = zachowawczy retusz (zmień jak najmniej), 3 = brak klauzuli (status
-# quo), 4-5 = wolna ręka w masce. Uzupełnia temperaturę wywołania
-# (generator._FIX_TEMPERATURA) — prompt jest pewniejszą dźwignią.
+# 1-2 = zachowawczy retusz (zmień jak najmniej), 3 = zbalansowana, 4-5 =
+# wolna ręka. Główną dźwignią siły jest OBRAZ wejściowy — przy 4/5 generator
+# rozmywa/wymazuje region w cropie (generator._przygotuj_region_poprawki),
+# więc klauzule 4-5 opisują region do namalowania na nowo i TWARDO żądają
+# wyraźnie widocznej zmiany (echo modelu = zła odpowiedź); temperaturę
+# dokręca generator._FIX_TEMPERATURA.
 _FIX_SILA = {
     1: """\
-CHANGE STRENGTH: minimal touch-up — change as FEW pixels as possible inside
-the masked region; preserve the existing composition, lines, colors and
-shapes, and only fix the exact defect described above.""",
+CHANGE STRENGTH 1/5: minimal touch-up — change as FEW pixels as possible
+inside the highlighted region; preserve the existing composition, lines,
+colors and shapes, and only fix the exact defect described above.""",
     2: """\
-CHANGE STRENGTH: conservative — keep the existing composition and colors of
-the masked region; adjust only what is necessary to fix the defect described
-above.""",
+CHANGE STRENGTH 2/5: conservative — keep the existing composition and colors
+of the highlighted region; adjust only what is necessary to fix the defect
+described above.""",
+    3: """\
+CHANGE STRENGTH 3/5: balanced — apply the instruction fully; you may adjust
+shapes, shading and details inside the highlighted region where needed, but
+keep its overall composition recognizable. Returning the region unchanged is
+a WRONG answer.""",
     4: """\
-CHANGE STRENGTH: strong — you may noticeably rework the masked region
-(shapes, shading, details) as long as it satisfies the instruction and stays
-consistent with the surrounding artwork.""",
+CHANGE STRENGTH 4/5: strong — the highlighted region has been heavily
+BLURRED in image (1); repaint it with full, sharp detail according to the
+instruction. The rough shapes and colors underneath are only a loose guide —
+you decide the details. Your output MUST look clearly different inside the
+region; a timid, barely-visible change is a WRONG answer.""",
     5: """\
-CHANGE STRENGTH: free repaint — you may repaint the masked region from
-scratch to best satisfy the instruction, keeping only the style, palette and
-line weight of the surrounding artwork.""",
+CHANGE STRENGTH 5/5: free repaint — the highlighted region has been ERASED
+from image (1) (filled with blurred surroundings); paint it completely from
+scratch according to the instruction, keeping only the style, palette and
+line weight of the surrounding artwork. Leaving the region blurry or empty
+is a WRONG answer — it must contain new, fully detailed artwork.""",
 }
 
 
-def fix_region_prompt(user_prompt: str, sila: int = 3) -> str:
+# Zakaz tekstu dla POPRAWKI — łagodniejszy niż NO_TEXT_SUFFIX: pełny zakaz
+# blokował naprawę treści sceny zawierającej napisy (np. ucięty znak drogowy
+# z nazwą miejscowości — model dostawał sprzeczne polecenia i nie robił nic).
+# Wartości/indeksy narożne i tak stempluje deterministycznie compositor.
+FIX_NO_TEXT = """\
+TEXT RULES: never add card values, corner indices, letters or numbers in the
+card corners, watermarks or signatures. Text that is PART OF THE ILLUSTRATED
+SCENE (e.g. lettering on a road sign, a shop sign, a book cover) IS allowed
+when the instruction asks for it — render it clearly and legibly, matching
+the reference photo if one is provided."""
+
+
+_FIX_PHOTO_REF = """\
+PHOTO REFERENCE: the LAST attached image is the ORIGINAL photo the card
+illustration was drawn from. When completing cut-off, missing or badly drawn
+elements in the highlighted region (signs and their lettering, props, people,
+clothing), match their real appearance in this photo — same shapes, colors,
+text content and details, translated into the artwork's illustration style."""
+
+
+def fix_region_prompt(user_prompt: str, sila: int = 3,
+                      z_foto: bool = False) -> str:
     """Prompt korekcyjnego inpaintingu (lightbox → „Popraw selektywnie"):
-    model dostaje kartę + maskę (drugi obraz, biały obszar = region do
-    przerysowania) i instrukcję użytkownika DOSŁOWNIE; sila (1-5) dokleja
-    klauzulę zachowawczości/swobody zmian. Twardą gwarancję nienaruszalności
-    reszty karty daje generator (composite po masce + klamp), prompt jest
-    tylko wsparciem."""
+    model dostaje WYCINEK karty (crop wokół maski, patrz generator) + TEN SAM
+    wycinek z regionem poprawki zaznaczonym MAGENTĄ (adnotacja wizualna —
+    czytelniejsza dla Gemini niż osobna czarno-biała maska) i instrukcję
+    użytkownika DOSŁOWNIE; sila (1-5) dokleja klauzulę zachowawczości/swobody
+    zmian; z_foto=True dodaje klauzulę zdjęcia referencyjnego (trzeci obraz —
+    uzupełnianie uciętych elementów sceny wiernie do oryginału). Wzorcem
+    stylu jest OTOCZENIE regionu w cropie, a technika podąża za poziomem
+    kreskówki (jak style_lock). Tekst SCENY jest dozwolony (FIX_NO_TEXT —
+    pełny NO_TEXT_SUFFIX blokował naprawę napisów na znakach). Twardą
+    gwarancję nienaruszalności reszty karty daje generator (composite po
+    masce + strefy twarde), prompt jest tylko wsparciem."""
+    if style_store.cartoon_level() >= 5:
+        technika = ("precise, multi-color vector-style illustration, "
+                    "cell-shaded")
+    else:
+        technika = ("the same rendering technique as the surrounding "
+                    "artwork (follow the STYLIZATION LEVEL instructions)")
     sila_clause = _FIX_SILA.get(sila, "")
+    foto_clause = f"\n{_FIX_PHOTO_REF}\n" if z_foto else ""
     return f"""\
-You are given TWO images: (1) a playing-card illustration, (2) a MASK — the
-WHITE area of the mask marks the ONLY region of the card you may repaint.
-Redraw the card with the masked region corrected.
+You are given TWO images: (1) a CROPPED FRAGMENT of a playing-card
+illustration — this is the image you must edit; (2) the SAME fragment with
+the region to repaint highlighted in MAGENTA (pink tint + outline). The
+magenta highlight is only an ANNOTATION showing WHERE to work — it does not
+exist in the artwork and you must NEVER paint magenta or pink tint in your
+output.
 
-Required style: precise, multi-color vector-style illustration, cell-shaded,
-consistent with the rest of the card.
-{style_lock()}
-
-Modification instruction for the masked region:
+Your task: output image (1) with the highlighted region REPAINTED according
+to this instruction:
 {user_prompt.strip()}
 
 {sila_clause}
+{foto_clause}
+STYLE MATCHING (hard constraint): the pixels SURROUNDING the highlighted
+region are your style reference — match them EXACTLY: same rendering
+technique, palette, line weight, level of detail and lighting, so the
+repainted region blends in seamlessly. Required style: {technika}.
+{cartoon_level_clause()}
+{style_lock()}
 
-IMPORTANT: Focus exclusively on repairing the masked region according to the
-instruction, blending seamlessly with the style, palette, lighting and line
-weight of the surrounding artwork. Everything OUTSIDE the white mask area must
-remain pixel-identical to the first image.
+Keep everything outside the highlighted region as close to image (1) as
+possible.
 
-{NO_TEXT_SUFFIX}"""
+{FIX_NO_TEXT}"""
 
 
 # Poziom przeróbki zdjęcia na kreskówkę (suwak na Ekranie roboczym, pole
@@ -396,6 +447,9 @@ SUIT_NAME_EN = {
     "karo": "diamond",
     "pik": "spade",
     "trefl": "club",
+    # Jokery: okno symbolu ma kształt pięcioramiennej gwiazdy (czerwona/czarna)
+    "joker_czerwony": "five-pointed star",
+    "joker_czarny": "five-pointed star",
 }
 
 

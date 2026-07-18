@@ -228,28 +228,90 @@ def nastepny_wariant(spec: CardSpec) -> int:
 
 # Temperatura wywołania edit_region wg suwaka „Siła poprawki" (1-5);
 # 3 celowo poza mapą → None → domyślne config.GEN_TEMPERATURE (status quo).
-# Uzupełnia klauzulę promptu prompts._FIX_SILA — prompt jest pewniejszą
-# dźwignią, temperatura tylko dokręca zachowawczość/swobodę.
-_FIX_TEMPERATURA = {1: 0.15, 2: 0.25, 4: 0.6, 5: 0.95}
+# Główną dźwignią siły jest obraz wejściowy (region rozmyty przy 4,
+# wymazany przy 5 — patrz _przygotuj_region_poprawki) + klauzula promptu
+# prompts._FIX_SILA; temperatura tylko dokręca zachowawczość/swobodę.
+_FIX_TEMPERATURA = {1: 0.1, 2: 0.3, 4: 0.85, 5: 1.2}
+
+# Próg średniej różnicy (RGB) wynik vs wejście W regionie poprawki, poniżej
+# którego uznajemy, że model ODBIŁ wejście (echo — „nie widać różnicy");
+# wtedy jedna ponowna próba z innym seedem i temperaturą +_FIX_ECHO_TEMP_BUMP.
+_FIX_ECHO_PROG = 2.0
+_FIX_ECHO_TEMP_BUMP = 0.3
+
+
+def _echo_modelu(wynik: Image.Image, wejscie: Image.Image,
+                 maska: Image.Image) -> bool:
+    """True, gdy odpowiedź modelu jest praktycznie identyczna z wejściem
+    w obrębie regionu poprawki (Gemini bywa zachowawczy i echo-uje obraz)."""
+    if wynik.size != wejscie.size:
+        return False
+    diff = np.abs(np.asarray(wynik.convert("RGB"), np.int16)
+                  - np.asarray(wejscie.convert("RGB"), np.int16)).mean(axis=2)
+    m = np.asarray(maska) > 0
+    return bool(m.any()) and float(diff[m].mean()) < _FIX_ECHO_PROG
+
+# Crop poprawki: margines kontekstu wokół bboxa maski (ułamek większego boku
+# bboxa, min. w px szablonu) — otoczenie w cropie jest dla modelu wzorcem
+# stylu; dłuższy bok cropa skalowany (też W GÓRĘ) do _FIX_CROP_SIDE, żeby
+# mały region dostał pełną rozdzielczość modelu zamiast ułamka całej karty.
+_FIX_MARGINES_FRAC = 0.4
+_FIX_MARGINES_MIN_PX = 180
+_FIX_CROP_SIDE = 1280
+
+
+def _bbox_poprawki(maska_img: Image.Image) -> tuple[int, int, int, int]:
+    """Bbox maski poprawki rozszerzony o margines kontekstu i przycięty do
+    granic karty — obszar wycinka wysyłanego do modelu."""
+    x0, y0, x1, y1 = maska_img.getbbox()
+    margines = max(_FIX_MARGINES_MIN_PX,
+                   round(max(x1 - x0, y1 - y0) * _FIX_MARGINES_FRAC))
+    return (max(0, x0 - margines), max(0, y0 - margines),
+            min(maska_img.width, x1 + margines),
+            min(maska_img.height, y1 + margines))
+
+
+def _przygotuj_region_poprawki(crop: Image.Image, maska: Image.Image,
+                               sila: int) -> Image.Image:
+    """Obraz wejściowy dla modelu wg siły poprawki — deterministyczna
+    dźwignia suwaka: 1-3 = oryginalna treść regionu (retusz), 4 = region
+    mocno ROZMYTY (struktura zostaje, detale model maluje od nowa),
+    5 = region WYMAZANY rozmytym otoczeniem (malowanie od zera)."""
+    if sila < 4:
+        return crop
+    promien = max(crop.size) // (24 if sila == 4 else 8)
+    rozmyty = crop.filter(ImageFilter.GaussianBlur(promien))
+    miekka = maska.filter(ImageFilter.GaussianBlur(6))
+    return Image.composite(rozmyty, crop, miekka)
 
 
 def popraw_region(spec: CardSpec, maska: np.ndarray, user_prompt: str,
                   tryb: str = "ai", sila: int = 3) -> Path:
     """Selektywna poprawa istniejącego wariantu karty (lightbox → „Popraw
     selektywnie"): w trybie "ai" model przerysowuje TYLKO obszar zamalowany
-    pędzlem przez użytkownika wg jego promptu (sila 1-5 = jak mocno wolno mu
-    zmieniać istniejącą treść: klauzula promptu + temperatura wywołania);
-    w trybie "szablon" zamalowany obszar wraca piksel-w-piksel do tła
+    pędzlem przez użytkownika wg jego promptu — do modelu idzie WYCINEK
+    karty (bbox maski + margines kontekstu, przeskalowany do _FIX_CROP_SIDE)
+    plus ten sam wycinek z regionem ZAZNACZONYM magentą (adnotacja wizualna,
+    czytelniejsza dla Gemini niż czarno-biała maska); sila 1-5 = jak mocno
+    wolno mu zmieniać istniejącą treść (1-3 retusz oryginału, 4 region
+    rozmyty, 5 region wymazany — patrz _przygotuj_region_poprawki; plus
+    klauzula promptu + temperatura), a echo modelu (odbite wejście) wykrywa
+    _echo_modelu i ponawia wywołanie raz z innym seedem/temperaturą.
+    W trybie "szablon" zamalowany obszar wraca piksel-w-piksel do tła
     z szablonu (deterministycznie, ZERO API — np. krzywe linie ramki,
-    przestylizowany ornament, których klamp celowo nie cofa). Wynik zapisuje
-    się jako NOWY wariant (oryginał zostaje w historii — akceptacja przez
+    zniekształcony symbol, przestylizowany ornament). Wynik zapisuje się
+    jako NOWY wariant (oryginał zostaje w historii — akceptacja przez
     „Ustaw jako główną").
 
     Baza = surowy PNG z output/_raw/ (bez narożników — model nie halucynuje
     liter; narożniki stempluje potem compositor). Nienaruszalność reszty
     karty jest DETERMINISTYCZNA: composite ogranicza zmianę do maski
-    użytkownika (feather = płynne złącze), a pełny klamp adaptacyjny
-    przywraca bordiurę, tarcze i tło z szablonu."""
+    użytkownika (feather = płynne złącze), a w obrębie maski z szablonu
+    wracają tylko strefy TWARDE (bordiura + tarcze narożne,
+    masks.strefy_chronione_poprawki). Poprawka celowo NIE przechodzi przez
+    pełny _klamp_do_szablonu — baza wariantu już go przeszła, a strefa
+    allowed klampu nie zna maski poprawki i wymazywała zmiany AI poza
+    ringiem okna symbolu („nie widać różnicy" niezależnie od siły)."""
     normalizuj_szablon(spec.suit.template_path)
     template = Image.open(spec.suit.template_path).convert("RGB")
     if spec.raw_path.exists():
@@ -274,25 +336,69 @@ def popraw_region(spec: CardSpec, maska: np.ndarray, user_prompt: str,
     if tryb == "szablon":
         # przywrócenie tła: deterministycznie, bez API (działa też
         # przy KARTY_FAKE_API)
-        wynik = template
-    elif _fake_api():
-        time.sleep(1.0)
-        wynik = ImageOps.posterize(baza, 3)   # udawana poprawka
+        zlacze = maska_img.filter(ImageFilter.GaussianBlur(4))
+        polaczony = Image.composite(template, baza, zlacze)
     else:
-        maly = baza.copy()
-        maly.thumbnail((MAX_API_SIDE, MAX_API_SIDE), Image.Resampling.LANCZOS)
-        maska_mala = maska_img.resize(maly.size, Image.Resampling.NEAREST)
-        wynik = gemini_client.edit_region(
-            maly, maska_mala, prompts.fix_region_prompt(user_prompt, sila),
-            seed=config.GEN_SEED + nowy.variant,
-            temperature=_FIX_TEMPERATURA.get(sila))
-    if wynik.size != baza.size:
-        wynik = wynik.resize(baza.size, Image.Resampling.LANCZOS)
+        # inpainting na WYCINKU karty zamiast całej: region dostaje pełną
+        # rozdzielczość modelu, a wklejka wraca dokładnie w miejsce cropa
+        box = _bbox_poprawki(maska_img)
+        crop = baza.crop(box)
+        maska_crop = maska_img.crop(box)
+        wejscie = _przygotuj_region_poprawki(crop, maska_crop, sila)
+        skala = _FIX_CROP_SIDE / max(crop.size)
+        rozmiar_api = (max(1, round(crop.width * skala)),
+                       max(1, round(crop.height * skala)))
+        maly = wejscie.resize(rozmiar_api, Image.Resampling.LANCZOS)
+        maska_mala = maska_crop.resize(rozmiar_api, Image.Resampling.NEAREST)
+        zaznaczony = compositor.zaznacz_region_poprawki(maly, maska_mala)
+        if _fake_api():
+            time.sleep(1.0)
+            wynik = ImageOps.posterize(maly, 3)   # udawana poprawka
+        else:
+            # zdjęcie referencyjne karty (jeśli przypisane): model uzupełnia
+            # ucięte/brakujące elementy sceny (znaki z napisami, rekwizyty,
+            # postaci) wiernie do oryginału zamiast zgadywać
+            foto = None
+            if spec.photo_path and Path(spec.photo_path).exists():
+                foto = gemini_client._load_photo(spec.photo_path,
+                                                 max_side=1024)
+            prompt = prompts.fix_region_prompt(user_prompt, sila,
+                                               z_foto=foto is not None)
+            temp = _FIX_TEMPERATURA.get(sila)
+            wynik = gemini_client.edit_region(
+                maly, zaznaczony, prompt,
+                seed=config.GEN_SEED + nowy.variant, temperature=temp,
+                photo=foto)
+            if _echo_modelu(wynik, maly, maska_mala):
+                # model odbił wejście — jedna ponowna próba z innym seedem
+                # i wyższą temperaturą zamiast oddawania „braku różnicy"
+                temp = ((config.GEN_TEMPERATURE if temp is None else temp)
+                        + _FIX_ECHO_TEMP_BUMP)
+                wynik = gemini_client.edit_region(
+                    maly, zaznaczony, prompt,
+                    seed=config.GEN_SEED + nowy.variant + 1000,
+                    temperature=temp, photo=foto)
+        if wynik.size != crop.size:
+            wynik = wynik.resize(crop.size, Image.Resampling.LANCZOS)
+        # zmiana istnieje WYŁĄCZNIE w granicach maski użytkownika
+        zlacze = maska_crop.filter(ImageFilter.GaussianBlur(4))
+        polaczony = baza.copy()
+        polaczony.paste(Image.composite(wynik, crop, zlacze), box[:2])
+        # dump pełnej karty SPRZED ochrony stref twardych do _raw/api/
+        # (debug „model vs pipeline" bez ponownych wywołań API)
+        api_path = nowy.raw_path.parent / "api" / nowy.raw_path.name
+        api_path.parent.mkdir(parents=True, exist_ok=True)
+        polaczony.save(api_path, "PNG")
 
-    # zmiana istnieje WYŁĄCZNIE w granicach maski użytkownika
-    zlacze = maska_img.filter(ImageFilter.GaussianBlur(4))
-    polaczony = Image.composite(wynik, baza, zlacze)
-    surowy = _klamp_do_szablonu(polaczony, nowy)
+    # W obrębie maski poprawki z szablonu wracają tylko strefy TWARDE
+    # (bordiura + tarcze narożne); reszta karty poza maską jest bitowo
+    # nietknięta. Maska poszerzona o zasięg feathera złącza, żeby rozmyta
+    # krawędź poprawki nie przeciekła na bordiurę.
+    chronione = masks.strefy_chronione_poprawki(
+        spec.suit.template_path, baza.size)
+    m_szeroka = np.asarray(maska_img.filter(ImageFilter.MaxFilter(9))) > 0
+    twarde = np.where(m_szeroka & (chronione > 0), 255, 0).astype(np.uint8)
+    surowy = Image.composite(template, polaczony, Image.fromarray(twarde))
 
     compositor.save_raw(surowy, nowy, template.size)
     karta = compositor.stempluj_narozniki(surowy, nowy)

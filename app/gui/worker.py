@@ -163,10 +163,10 @@ class TemplateWorker(QThread):
 
 
 class TemplateSetWorker(QThread):
-    """Generowanie KOMPLETU teł przodu (4 kolory jednym stylem) + opcjonalnie
-    rewers — sekwencyjnie, ze spójnością zestawu: pierwsze tło (kier) powstaje
-    bez referencji, kolejne kolory dostają je jako obraz referencyjny i ten
-    sam seed."""
+    """Generowanie KOMPLETU teł przodu (domyślnie 4 kolory jednym stylem,
+    opcjonalnie też jokery) + opcjonalnie rewers — sekwencyjnie, ze spójnością
+    zestawu: pierwsze tło (kier) powstaje bez referencji, kolejne kolory
+    dostają je jako obraz referencyjny i ten sam seed."""
 
     variant_done = pyqtSignal(object, str)   # Suit, ścieżka tła
     back_done = pyqtSignal(str)              # ścieżka rewersu
@@ -174,9 +174,11 @@ class TemplateSetWorker(QThread):
     progress = pyqtSignal(int, int)          # zrobione, wszystkie
     finished_all = pyqtSignal(int, int)      # zrobione, wszystkie
 
-    def __init__(self, back_prompt: str | None = None, back_source=None,
+    def __init__(self, suits: list[Suit] | None = None,
+                 back_prompt: str | None = None, back_source=None,
                  back_orientation: str = "portrait", parent=None):
         super().__init__(parent)
+        self.suits = list(suits) if suits else Suit.kolory()
         self.back_prompt = back_prompt       # None = bez rewersu
         self.back_source = back_source
         self.back_orientation = back_orientation
@@ -193,10 +195,10 @@ class TemplateSetWorker(QThread):
         from app import config
         from app.core import prompts
 
-        total = len(list(Suit)) + (1 if self.back_prompt else 0)
+        total = len(self.suits) + (1 if self.back_prompt else 0)
         made = 0
         anchor: Path | None = None   # pierwsze tło zestawu = referencja reszty
-        for suit in Suit:
+        for suit in self.suits:
             if self._cancelled:
                 break
             try:
@@ -216,7 +218,7 @@ class TemplateSetWorker(QThread):
                     self.failed.emit(suit, str(exc))
                 break
             self.progress.emit(made, total)
-        if self.back_prompt and not self._cancelled and made == len(list(Suit)):
+        if self.back_prompt and not self._cancelled and made == len(self.suits):
             try:
                 path = generator.generate_back(
                     self.back_prompt, self.back_source, self.back_orientation

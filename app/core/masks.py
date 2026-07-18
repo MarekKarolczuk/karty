@@ -757,6 +757,32 @@ def domyslna_strefa_popout(template_path: Path
     return okno_ring, strefa_gora
 
 
+def strefy_chronione_poprawki(template_path: Path,
+                              size: tuple[int, int]) -> np.ndarray:
+    """Strefy TWARDE selektywnej poprawy (generator.popraw_region): pas
+    bordiury (KLAMP_BORDIURA) + tarcze narożne — jedyne obszary, które
+    w obrębie maski poprawki ZAWSZE wracają z szablonu. Poprawka celowo NIE
+    przechodzi przez pełny klamp adaptacyjny (baza wariantu już go przeszła,
+    a strefa allowed klampu nie zna maski poprawki i wymazywała zmiany AI
+    poza ringiem okna); frame_lines też nie są chronione — krzywe linie
+    naprawia tryb „Przywróć tło szablonu". Zwraca uint8 0/255 w rozmiarze
+    size (szer., wys.)."""
+    base = get_masks(template_path)
+    w, h = size
+    chronione = np.zeros((h, w), np.uint8)
+    bx, by = round(w * KLAMP_BORDIURA), round(h * KLAMP_BORDIURA)
+    chronione[:by, :] = 255
+    chronione[h - by:, :] = 255
+    chronione[:, :bx] = 255
+    chronione[:, w - bx:] = 255
+    sw, sh = base.center.size
+    for x0, y0, x1, y1 in (base.tl_box, base.br_box):
+        # bboxy tarcz są w rozdzielczości szablonu — przeskaluj do size
+        chronione[round(y0 * h / sh):round(y1 * h / sh),
+                  round(x0 * w / sw):round(x1 * w / sw)] = 255
+    return chronione
+
+
 def maska_klampu(wynik: Image.Image, template: Image.Image,
                  template_path: Path,
                  kolor_tla: tuple[int, int, int] | None = None,

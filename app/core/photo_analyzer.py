@@ -408,3 +408,79 @@ def uloz_propozycje(
         f"{kolor}:{v}" for kolor, v in wolne
     )
     return propozycje, karty_bez_kandydata, nieuzyte
+
+
+# --- import przypisań z nazw plików folderu ---------------------------------------
+
+# Rozszerzenia zdjęć honorowane przy imporcie z folderu (case-insensitive).
+_IMPORT_ROZSZERZENIA = {".jpg", ".jpeg", ".png"}
+
+# Aliasy wartości w nazwach plików: polskie oznaczenia figur → kody programu.
+_ALIASY_WARTOSCI = {"D": "Q", "W": "J"}
+
+
+@dataclass(frozen=True)
+class ImportPrzypisan:
+    """Wynik parsowania folderu ze zdjęciami nazwanymi `<Kolor>_<Wartość>.<ext>`."""
+    przypisania: dict[str, str]        # klucz "kolor:wartość" → ścieżka pliku
+    pominiete: list[tuple[str, str]]   # (nazwa pliku, powód pominięcia)
+
+
+def _klucz_ze_stemu(stem: str, wartosci_talii: list[str]) -> tuple[str | None, str]:
+    """Mapuje stem nazwy pliku na klucz karty ("kolor:wartość") albo (None, powód).
+
+    Konwencja: `Kier_A`, `Trefl_10 dowolny dopisek`, `Joker_czerwony`;
+    wielkość liter bez znaczenia, dama jako D lub Q, walet jako W lub J.
+    """
+    from app.core.models import JOKER_WARTOSC
+
+    tekst = stem.strip().lower()
+    if tekst.startswith("joker"):
+        reszta = tekst[len("joker"):].lstrip("_ ").split()
+        odmiana = reszta[0] if reszta else ""
+        if odmiana.startswith("czerwon"):
+            return f"joker_czerwony:{JOKER_WARTOSC}", ""
+        if odmiana.startswith("czarn"):
+            return f"joker_czarny:{JOKER_WARTOSC}", ""
+        return None, "niejednoznaczny joker (oczekiwano Joker_czerwony/Joker_czarny)"
+
+    czesci = tekst.split("_", 1)
+    if len(czesci) != 2 or czesci[0] not in _KOLORY:
+        return None, "nazwa nie zaczyna się od koloru (Kier/Karo/Pik/Trefl/Joker)"
+    kolor = czesci[0]
+    # wartość = pierwszy człon reszty do spacji ("10 patryk k" → "10")
+    token = czesci[1].strip().split()
+    wartosc = token[0].upper() if token else ""
+    wartosc = _ALIASY_WARTOSCI.get(wartosc, wartosc)
+    if wartosc not in wartosci_talii:
+        return None, f"nieznana wartość karty: {wartosc or '(brak)'}"
+    return f"{kolor}:{wartosc}", ""
+
+
+def przypisania_z_folderu(folder: Path,
+                          wartosci_talii: list[str]) -> ImportPrzypisan:
+    """Buduje przypisania kart ze zdjęć w folderze wg konwencji nazw
+    `<Kolor>_<Wartość>.<ext>` (np. `Kier_A.jpg`, `Trefl_10 opis.jpg`,
+    `Joker_czerwony.jpg`). Czysta funkcja, zero API.
+
+    Przy dwóch plikach na tę samą kartę wygrywa pierwszy alfabetycznie,
+    pozostałe trafiają do `pominiete` z powodem.
+    """
+    przypisania: dict[str, str] = {}
+    pominiete: list[tuple[str, str]] = []
+    pliki = sorted(
+        (p for p in Path(folder).iterdir()
+         if p.is_file() and p.suffix.lower() in _IMPORT_ROZSZERZENIA),
+        key=lambda p: p.name.lower(),
+    )
+    for plik in pliki:
+        klucz, powod = _klucz_ze_stemu(plik.stem, wartosci_talii)
+        if klucz is None:
+            pominiete.append((plik.name, powod))
+            continue
+        if klucz in przypisania:
+            zajety = Path(przypisania[klucz]).name
+            pominiete.append((plik.name, f"karta {klucz} już zajęta przez {zajety}"))
+            continue
+        przypisania[klucz] = str(plik)
+    return ImportPrzypisan(przypisania=przypisania, pominiete=pominiete)

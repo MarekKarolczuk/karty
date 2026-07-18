@@ -20,6 +20,9 @@ out_dir.mkdir(parents=True, exist_ok=True)
 
 # 1. Maski wszystkich 4 szablonów + podglądy (czerwona nakładka = maska)
 for suit in Suit:
+    if suit.czy_joker and not suit.available_templates():
+        print(f"[pomijam] {suit.nazwa}: brak tła (opcjonalne)")
+        continue
     tpl = suit.template_path
     m = masks.get_masks(tpl)
     img = Image.open(tpl).convert("RGB")
@@ -434,6 +437,8 @@ for suit in (Suit.KIER, Suit.PIK):
 # (g) tarcze wykryte flood-fillem, nie z awaryjnych ramek (dla dostarczonych
 # szablonów detekcja MUSI trafiać; log „[maski] … awaryjnej ramki" = regresja)
 for suit in Suit:
+    if suit.czy_joker and not suit.available_templates():
+        continue
     tpl = suit.template_path
     m = masks.get_masks(tpl)
     w, h = Image.open(tpl).size

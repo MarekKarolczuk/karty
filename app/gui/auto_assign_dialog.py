@@ -83,7 +83,8 @@ class AutoAssignDialog(QDialog):
         self._estimate_debounce.setSingleShot(True)
         self._estimate_debounce.setInterval(350)
         self._estimate_debounce.timeout.connect(self._refresh_estimate)
-        for suit in Suit:
+        # tylko klasyczne kolory — jokery są poza auto-przydziałem
+        for suit in Suit.kolory():
             row = QHBoxLayout()
             row.setSpacing(6)
             lab = QLabel(f"{suit.symbol} {suit.nazwa.upper()}")

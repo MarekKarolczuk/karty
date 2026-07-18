@@ -493,7 +493,9 @@ class BackView(QWidget):
                       "Program dokleja do promptu twardy layout: centralną ramę w "
                       "kształcie symbolu koloru (kier → serce) i puste tarcze na "
                       "wartości TYLKO w lewym górnym i prawym dolnym rogu — chyba "
-                      "że włączysz tryb własny poniżej.")
+                      "że włączysz tryb własny poniżej. Tła Jokerów (okno w "
+                      "kształcie gwiazdy) są opcjonalne — jokery trafiają do "
+                      "talii dopiero po wygenerowaniu.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         pl.addWidget(hint)
@@ -520,7 +522,7 @@ class BackView(QWidget):
         self.front_suit_combo = NoScrollComboBox()
         self.front_suit_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         for suit in Suit:
-            self.front_suit_combo.addItem(f"{suit.symbol} {suit.nazwa}", suit)
+            self.front_suit_combo.addItem(f"{suit.symbol} {suit.etykieta}", suit)
         self.front_suit_combo.currentIndexChanged.connect(
             self._on_front_suit_changed
         )
@@ -566,6 +568,12 @@ class BackView(QWidget):
             "Po 4 tłach wygeneruj też rewers wg ustawień sekcji „Rewers”"
         )
         left.addWidget(self.front_set_back_check)
+        self.front_set_jokers_check = QCheckBox("razem z tłami Jokerów (★)")
+        self.front_set_jokers_check.setToolTip(
+            "Dwie dodatkowe generacje: tła Jokera czerwonego i czarnego "
+            "w tym samym stylu, z centralnym oknem w kształcie gwiazdy"
+        )
+        left.addWidget(self.front_set_jokers_check)
 
         self.front_import_btn = QPushButton("📁  Wgraj własne tło")
         self.front_import_btn.setObjectName("ghostBtn")
@@ -863,6 +871,7 @@ class BackView(QWidget):
     def _emit_generate_front_set(self) -> None:
         self.generate_front_set_clicked.emit({
             "include_back": self.front_set_back_check.isChecked(),
+            "include_jokers": self.front_set_jokers_check.isChecked(),
         })
 
     def _pick_front_file(self) -> None:

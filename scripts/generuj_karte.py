@@ -4,6 +4,8 @@ Uruchomienie:
     python -m scripts.generuj_karte <wartość> <kolor> <zdjęcie> [hybrid|full_ai] [model]
 Przykład:
     python -m scripts.generuj_karte K kier "zdjecia/x.jpg" hybrid stability-ultra
+Joker (wartość JOKER, kolory joker_czerwony / joker_czarny):
+    python -m scripts.generuj_karte JOKER joker_czerwony "zdjecia/x.jpg" hybrid
 Dostępne modele: patrz app/config.py (MODELS).
 """
 import sys

@@ -125,9 +125,9 @@ class DeckView(QWidget):
         if index == 1:   # Historia
             self.refresh_history()
 
-    def current_filter(self) -> Suit | None:
-        """Aktywny filtr koloru siatki (None = wszystkie) — dla nawigacji
-        ↑/↓ w lightboxie."""
+    def current_filter(self) -> tuple[Suit, ...] | None:
+        """Aktywna grupa filtra kolorów siatki (None = wszystkie; pozycja
+        „Jokery" to dwa suity) — dla nawigacji ↑/↓ w lightboxie."""
         return self.grid_panel.current_filter()
 
     # --- lightbox + odświeżanie ------------------------------------------------------

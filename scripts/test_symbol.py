@@ -16,6 +16,7 @@ output/symbol_test/). Kod wyjścia ≠ 0 przy dowolnym FAIL.
 UWAGA: szablon i kolory brane z AKTYWNYCH presetów — jak w scripts.test_klamp.
 """
 import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -43,13 +44,14 @@ LINIE_DIFF_MAX = 12       # max |kompozyt − szablon| na liniach (wracają z ba
 
 
 def _kolor_z_nazwy(path: Path) -> Suit | None:
-    czesci = path.stem.split("_")
-    if len(czesci) < 2:
-        return None
-    try:
-        return Suit.from_nazwa(czesci[1])
-    except ValueError:
-        return None
+    """Kolor karty ze stemu (wzorzec CardSpec.raw_name: K_kier_v2) —
+    dopasowanie sufiksem, bo nazwy jokerów zawierają podkreślnik
+    (JOKER_joker_czerwony_v2)."""
+    base = re.sub(r"_v\d+$", "", path.stem)
+    for suit in Suit:
+        if base.endswith(f"_{suit.nazwa}"):
+            return suit
+    return None
 
 
 def _kompozyt(suit: Suit, plik: Path, styl) -> Image.Image | None:

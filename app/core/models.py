@@ -14,11 +14,31 @@ class Suit(Enum):
     KARO = ("karo", "♦", True)
     PIK = ("pik", "♠", False)
     TREFL = ("trefl", "♣", False)
+    JOKER_CZERWONY = ("joker_czerwony", "★", True)
+    JOKER_CZARNY = ("joker_czarny", "★", False)
 
     def __init__(self, nazwa: str, symbol: str, is_red: bool):
         self.nazwa = nazwa
         self.symbol = symbol
         self.is_red = is_red
+
+    @property
+    def czy_joker(self) -> bool:
+        return self.nazwa.startswith("joker")
+
+    @property
+    def etykieta(self) -> str:
+        """Nazwa do wyświetlania („Joker czerwony"); `nazwa` zostaje kluczem."""
+        return self.nazwa.replace("_", " ").capitalize()
+
+    @classmethod
+    def kolory(cls) -> list["Suit"]:
+        """Cztery klasyczne kolory (bez jokerów)."""
+        return [s for s in cls if not s.czy_joker]
+
+    @classmethod
+    def jokery(cls) -> list["Suit"]:
+        return [s for s in cls if s.czy_joker]
 
     @property
     def value_color(self) -> str:
@@ -55,6 +75,15 @@ class Suit(Enum):
             if suit.nazwa == nazwa:
                 return suit
         raise ValueError(f"Nieznany kolor: {nazwa}")
+
+
+JOKER_WARTOSC = "JOKER"
+
+
+def wartosci_dla(suit: Suit, values: list[str]) -> list[str]:
+    """Lista wartości kart danego koloru: jokery mają jedną „wartość" JOKER,
+    klasyczne kolory pełną listę talii."""
+    return [JOKER_WARTOSC] if suit.czy_joker else list(values)
 
 
 class GenMode(Enum):

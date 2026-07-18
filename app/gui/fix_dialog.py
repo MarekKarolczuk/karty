@@ -5,8 +5,8 @@ tła szablonu (deterministyczne, bez API — np. krzywe linie ramki).
 
 Dialog niczego nie generuje — zero wywołań API; komplet (maska, prompt,
 tryb, siła) odbiera MainWindow i przekazuje do FixWorker →
-generator.popraw_region (zmiana ograniczona do maski + klamp, wynik =
-NOWY wariant karty).
+generator.popraw_region (zmiana ograniczona do maski, strefy twarde
+bordiury/tarcz z szablonu, wynik = NOWY wariant karty).
 """
 from __future__ import annotations
 
@@ -32,7 +32,9 @@ _HINT_AI = (
     "Zamaluj pędzlem obszar do poprawy (np. uciętą twarz, brakujący "
     "detal) i opisz poniżej, co ma się w nim zmienić. Model przerysuje "
     "WYŁĄCZNIE zamalowany obszar — reszta karty, ramka i kolory "
-    "pozostaną nienaruszone; wynik zapisze się jako NOWY wariant."
+    "pozostaną nienaruszone; wynik zapisze się jako NOWY wariant. "
+    "Krzywe linie ramki i zniekształcony symbol naprawiaj trybem "
+    "„Przywróć tło szablonu”."
 )
 _HINT_SZABLON = (
     "Zamaluj pędzlem obszar, który ma wrócić piksel-w-piksel do tła "
@@ -46,8 +48,8 @@ _SILA_OPISY = {
     1: "delikatny retusz",
     2: "zachowawcza",
     3: "standardowa",
-    4: "mocna",
-    5: "przemaluj swobodnie",
+    4: "mocna (detale od nowa)",
+    5: "przemaluj od zera",
 }
 
 
@@ -56,9 +58,14 @@ class FixRegionDialog(QDialog):
     exec() → Accepted tylko z niepustą maską (tryb AI wymaga też promptu);
     wyniki przez maska(), prompt_uzytkownika(), tryb() i sila()."""
 
-    def __init__(self, card_path: Path, etykieta: str, parent=None):
+    def __init__(self, card_path: Path, etykieta: str,
+                 template_path: Path | None = None, parent=None):
         super().__init__(parent)
         self._card_path = Path(card_path)
+        # szablon tła karty — do ostrzeżenia, gdy maska leży głównie
+        # w strefach twardych (bordiura/tarcze wracają z szablonu)
+        self._template_path = Path(template_path) if template_path else None
+        self._ostrzezono_strefy = False
         self.setWindowTitle(f"Popraw selektywnie — {etykieta} "
                             f"({self._card_path.name})")
         self.setModal(True)
@@ -106,6 +113,13 @@ class FixRegionDialog(QDialog):
         self._sila_opis.setObjectName("hint")
         sila_row.addWidget(self._sila_opis)
         sila_row.addStretch(1)
+        # dokładnie ten obraz (crop + rozmycie/wymazanie wg siły + magenta
+        # zaznaczenie), który pójdzie do modelu — wspólny kod z generatorem
+        self.podglad_btn = QPushButton("👁  Podgląd dla modelu")
+        self.podglad_btn.setObjectName("ghostBtn")
+        self.podglad_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.podglad_btn.clicked.connect(self._pokaz_podglad)
+        sila_row.addWidget(self.podglad_btn)
         layout.addLayout(sila_row)
 
         tools = QHBoxLayout()
@@ -168,6 +182,7 @@ class FixRegionDialog(QDialog):
         self.sila_slider.setEnabled(ai)
         self._sila_label.setEnabled(ai)
         self._sila_opis.setEnabled(ai)
+        self.podglad_btn.setEnabled(ai)
         self._hint.setText(_HINT_AI if ai else _HINT_SZABLON)
         self._hint.setStyleSheet("")
         self.fix_btn.setText("✨  Popraw (1 wywołanie API)" if ai
@@ -176,7 +191,60 @@ class FixRegionDialog(QDialog):
     def _on_sila_changed(self, value: int) -> None:
         self._sila_opis.setText(_SILA_OPISY.get(value, ""))
 
+    # --- podgląd ----------------------------------------------------------------
+    def _pokaz_podglad(self) -> None:
+        """Podgląd „co zobaczy model": crop wg bboxa maski + przygotowanie
+        regionu wg aktualnej siły + magenta zaznaczenie — te same funkcje,
+        których użyje generator.popraw_region (podgląd = rzeczywistość).
+        Zero wywołań API."""
+        m = self._canvas.maska()
+        if cv2.countNonZero(m) == 0:
+            self._hint.setText("⚠ Najpierw zamaluj obszar do poprawy.")
+            self._hint.setStyleSheet("color: #C9A227;")
+            return
+        from PIL import Image
+        from app.core import compositor, generator
+        from app.gui.widgets import pil_to_pixmap
+        baza = Image.open(self._card_path).convert("RGB")
+        maska_img = Image.fromarray(m).convert("L").resize(
+            baza.size, Image.Resampling.NEAREST)
+        box = generator._bbox_poprawki(maska_img)
+        crop = baza.crop(box)
+        maska_crop = maska_img.crop(box)
+        wejscie = generator._przygotuj_region_poprawki(
+            crop, maska_crop, self.sila())
+        podglad = compositor.zaznacz_region_poprawki(wejscie, maska_crop)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Podgląd dla modelu — siła {self.sila()} "
+                           f"({_SILA_OPISY.get(self.sila(), '')})")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        label = QLabel()
+        label.setPixmap(pil_to_pixmap(podglad).scaled(
+            640, 760, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+        lay.addWidget(label)
+        dlg.exec()
+
     # --- walidacja -------------------------------------------------------------
+    def _udzial_stref_twardych(self) -> float:
+        """Ułamek maski leżący w strefach twardych (bordiura + tarcze) —
+        te obszary ZAWSZE wracają z szablonu, poprawka AI ich nie zmieni."""
+        if self._template_path is None or not self._template_path.exists():
+            return 0.0
+        from app.core import masks as core_masks
+        m = self._canvas.maska()
+        h, w = m.shape
+        try:
+            chronione = core_masks.strefy_chronione_poprawki(
+                self._template_path, (w, h))
+        except Exception:
+            return 0.0
+        pole = cv2.countNonZero(m)
+        return (float(np.count_nonzero((m > 0) & (chronione > 0))) / pole
+                if pole else 0.0)
+
     def _on_accept(self) -> None:
         braki = []
         if cv2.countNonZero(self._canvas.maska()) == 0:
@@ -186,5 +254,15 @@ class FixRegionDialog(QDialog):
         if braki:
             self._hint.setText("⚠ Najpierw " + " i ".join(braki) + ".")
             self._hint.setStyleSheet("color: #C9A227;")   # złote ostrzeżenie
+            return
+        if (self.tryb() == "ai" and not self._ostrzezono_strefy
+                and self._udzial_stref_twardych() > 0.4):
+            self._ostrzezono_strefy = True
+            self._hint.setText(
+                "⚠ Większość zaznaczenia to narożnik/bordiura — te obszary "
+                "ZAWSZE wracają z szablonu, a znaki narożne stempluje preset "
+                "„Wartości” (poprawka AI ich nie zmieni). Kliknij ponownie, "
+                "aby mimo to kontynuować.")
+            self._hint.setStyleSheet("color: #C9A227;")
             return
         self.accept()
