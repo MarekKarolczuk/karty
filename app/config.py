@@ -17,6 +17,9 @@ OUTPUT_DIR = ROOT / "output"
 RAW_DIR = OUTPUT_DIR / "_raw"        # surowe wyjście AI (PNG, bez narożników)
 ASSETS_DIR = ROOT / "assets"
 MASKS_DIR = ASSETS_DIR / "masks"
+CMYK_ICC_DIR = ASSETS_DIR / "icc"    # profile ICC CMYK do eksportu druku
+                                     # (pierwszy *.icc/*.icm; podmienialny na
+                                     # profil własnej drukarni)
 FONTS_DIR = ASSETS_DIR / "fonts"
 UI_FONTS_DIR = FONTS_DIR / "ui"      # fonty interfejsu (NIE do rysowania kart!)
 CARD_FONTS_DIR = FONTS_DIR / "karty"  # biblioteka czcionek narożników
@@ -33,10 +36,13 @@ ANALIZA_JSON = ROOT / "analiza_zdjec.json"   # cache analiz AI zdjęć (auto-prz
 STYLE_ROOT = ROOT / "Style"
 # (dawna kategoria "styl_tla" scalona z "tla_przodu" jako pole `styl` —
 # stary folder Style/styl_tla/ jest ignorowany, treść migruje style_store.load())
-STYLE_CATEGORIES = ("postac", "tla_przodu", "rewers", "wartosci")
+STYLE_CATEGORIES = ("postac", "tla_przodu", "rewers", "wartosci", "pudelko")
 STYLE_ACTIVE_JSON = STYLE_ROOT / "active.json"
 
 # --- API ---
+# Timeout POJEDYNCZEGO wywołania modelu (ms) — wiszące połączenie zrywa się
+# zamiast wisieć w nieskończoność (spinner bez końca przy generacji).
+API_TIMEOUT_MS = 180_000
 # Klucze czytane ze zmiennych środowiskowych / .env (NIGDY nie hardcodowane —
 # .env jest w .gitignore, więc nie trafia na repo).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -82,7 +88,10 @@ MODELS: dict[str, dict] = {
         "tier": "best",
         "vertex_location": "global",   # na Vertex serwowany tylko z "global"
     },
-    "gemini-3.1-flash-image-preview": {
+    # Nano Banana 2 GA — następca wygaszonego "gemini-3.1-flash-image-preview"
+    # (Google wyłączył wersję preview 25.06.2026; nie przywracać sufiksu
+    # "-preview" — martwe ID mapuje MODEL_ALIASES → canonical_model()).
+    "gemini-3.1-flash-image": {
         "provider": "gemini",
         "label": "Gemini 3.1 Flash Image (Nano Banana 2)",
         "vertex_location": "global",   # rodzina gemini-3* jest global-only
@@ -93,7 +102,13 @@ MODELS: dict[str, dict] = {
         "vertex_location": None,       # honoruje GCP_LOCATION (regionalny)
     },
 }
-DEFAULT_MODEL = "gemini-3-pro-image"
+# Aliasy wygaszonych/przemianowanych ID → obowiązujący model. Stosowane przez
+# canonical_model() przy wczytywaniu wyboru z projekt.json / GUI, żeby stary
+# zapis nie spadał po cichu do domyślnego.
+MODEL_ALIASES: dict[str, str] = {
+    "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+}
+DEFAULT_MODEL = "gemini-3.1-flash-image"
 SELECTED_MODEL = DEFAULT_MODEL   # nadpisywane z GUI / projekt.json
 
 # Model TEKSTOWO-WIZYJNY do analizy zdjęć (auto-przydział) — celowo POZA MODELS
@@ -103,6 +118,14 @@ SELECTED_MODEL = DEFAULT_MODEL   # nadpisywane z GUI / projekt.json
 # "global" — patrz pole "vertex_location" w MODELS).
 ANALYSIS_MODEL = "gemini-2.5-flash"
 ANALYSIS_TEMPERATURE = 0.1   # analiza ma być powtarzalna, nie kreatywna
+
+
+def canonical_model(model_id: str | None) -> str:
+    """Mapuje wygaszone/przemianowane ID modelu na obowiązujące (MODEL_ALIASES);
+    nieznane albo aktualne ID zwraca bez zmian."""
+    if not model_id:
+        return DEFAULT_MODEL
+    return MODEL_ALIASES.get(model_id, model_id)
 
 
 def current_model() -> dict:
@@ -242,3 +265,15 @@ def dpi_for_template(width_px: int, height_px: int) -> tuple[float, float]:
         width_px / (CARD_MM[0] / mm_per_inch),
         height_px / (CARD_MM[1] / mm_per_inch),
     )
+
+
+def cmyk_profile_path() -> Path | None:
+    """Ścieżka profilu ICC CMYK do eksportu druku (pierwszy *.icc/*.icm w
+    CMYK_ICC_DIR) albo None, gdy folder pusty/nieobecny — wtedy konwersja
+    CMYK leci przybliżonym trybem Pillow (bez zarządzania kolorem)."""
+    if not CMYK_ICC_DIR.is_dir():
+        return None
+    for wzor in ("*.icc", "*.icm"):
+        for plik in sorted(CMYK_ICC_DIR.glob(wzor)):
+            return plik
+    return None

@@ -17,6 +17,7 @@ VIEWS = [
     ("❖", "Style", "Style postaci i teł, prompty, generacja teł przodu i rewersu"),
     ("⚙", "Ustawienia i style", "Klucze API / Vertex, model, styl i format"),
     ("⇲", "Eksport", "Pobierz talię do druku (PDF) lub jako paczkę do gry"),
+    ("▧", "Pudełko", "Zaprojektuj i wyeksportuj pudełko na karty"),
 ]
 
 

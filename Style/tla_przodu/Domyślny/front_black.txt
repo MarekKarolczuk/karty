@@ -1,1 +1,11 @@
-Generate a highly detailed, blank playing card front background. Vertical layout. Style: precise neo-ornamental engraving, vintage cream paper base, symmetrical, rich intricate scrollwork, and acanthus leaves along the borders. The artwork MUST be rendered entirely in deep black outlines. CRITICAL: The center of the card MUST feature a large, completely blank, vintage cream frame to serve as an empty canvas for placing subjects later. Absolutely NO patterns, shading, or lines inside this central window. Consistent graphic novel / collector card aesthetic. Output strictly the background design with no characters, numbers, or suits.
+Generate a highly detailed, intricate, and symmetrical neo-ornamental playing card front background, specifically designed for a collector's edition Joker card. Vertical layout.
+
+Style: Meticulous, etched neo-ornamental engraving with precise, varying line-weights, entirely rendered in a saturated, deep dark red (#801515) line-art style on a vintage, textured cream-colored paper base.
+
+Border Pattern: The card borders and outer field feature a dense, opulent tapestry of whimsical, intricate scrollwork and stylized acanthus leaves. integrated subtly within this complex filigree are miniature stylized jester’s caps with tiny bells, profile-view masks, and jester's scepters, all forming a cohesive, whimsical, and rich ornamental frame. The pattern is dense and detailed.
+
+Central Element (CRITICAL): Dominating the card's center is a very large, clean, perfectly smooth, and completely blank vintage cream-colored field, defined by an exquisite, decorative inner etched border frame.
+
+Strict Constraints: The interior of this large central field must be absolutely pristine: NO patterns, lines, shading, numbers, letters, suits (heart, diamond, club, spade), or character images of any kind. This area must be an empty, clean canvas for portrait insertion later.
+
+Aesthetic: Consistent with a high-end, limited-edition collector's card and graphic novel style, featuring dense, complex patterns that frame the large, clean central window. Output strictly the background design; no characters, numbers, or standard suits on the card.

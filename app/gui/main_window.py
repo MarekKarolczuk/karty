@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app import config
-from app.core import photo_analyzer, prompts, style_store
+from app.core import photo_analyzer, prompts, pudelko, style_store
 from app.core.exporter import ExportJob
 from app.core.models import CardSpec, GenMode, Suit, wartosci_dla
 from app.gui import card_grid, deck_grid_panel
@@ -31,6 +31,7 @@ from app.gui.photo_gallery import load_thumbnail
 from app.gui.sidebar import Sidebar
 from app.gui.title_bar import TitleBar
 from app.gui.views.back_view import BackView
+from app.gui.views.box_view import BoxView
 from app.gui.views.deck_view import DeckView
 from app.gui.views.export_view import ExportView
 from app.gui.views.photo_library_view import PhotoLibraryView
@@ -38,8 +39,9 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.workspace_view import WorkspaceView
 from app.gui.widgets import show_toast
 from app.gui.worker import (
-    AnalysisWorker, BackWorker, ExportWorker, FixWorker, GenerationWorker,
-    RestampWorker, SampleWorker, TemplateSetWorker, TemplateWorker,
+    AnalysisWorker, BackWorker, BoxFixWorker, BoxWorker, ExportWorker,
+    FixWorker, GenerationWorker, RestampWorker, SampleWorker,
+    TemplateSetWorker, TemplateWorker,
 )
 
 class MainWindow(QMainWindow):
@@ -81,6 +83,8 @@ class MainWindow(QMainWindow):
         self.sample_worker: SampleWorker | None = None
         self.restamp_worker: RestampWorker | None = None
         self.fix_worker: FixWorker | None = None
+        self.box_worker: BoxWorker | None = None
+        self.box_fix_worker: BoxFixWorker | None = None
         self.analysis_worker: AnalysisWorker | None = None
         # auto-przydział: edytowalne motywy kolorów + stan bieżącej sesji
         self.auto_motywy: dict[str, str] = dict(photo_analyzer.DOMYSLNE_MOTYWY)
@@ -115,6 +119,7 @@ class MainWindow(QMainWindow):
         self.back_view = BackView()
         self.settings_view = SettingsView()
         self.export_view = ExportView()
+        self.box_view = BoxView()
         # panel generacji wchłonięty przez Ekran roboczy — alias dla kontrolera
         self.generation = self.workspace.gen_panel
         # podgląd wygenerowanych kart to teraz siatka w zakładce Talie
@@ -123,7 +128,8 @@ class MainWindow(QMainWindow):
 
         self.stack = FadingStackedWidget()
         for view in (self.workspace, self.photo_library, self.deck,
-                     self.back_view, self.settings_view, self.export_view):
+                     self.back_view, self.settings_view, self.export_view,
+                     self.box_view):
             self.stack.addWidget(view)
         body.addLayout(self._wrap_stack(), stretch=1)
         root_layout.addLayout(body, stretch=1)
@@ -231,7 +237,15 @@ class MainWindow(QMainWindow):
         self.back_view.mask_library_changed.connect(
             self._on_mask_library_changed)
         self.export_view.export_clicked.connect(self._start_export)
+        self.export_view.preview_boost_clicked.connect(self._preview_print_boost)
         self.export_view.options_changed.connect(self._save_project)
+
+        self.box_view.generate_box_clicked.connect(self._start_box_generation)
+        self.box_view.import_box_clicked.connect(self._on_box_import)
+        self.box_view.fix_box_clicked.connect(self._on_box_fix)
+        self.box_view.export_box_clicked.connect(self._start_box_export)
+        self.box_view.box_changed.connect(self._save_project)
+        self.box_view.set_main_variant.connect(self._on_box_set_main)
 
     def _build_status_bar(self) -> QWidget:
         bar = QWidget()
@@ -259,6 +273,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- pomocnicze stany
     def _switch_view(self, index: int) -> None:
+        if index == self._BOX_INDEX:
+            self._refresh_box_info()
         self.stack.fade_to(index)
 
     _SETTINGS_INDEX = 4   # kolejność wg VIEWS w sidebarze
@@ -1609,7 +1625,8 @@ class MainWindow(QMainWindow):
         worker = TemplateSetWorker(suits=suits,
                                    back_prompt=back_prompt,
                                    back_source=back_source,
-                                   back_orientation=orientation)
+                                   back_orientation=orientation,
+                                   jokery_odbarw=opts.get("jokery_odbarw", True))
         worker.variant_done.connect(self._on_set_variant_done)
         worker.back_done.connect(self._on_set_back_done)
         worker.failed.connect(self._on_set_failed)
@@ -1768,6 +1785,265 @@ class MainWindow(QMainWindow):
         self.generation.log_pane.log_line(f"✖ rewers: {message}")
         show_toast(self, f"✖ rewers: {message[:120]}", "error")
 
+    # ----------------------------------------------------------------------- pudełko
+    _BOX_INDEX = 6   # kolejność wg VIEWS w sidebarze (na końcu)
+
+    def _box_photo_paths(self) -> list[Path]:
+        """Unikalne zdjęcia osób przypisanych do kart talii (zachowana
+        kolejność) — trafiają na grafikę pudełka."""
+        return [Path(p) for p in dict.fromkeys(self.assignments.values())
+                if Path(p).exists()]
+
+    def _box_people_count(self, paths: list[Path]) -> int | None:
+        """Łączna liczba osób ze zdjęć (z cache analizy; None gdy nieznana)."""
+        suma = 0
+        znane = False
+        for p in paths:
+            n = photo_analyzer.liczba_osob_z_cache(p)
+            if n:
+                suma += n
+                znane = True
+        return suma if znane else None
+
+    def _refresh_box_info(self) -> None:
+        paths = self._box_photo_paths()
+        self.box_view.set_people_info(len(paths), self._box_people_count(paths))
+        self.box_view.reload_library()
+        self.box_view.refresh_box_preview()
+
+    def _box_context(self) -> tuple[Path, tuple[float, float]] | None:
+        """Rozwiązuje aktywny wykrojnik + wymiary design area (mm). Gdy brak
+        wymiarów w sidecarze — pyta użytkownika i zapisuje. None = brak
+        wykrojnika albo anulowano."""
+        die = self.box_view.current_dieline()
+        if die is None:
+            show_toast(self, "Brak wykrojnika — dodaj plik PNG do "
+                       "Style/Pudełka/", "error")
+            return None
+        dm = pudelko.design_area_mm(die)
+        if dm is None:
+            from PyQt6.QtWidgets import QInputDialog
+            w, ok = QInputDialog.getDouble(
+                self, "Wymiary wykrojnika",
+                f"Podaj SZEROKOŚĆ obszaru projektu (Design area) z nagłówka "
+                f"wykrojnika w mm:\n{die.name}", 100.0, 1.0, 2000.0, 1)
+            if not ok:
+                return None
+            h, ok = QInputDialog.getDouble(
+                self, "Wymiary wykrojnika",
+                "Podaj WYSOKOŚĆ obszaru projektu (Design area) w mm:",
+                100.0, 1.0, 2000.0, 1)
+            if not ok:
+                return None
+            dm = (w, h)
+            pudelko.zapisz_design_area(die, dm)
+            self.box_view.reload_library()
+        return die, dm
+
+    def _start_box_generation(self, settings: dict) -> None:
+        if self.box_worker is not None:
+            return
+        if not self._guard_api_ready():
+            return
+        ctx = self._box_context()
+        if ctx is None:
+            return
+        die, dm = ctx
+        paths = self._box_photo_paths()
+        if not paths:
+            show_toast(self, "Najpierw przypisz zdjęcia do kart na Ekranie "
+                       "roboczym", "error")
+            return
+        # osobne portrety (1 osoba/plik) — dodatkowe referencje wierności twarzy
+        osobne_foto = self._box_osobne_foto(settings)
+        n_portrety = len(osobne_foto)
+        liczba_osob = n_portrety or self._box_people_count(paths)
+        tryb = settings.get("tryb", "scena")
+        custom = settings.get("custom", "")
+        from app.api import stability_client
+        stability_client.reset_abort()
+        self._gen_cancelled = False
+        self.box_view.set_box_busy(True)
+        self.cancel_btn.setVisible(True)
+        if tryb == "panele":
+            karty = self._box_karty_boki()
+            boki_ai = bool(settings.get("boki_ai", False)) and bool(karty)
+            if not karty:
+                show_toast(self, "Brak wygenerowanych kart — boki pudełka będą "
+                           "puste. Wygeneruj talię, by pokazać mini-karty.",
+                           "info")
+            status = ("osobne panele + boki AI (front, tył i do 6 scen boków)"
+                      if boki_ai else "osobne panele (2 sceny AI)")
+            self._set_status(f"Generuję pudełko — {status}…")
+            worker = BoxWorker(
+                None, die, paths, dm, tryb="panele",
+                prompt_front=prompts.box_front_prompt(
+                    custom, liczba_osob, osobne_portrety=n_portrety),
+                prompt_back=prompts.box_back_prompt(
+                    custom, liczba_osob, osobne_portrety=n_portrety),
+                card_paths=karty, boki_ai=boki_ai, liczba_osob=liczba_osob,
+                osobne_foto=osobne_foto)
+        else:
+            proporcja = pudelko.parsuj_wykrojnik(die).proporcja
+            prompt = prompts.box_generation_prompt(
+                custom_text=custom, liczba_osob=liczba_osob, proporcja=proporcja,
+                osobne_portrety=n_portrety)
+            self._set_status("Generuję pudełko (AI)…")
+            worker = BoxWorker(prompt, die, paths, dm, osobne_foto=osobne_foto)
+        worker.done.connect(self._on_box_generated)
+        worker.failed.connect(self._on_box_failed)
+        worker.progress.connect(self.box_view.set_box_status)
+        self.box_worker = worker
+        worker.start()
+
+    def _box_osobne_foto(self, settings: dict) -> list[Path]:
+        """Osobne portrety (1 osoba/plik) z folderu wskazanego w widoku pudełka
+        — dodatkowe referencje wierności twarzy. Pusta lista = opcja wyłączona
+        albo folder pusty/nieistniejący."""
+        if not settings.get("osobne_on"):
+            return []
+        folder = settings.get("osobne_folder") or ""
+        d = Path(folder)
+        if not folder or not d.is_dir():
+            return []
+        pliki: list[Path] = []
+        for p in sorted(d.iterdir()):
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                pliki.append(p)
+        return pliki
+
+    def _box_karty_boki(self, maks: int = 6) -> list[Path]:
+        """Reprezentatywna próbka wygenerowanych kart do wizualizacji boków
+        pudełka (figury z różnych kolorów, tylko istniejące pliki)."""
+        wybrane: list[Path] = []
+        for value in ("A", "K", "Q", "J", "10"):
+            for suit in Suit.kolory():
+                p = self._selected_variant(suit.nazwa, value)
+                if p is not None and Path(p).exists() and Path(p) not in wybrane:
+                    wybrane.append(Path(p))
+                    if len(wybrane) >= maks:
+                        return wybrane
+        for _name, p in self._deck_fronts():
+            if p is not None and Path(p).exists() and Path(p) not in wybrane:
+                wybrane.append(Path(p))
+                if len(wybrane) >= maks:
+                    break
+        return wybrane
+
+    def _on_box_generated(self, path: str) -> None:
+        self.box_worker = None
+        self.box_view.set_box_busy(False)
+        self.cancel_btn.setVisible(bool(self.worker or self.template_worker))
+        self._set_status(f"✔ pudełko: {Path(path).name}")
+        show_toast(self, "✔ grafika pudełka wygenerowana", "ok")
+
+    def _on_box_failed(self, message: str) -> None:
+        self.box_worker = None
+        self.box_view.set_box_busy(False)
+        self.box_view.set_box_status(f"✖ {message}", error=True)
+        self.cancel_btn.setVisible(bool(self.worker or self.template_worker))
+        self.generation.log_pane.log_line(f"✖ pudełko: {message}")
+        show_toast(self, f"✖ pudełko: {message[:120]}", "error")
+
+    def _on_box_set_main(self, stamp: str) -> None:
+        """Ustawia wskazany wariant pudełka jako główny (baza eksportu/poprawki)."""
+        try:
+            pudelko.ustaw_glowny_wariant(stamp)
+        except (OSError, FileNotFoundError) as exc:
+            show_toast(self, f"Nie ustawiono wariantu: {exc}", "error")
+            return
+        self.box_view.refresh_box_preview()
+        show_toast(self, "✔ wariant pudełka ustawiony jako główny", "ok")
+
+    def _on_box_import(self, src: str) -> None:
+        """Wgranie własnego projektu pudełka (bez API): dopasowanie do
+        wykrojnika + zapis proof/raw."""
+        from app.core import generator
+        ctx = self._box_context()
+        if ctx is None:
+            return
+        die, dm = ctx
+        try:
+            generator.import_box(Path(src), die, dm)
+        except (OSError, ValueError) as exc:
+            show_toast(self, f"Nie wczytano obrazu: {exc}", "error")
+            return
+        self.box_view.refresh_box_preview()
+        show_toast(self, "✔ własny projekt pudełka dopasowany", "ok")
+
+    def _on_box_fix(self) -> None:
+        """Selektywna poprawa artworku pudełka (reużyty FixRegionDialog na
+        surowym artworku bez linii) → BoxFixWorker → generator.popraw_pudelko."""
+        if self.box_fix_worker is not None:
+            show_toast(self, "Poczekaj — trwa poprzednia poprawka", "info")
+            return
+        from app.core import generator
+        raw = generator.box_raw_path()
+        if not raw.exists():
+            show_toast(self, "Najpierw wygeneruj pudełko", "info")
+            return
+        ctx = self._box_context()
+        if ctx is None:
+            return
+        die, dm = ctx
+        dialog = FixRegionDialog(raw, "pudełko", parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        from app.api import stability_client
+        stability_client.reset_abort()
+        worker = BoxFixWorker(dialog.maska(), dialog.prompt_uzytkownika(), die,
+                              dm, tryb=dialog.tryb(), sila=dialog.sila())
+        worker.done.connect(self._on_box_fix_done)
+        worker.failed.connect(self._on_box_fix_failed)
+        self.box_fix_worker = worker
+        self.box_view.set_box_busy(True)
+        self._set_status("Poprawiam pudełko…")
+        worker.start()
+
+    def _on_box_fix_done(self, path: str) -> None:
+        self.box_fix_worker = None
+        self.box_view.set_box_busy(False)
+        self._set_status(f"✔ poprawka pudełka: {Path(path).name}")
+        show_toast(self, "✔ poprawka pudełka zapisana", "ok")
+
+    def _on_box_fix_failed(self, message: str) -> None:
+        self.box_fix_worker = None
+        self.box_view.set_box_busy(False)
+        self.generation.log_pane.log_line(f"✖ poprawka pudełka: {message}")
+        show_toast(self, f"✖ poprawka pudełka: {message[:120]}", "error")
+
+    def _start_box_export(self, opts: dict) -> None:
+        """Eksport pudełka do PNG/PDF w dokładnym rozmiarze fizycznym."""
+        from app.core import generator
+        raw = generator.box_raw_path()
+        if not raw.exists():
+            show_toast(self, "Najpierw wygeneruj pudełko", "info")
+            return
+        ctx = self._box_context()
+        if ctx is None:
+            return
+        die, dm = ctx
+        fmt = opts.get("format", "png")
+        filtr = ("PDF do druku (*.pdf)" if fmt == "pdf"
+                 else "PDF CMYK (*.pdf)" if fmt == "cmyk"
+                 else "Obraz PNG (*.png)")
+        rozsz = "pdf" if fmt in ("pdf", "cmyk") else fmt
+        sufiks = "_cmyk" if fmt == "cmyk" else ""
+        domyslna = f"pudelko_{die.stem}{sufiks}.{rozsz}"
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Zapisz pudełko", domyslna, filtr)
+        if not out:
+            return
+        try:
+            generator.eksportuj_pudelko(
+                Path(out), die, dm, z_liniami=opts.get("z_liniami", True),
+                format=fmt)
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            show_toast(self, f"Nie wyeksportowano: {exc}", "error")
+            return
+        self._set_status(f"✔ eksport pudełka: {Path(out).name}")
+        show_toast(self, f"✔ pudełko zapisane: {Path(out).name}", "ok")
+
     # ----------------------------------------------- podgląd przykładowej karty
     def _first_available_photo(self) -> Path | None:
         if config.ZDJECIA_DIR.exists():
@@ -1838,6 +2114,8 @@ class MainWindow(QMainWindow):
     _EXPORT_FILES = {
         "pdf": ("arkusz_druku.pdf", "PDF (*.pdf)"),
         "files": ("karty_png", ""),   # folder docelowy
+        "cmyk": ("karty_cmyk.pdf", "PDF CMYK (*.pdf)"),   # jeden PDF CMYK
+        "krm": ("druk_krm.pdf", "PDF CMYK (*.pdf)"),      # druk w KRM
         "zip": ("talia_png.zip", "Archiwum ZIP (*.zip)"),
         "atlas": ("atlas_tts_10x7.png", "PNG (*.png)"),
         "sprite": ("sprite_13x4.png", "PNG (*.png)"),
@@ -1885,6 +2163,7 @@ class MainWindow(QMainWindow):
             marks=self.export_view.marks_check.isChecked(),
             backs=self.export_view.backs_check.isChecked(),
             small_atlas=self.export_view.small_check.isChecked(),
+            extra={"podbicie": self.export_view.boost_level()},
         )
         self.export_view.set_export_status(f"Eksportuję {default_name}…")
         self._set_status(f"Eksport: {Path(out_path).name}…")
@@ -1900,6 +2179,56 @@ class MainWindow(QMainWindow):
         self.export_view.set_export_status(f"✔ zapisano: {path}", finished=True)
         self._set_status(f"✔ eksport: {path}")
         show_toast(self, f"✔ zapisano {Path(path).name}", "ok")
+
+    _PODGLAD_WYS = 900          # wysokość połówki podglądu podbicia (px)
+
+    def _preview_print_boost(self, sila: int) -> None:
+        """Podgląd „przed | po" podbicia kolorów na pierwszej gotowej karcie.
+        Prawa połówka przechodzi PEŁNĄ ścieżkę druku (pre-press → CMYK →
+        z powrotem do RGB do wyświetlenia), więc pokazuje to, co trafi do
+        PDF-a. Przy wybranym KRM obie połówki są całą stroną 69 × 94 mm.
+        Zero API, zero zapisów do talii."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        from app.core.eksport.cmyk import rgb_na_cmyk
+        from app.core.eksport.formaty import aktywny_format
+        from app.core.eksport.procesor import ProcesorKRM
+
+        zrodlo = next((p for _n, p in self._deck_fronts()
+                       if p is not None and p.exists()), None)
+        if zrodlo is None:
+            show_toast(self, "Brak gotowej karty do podglądu", "info")
+            return
+        try:
+            karta = Image.open(zrodlo).convert("RGB")
+            if self.export_view.krm_selected():
+                karta = ProcesorKRM(aktywny_format()).przetworz(karta)
+            skala = self._PODGLAD_WYS / karta.height
+            karta = karta.resize(
+                (max(1, round(karta.width * skala)), self._PODGLAD_WYS),
+                Image.Resampling.LANCZOS)
+            po = rgb_na_cmyk(karta, sila=sila)[0].convert("RGB")
+
+            odstep, opis = 16, 34
+            plotno = Image.new(
+                "RGB", (karta.width * 2 + odstep * 3, karta.height + opis + odstep * 2),
+                "#12100E")
+            plotno.paste(karta, (odstep, opis + odstep))
+            plotno.paste(po, (karta.width + odstep * 2, opis + odstep))
+            rysuj = ImageDraw.Draw(plotno)
+            font = ImageFont.load_default(size=22)
+            rysuj.text((odstep, odstep), "PRZED (plik karty)",
+                       font=font, fill="#C9C2B4")
+            rysuj.text((karta.width + odstep * 2, odstep),
+                       f"PO (druk CMYK, podbicie {sila})",
+                       font=font, fill="#E8C87A")
+            out = config.OUTPUT_DIR / "_podglad_druku.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            plotno.save(out)
+        except (OSError, ValueError) as exc:
+            show_toast(self, f"✖ podgląd podbicia: {exc}", "error")
+            return
+        self._preview_file(str(out))
 
     def _on_export_failed(self, message: str) -> None:
         self.export_worker = None
@@ -1951,6 +2280,7 @@ class MainWindow(QMainWindow):
             "card_preset": config.SELECTED_CARD_PRESET,
             "back": self.back_view.settings(),
             "export": self.export_view.settings(),
+            "box": self.box_view.settings(),
             "auto_przydzial": {"motywy": self.auto_motywy},
             "import_folder": self._import_folder,
         }
@@ -2010,8 +2340,11 @@ class MainWindow(QMainWindow):
             self.back_view.apply_settings(data["back"])
         if isinstance(data.get("export"), dict):
             self.export_view.apply_settings(data["export"])
-        if data.get("model") in config.MODELS:
-            config.SELECTED_MODEL = data["model"]
+        if isinstance(data.get("box"), dict):
+            self.box_view.apply_settings(data["box"])
+        model = config.canonical_model(data.get("model"))  # martwe -preview → GA
+        if model in config.MODELS:
+            config.SELECTED_MODEL = model
             self._sync_model_views()
         # aktywne presety stylu zapamiętane dla tej talii
         chosen = data.get("style_presets")

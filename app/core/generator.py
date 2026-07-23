@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,9 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 from app import config
 from app.api import gemini_client, stability_client
-from app.core import compositor, masks, photo_analyzer, prompts, style_store
+from app.core import (
+    compositor, masks, photo_analyzer, prompts, pudelko, style_store,
+)
 from app.core.models import CardSpec, GenMode, Suit
 
 # Kolaż/maska wysyłane do API — 1536 px wystarcza inpaintingowi, a tniemy
@@ -32,6 +35,16 @@ MAX_API_SIDE = 1536
 PHOTO_REF_SIDE = 1536
 PHOTO_REF_SIDE_GRUPA = 1536
 GRUPA_OD_OSOB = 3
+
+# Pudełko: twardy limit zdjęć składanych w JEDEN montaż referencyjny. Zarówno
+# osobne portrety, jak i zdjęcia grupowe idą pojedynczym montażem-siatką (nie
+# kilkoma osobnymi obrazami 1536 px — kilkanaście dużych zdjęć = przeciążony
+# request → timeout / model zwraca tekst zamiast obrazu).
+MAKS_REF_OBRAZY = 8
+GRUPA_SIDE = 1024
+# Pudełko: mniej prób niż karty (2 zamiast 3) — porażka ciężkiego, 2-wywołaniowego
+# requestu nie ma narastać do kilkunastu minut backoffu; lepiej szybko zgłosić błąd.
+BOX_RETRIES = 2
 
 
 def _fake_api() -> bool:
@@ -586,17 +599,39 @@ def generate_template(suit: Suit, prompt: str | None = None, *,
             reference_img = Image.open(reference_path).convert("RGB")
             reference_img.thumbnail((768, 768), Image.Resampling.LANCZOS)
             contents.append(reference_img)
-        img = gemini_client.generate_image(contents, seed=seed)
-    # Proporcje wybranego formatu + standardowa rozdzielczość (model zwraca
-    # ~1024 px — upscale LANCZOS): wszystkie tła mają jedną skalę pod klamp
-    img = ImageOps.fit(img, config.template_target_size(),
-                       method=Image.Resampling.LANCZOS)
+        # aspect_ratio steruje kadrem modelu (inaczej zwraca ~kwadrat, który
+        # docinano do 5:7 — „ucięte tło", zwłaszcza joker z oknem-gwiazdą)
+        target = config.template_target_size()
+        img = gemini_client.generate_image(
+            contents, seed=seed,
+            aspect_ratio=pudelko.najblizszy_aspect(target[0] / target[1]))
+    # Dokładna proporcja formatu + standardowa rozdzielczość: ROZCIĄGAMY (bez
+    # docinania — spójne z normalizuj_szablon i import rozciagnij), więc nic
+    # nie ucinamy; po nasterowaniu na ~3:4 rozciągnięcie do 5:7 jest znikome
+    img = img.resize(config.template_target_size(), Image.Resampling.LANCZOS)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     target_dir = style_store.front_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{suit.nazwa} ai {stamp}.png"
     img.save(path)
+    return path
+
+
+def derywuj_tlo_czarnego_jokera(czerwony_path: Path) -> Path:
+    """Tło CZARNEGO jokera = czarno-biała (grayscale) kopia podanego tła
+    CZERWONEGO jokera — identyczny kształt/okno-gwiazda, różny tylko kolor
+    (czerwony ornament → szarość). Zapis do folderu aktywnego presetu tą samą
+    konwencją nazw co generate_template (available_templates wykryje po stemie
+    zawierającym „joker_czarny"). ZERO API — działa też pod KARTY_FAKE_API."""
+    czb = ImageOps.grayscale(
+        Image.open(czerwony_path).convert("RGB")).convert("RGB")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = style_store.front_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"{Suit.JOKER_CZARNY.nazwa} ai {stamp}.png"
+    czb.save(path)
+    normalizuj_szablon(path)   # spójność z resztą teł (rozmiar już 5:7 → guard)
     return path
 
 
@@ -665,3 +700,248 @@ def generate_back(prompt: str | None = None,
         back.rename(backup)
     img.save(back)
     return back
+
+
+# --- Pudełko na karty ----------------------------------------------------------
+
+def box_raw_path() -> Path:
+    """Surowy artwork GŁÓWNEGO wariantu pudełka (bez linii) — baza eksportu
+    i selektywnych poprawek (jak output/_raw dla kart)."""
+    return pudelko.box_glowny_raw()
+
+
+def box_ustaw_glowny(stamp: str) -> Path:
+    """Przełącza główny wariant pudełka na wskazany (z historii)."""
+    return pudelko.ustaw_glowny_wariant(stamp)
+
+
+def _zapisz_box_pliki(raw: Image.Image, proof: Image.Image) -> Path:
+    """Zapisuje NOWY wariant pudełka do historii i ustawia jako główny
+    (raw bez linii + proof z liniami). Zwraca proof główny (podgląd)."""
+    return pudelko.zapisz_wariant_pudelka(raw, proof)
+
+
+def _zapisz_pudelko(scena: Image.Image, wykr, design_mm) -> Path:
+    """Zapis dla trybu SCENA: jedna scena → raw (bez linii) + proof."""
+    return _zapisz_box_pliki(
+        pudelko.zloz_pudelko(scena, wykr, design_mm, z_liniami=False),
+        pudelko.zloz_pudelko(scena, wykr, design_mm, z_liniami=True))
+
+
+def _referencje_pudelka(foto_paths: list[Path],
+                        osobne_foto: list[Path] | None) -> list[Image.Image]:
+    """JEDEN montaż-siatka referencji pudełka (nie kilka osobnych zdjęć 1536 px —
+    ciężki request wisiał / model zwracał tekst zamiast obrazu). Gdy podano
+    osobne portrety — to JEDYNE źródło twarzy. Bez portretów — zdjęcia grupowe
+    przypisane kartom, też scalone w jeden montaż. Pusta lista, gdy brak zdjęć."""
+    osobne = [p for p in (osobne_foto or []) if Path(p).exists()]
+    if osobne:
+        return [compositor.montaz_portretow(osobne)]
+    grupowe = [p for p in (foto_paths or []) if Path(p).exists()]
+    if not grupowe:
+        return []
+    return [compositor.montaz_portretow(grupowe, maks=MAKS_REF_OBRAZY)]
+
+
+def _kolor_z_frontu(front: Image.Image) -> str:
+    """Dominujący kolor pudełka pobrany z PASA BRZEGOWEGO frontu (ramka/obrzeże,
+    nie centralna scena) — mediana per-kanał na pomniejszonej kopii. Zwraca hex;
+    używany jako jednolite tło boków, żeby całe pudełko trzymało jeden klimat."""
+    import numpy as np
+
+    mini = front.convert("RGB")
+    mini.thumbnail((80, 80), Image.Resampling.LANCZOS)
+    a = np.asarray(mini)
+    h, w, _ = a.shape
+    m = max(1, round(min(h, w) * 0.15))
+    brzeg = np.concatenate([
+        a[:m].reshape(-1, 3), a[-m:].reshape(-1, 3),
+        a[:, :m].reshape(-1, 3), a[:, -m:].reshape(-1, 3)])
+    r, g, b = (int(np.median(brzeg[:, i])) for i in range(3))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _generate_box_panele(wykr, design_mm, foto_paths, prompt_front, prompt_back,
+                         card_paths, seed, boki_ai=False, liczba_osob=None,
+                         osobne_foto=None,
+                         postep: Callable[[str], None] | None = None) -> Path:
+    """Tryb OSOBNYCH PANELI: 2 generacje AI (przód + tył kotwiczony frontem).
+    Boki: gdy boki_ai=True i są karty — AI-restyling wachlarza mini-kart
+    (osobna scena/bok); inaczej deterministyczna wizualizacja mini-kart.
+    osobne_foto = portrety 1 osoba/plik doklejane do referencji front/tył.
+    postep = callback etapu (GUI status: „Generuję przód/tył…")."""
+    def _etap(msg: str) -> None:
+        if postep:
+            postep(msg)
+    if _fake_api():
+        _etap("Generuję przód pudełka…")
+        front = _fake_illustration(foto_paths[0] if foto_paths else None)
+        _etap("Generuję tył pudełka…")
+        back = _fake_illustration(foto_paths[-1] if foto_paths else None)
+    elif _provider() == "stability":
+        _etap("Generuję przód pudełka…")
+        front = stability_client.generate_template_image(prompt_front or "", None)
+        _etap("Generuję tył pudełka…")
+        back = stability_client.generate_template_image(prompt_back or "", None)
+    else:
+        zdjecia = _referencje_pudelka(foto_paths, osobne_foto)
+        # proporcja kadru per rola panelu → hint kadru dla modelu (żeby front/
+        # tył wróciły w kształcie swojego panelu, nie kwadratem obcinanym przy
+        # składaniu); brak panelu danej roli → None (model bez wymuszenia)
+        ar_rola: dict[str, str] = {}
+        for panel in pudelko.segmentuj_panele(wykr):
+            if panel.rola in ("przod", "tyl"):
+                ar_rola[panel.rola] = pudelko.najblizszy_aspect(panel.aspect)
+        _etap("Generuję przód pudełka…")
+        front = gemini_client.generate_image(
+            [prompt_front or ""] + zdjecia, seed=seed, retries=BOX_RETRIES,
+            aspect_ratio=ar_rola.get("przod"))
+        # tył kotwiczony frontem (ostatni obraz = gotowy front) — spójny styl
+        _etap("Generuję tył pudełka…")
+        back = gemini_client.generate_image(
+            [prompt_back or ""] + zdjecia + [front], seed=seed,
+            retries=BOX_RETRIES, aspect_ratio=ar_rola.get("tyl"))
+    _etap("Składam panele pudełka…")
+    obrazy = {"przod": front, "tyl": back}
+    karty = [Path(p) for p in (card_paths or []) if Path(p).exists()]
+    # Boki ZAWSZE deterministyczne: jednolite tło w kolorze frontu + prawdziwe
+    # mini-karty (spójne). AI-restyling boków usunięty — robił niespójne tła i
+    # dokładał 6 wywołań (ryzyko zawisu). Zostają 2 wywołania AI: front + tył.
+    tlo_boku = _kolor_z_frontu(front)
+    raw = pudelko.zloz_pudelko_panele(obrazy, wykr, design_mm,
+                                      karty_boki=karty, tlo_boku=tlo_boku,
+                                      z_liniami=False)
+    proof = pudelko.zloz_pudelko_panele(obrazy, wykr, design_mm,
+                                        karty_boki=karty, tlo_boku=tlo_boku,
+                                        z_liniami=True)
+    return _zapisz_box_pliki(raw, proof)
+
+
+def generate_box(prompt: str | None = None, dieline_path: Path | None = None,
+                 foto_paths: list[Path] | None = None,
+                 design_mm: tuple[float, float] | None = None, *,
+                 tryb: str = "scena", prompt_front: str | None = None,
+                 prompt_back: str | None = None,
+                 card_paths: list[Path] | None = None,
+                 seed: int | None = None, boki_ai: bool = False,
+                 liczba_osob: int | None = None,
+                 osobne_foto: list[Path] | None = None,
+                 postep: Callable[[str], None] | None = None) -> Path:
+    """Generuje grafikę pudełka. tryb="scena" (domyślny): JEDNA scena AI ze
+    wszystkich zdjęć, wciśnięta w wykrojnik. tryb="panele": OSOBNE panele —
+    przód i tył to dwie sceny AI (spójne przez wspólny seed + kotwica), boki =
+    wizualizacja mini-kart talii (card_paths) albo — gdy boki_ai=True —
+    AI-restyling wachlarza mini-kart (osobna scena/bok). Fallback: gdy wykrojnik
+    nie ma ≥2 twarzy → tryb scena. Zapisuje raw (bez linii) + proof.
+    postep = callback etapu (GUI status). Honoruje KARTY_FAKE_API."""
+    wykr = pudelko.parsuj_wykrojnik(dieline_path)
+    if tryb == "panele" and pudelko.liczba_twarzy(
+            pudelko.segmentuj_panele(wykr)) >= 2:
+        return _generate_box_panele(wykr, design_mm, foto_paths or [],
+                                    prompt_front, prompt_back, card_paths, seed,
+                                    boki_ai=boki_ai, liczba_osob=liczba_osob,
+                                    osobne_foto=osobne_foto, postep=postep)
+
+    tekst = prompt or prompt_front or ""
+    if _fake_api():
+        scena = _fake_illustration(
+            foto_paths[0] if foto_paths else None)
+    elif _provider() == "stability":
+        scena = stability_client.generate_template_image(tekst, None)
+    else:
+        if postep:
+            postep("Generuję grafikę pudełka…")
+        scena = gemini_client.generate_image(
+            [tekst] + _referencje_pudelka(foto_paths or [], osobne_foto),
+            seed=seed, retries=BOX_RETRIES,
+            aspect_ratio=pudelko.najblizszy_aspect(wykr.proporcja))
+    return _zapisz_pudelko(scena, wykr, design_mm)
+
+
+def import_box(src: Path, dieline_path: Path,
+               design_mm: tuple[float, float]) -> Path:
+    """Wgranie własnego gotowego projektu pudełka (ZERO API): dopasowanie do
+    obszaru druku wykrojnika + zapis raw i proof (jak generate_box)."""
+    wykr = pudelko.parsuj_wykrojnik(dieline_path)
+    obraz = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
+    return _zapisz_pudelko(obraz, wykr, design_mm)
+
+
+def eksportuj_pudelko(out_path: Path, dieline_path: Path,
+                      design_mm: tuple[float, float], *, z_liniami: bool,
+                      format: str = "png") -> Path:
+    """Eksport pudełka z surowego artworku (output/_raw) w DOKŁADNYM rozmiarze
+    fizycznym: PNG (metadane DPI), PDF (strona = rozmiar wykrojnika) lub TIFF
+    CMYK (300 DPI, podbite kolory, profil ICC). z_liniami dokłada warstwę
+    cięcia/big (proof) albo daje czysty artwork (dla drukarni z osobną warstwą
+    dieline)."""
+    raw_path = box_raw_path()
+    if not raw_path.exists():
+        raise FileNotFoundError("Brak wygenerowanego pudełka do eksportu")
+    wykr = pudelko.parsuj_wykrojnik(dieline_path)
+    raw = Image.open(raw_path).convert("RGB")
+    obraz = pudelko.zloz_pudelko(raw, wykr, design_mm, z_liniami=z_liniami)
+    if format == "pdf":
+        return pudelko.eksportuj_pdf(obraz, out_path, design_mm)
+    if format == "cmyk":
+        return pudelko.eksportuj_pdf_cmyk(obraz, out_path, design_mm)
+    return pudelko.eksportuj_png(obraz, out_path, design_mm)
+
+
+def popraw_pudelko(maska: np.ndarray, user_prompt: str, dieline_path: Path,
+                   design_mm: tuple[float, float], tryb: str = "ai",
+                   sila: int = 3) -> Path:
+    """Selektywna poprawa artworku pudełka (reużyty FixRegionDialog): w trybie
+    "ai" model przerysowuje TYLKO zamalowany obszar (inpainting na wycinku, jak
+    popraw_region — bez stref twardych szablonu, bo pudełko ich nie ma); w
+    trybie "szablon" zamalowany obszar jest czyszczony do bieli (deterministy-
+    cznie, bez API). Baza = surowy artwork (output/_raw); wynik nadpisuje raw i
+    proof. Zwraca ścieżkę proof."""
+    raw_path = box_raw_path()
+    if not raw_path.exists():
+        raise FileNotFoundError("Brak wygenerowanego pudełka do poprawy")
+    baza = Image.open(raw_path).convert("RGB")
+    maska_img = Image.fromarray(maska).convert("L").resize(
+        baza.size, Image.Resampling.NEAREST)
+    if maska_img.getbbox() is None:
+        raise ValueError("Maska poprawki jest pusta — zamaluj obszar do zmiany")
+
+    if tryb == "szablon":
+        biel = Image.new("RGB", baza.size, "white")
+        zlacze = maska_img.filter(ImageFilter.GaussianBlur(4))
+        wynikowy = Image.composite(biel, baza, zlacze)
+    else:
+        box = _bbox_poprawki(maska_img)
+        crop = baza.crop(box)
+        maska_crop = maska_img.crop(box)
+        wejscie = _przygotuj_region_poprawki(crop, maska_crop, sila)
+        skala = _FIX_CROP_SIDE / max(crop.size)
+        rozmiar_api = (max(1, round(crop.width * skala)),
+                       max(1, round(crop.height * skala)))
+        maly = wejscie.resize(rozmiar_api, Image.Resampling.LANCZOS)
+        maska_mala = maska_crop.resize(rozmiar_api, Image.Resampling.NEAREST)
+        zaznaczony = compositor.zaznacz_region_poprawki(maly, maska_mala)
+        if _fake_api():
+            time.sleep(1.0)
+            wynik = ImageOps.posterize(maly, 3)
+        else:
+            prompt = prompts.fix_region_prompt(user_prompt, sila, z_foto=False)
+            temp = _FIX_TEMPERATURA.get(sila)
+            wynik = gemini_client.edit_region(
+                maly, zaznaczony, prompt,
+                seed=config.GEN_SEED + sila, temperature=temp)
+            if _echo_modelu(wynik, maly, maska_mala):
+                temp = ((config.GEN_TEMPERATURE if temp is None else temp)
+                        + _FIX_ECHO_TEMP_BUMP)
+                wynik = gemini_client.edit_region(
+                    maly, zaznaczony, prompt,
+                    seed=config.GEN_SEED + sila + 1000, temperature=temp)
+        if wynik.size != crop.size:
+            wynik = wynik.resize(crop.size, Image.Resampling.LANCZOS)
+        zlacze = maska_crop.filter(ImageFilter.GaussianBlur(4))
+        wynikowy = baza.copy()
+        wynikowy.paste(Image.composite(wynik, crop, zlacze), box[:2])
+
+    # ponowny clip do spadu + zapis raw/proof (wykrojnik nadaje kształt)
+    wykr = pudelko.parsuj_wykrojnik(dieline_path)
+    return _zapisz_pudelko(wynikowy, wykr, design_mm)

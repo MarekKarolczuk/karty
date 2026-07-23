@@ -144,12 +144,19 @@ _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
     # styl = wspólny opis ornamentyki szablonu (dawna kategoria "styl_tla");
     # maska_aktywna = nazwa presetu maski pop-out z podfolderu maski/
     # ("" = Maska automatyczna, strefa wyliczana — masks.domyslna_strefa_popout)
+    # joker_mono "1" = tło czarnego jokera powstaje jako czarno-biała kopia
+    # tła czerwonego (nie osobna generacja AI) — domyślnie włączone
     "tla_przodu": {"front_red": DEFAULT_FRONT_RED,
                    "front_black": DEFAULT_FRONT_BLACK,
                    "styl": DEFAULT_TEMPLATE_STYLE,
                    "maska_aktywna": "",
-                   "tryb_wlasny": "0"},
+                   "tryb_wlasny": "0",
+                   "joker_mono": "1"},
     "rewers": {"opis": "", "tryb_wlasny": "0"},
+    # Pudełko na karty: opis = styl grafiki pudełka; tryb_wlasny "1" = opis
+    # idzie do modelu dosłownie (bez dopisków layoutu); wykrojnik = nazwa pliku
+    # PNG z biblioteki Style/Pudełka/ (pusty = pierwszy dostępny).
+    "pudelko": {"opis": "", "tryb_wlasny": "0", "wykrojnik": ""},
     # Typografia narożników (stemplowanie lokalne, nie AI) — liczby w %
     # wysokości tarczy, kolory hex; parsowanie w compositor.styl_z_presetu()
     "wartosci": {
@@ -173,6 +180,7 @@ _CATEGORY_FIELDS: dict[str, dict[str, str]] = {
 _CATEGORY_IMAGES: dict[str, tuple[str, ...]] = {
     "tla_przodu": ("kier", "karo", "pik", "trefl"),
     "rewers": ("rewers",),
+    "pudelko": ("pudelko",),
 }
 
 # Czytelne etykiety kategorii (dla GUI).
@@ -181,6 +189,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "tla_przodu": "tła przodu",
     "rewers": "rewers",
     "wartosci": "wartości narożne",
+    "pudelko": "pudełko",
 }
 
 DEFAULT_PRESET_NAME = "Domyślny"
@@ -326,6 +335,13 @@ def front_custom_mode() -> bool:
     return text("tla_przodu", "tryb_wlasny").strip() == "1"
 
 
+def joker_mono_mode() -> bool:
+    """Tło czarnego jokera = czarno-biała (grayscale) kopia tła czerwonego
+    zamiast osobnej generacji AI (domyślnie WŁ.). Zapewnia identyczne tła
+    obu jokerów — różni je tylko kolor."""
+    return text("tla_przodu", "joker_mono").strip() != "0"
+
+
 def scenery_suit_mode() -> bool:
     """Sceneria zdjęcia (góry, horyzont) malowana w oknie symbolu w
     monochromatycznych odcieniach koloru karty zamiast płaskiego wypełnienia."""
@@ -350,6 +366,22 @@ def back_custom_mode() -> bool:
     """Tryb własnego promptu rewersu: opis presetu idzie do modelu dosłownie,
     bez twardych wymogów (symetria 180°, bordiura, zakaz tekstu)."""
     return text("rewers", "tryb_wlasny").strip() == "1"
+
+
+def box_text() -> str:
+    return text("pudelko", "opis")
+
+
+def box_custom_mode() -> bool:
+    """Tryb własnego promptu pudełka: opis presetu idzie do modelu dosłownie,
+    bez dopisków layoutu (wraparound, wierność twarzy, zakaz tekstu)."""
+    return text("pudelko", "tryb_wlasny").strip() == "1"
+
+
+def active_dieline() -> str:
+    """Nazwa pliku wybranego wykrojnika pudełka (Style/Pudełka/<nazwa>.png);
+    "" = pierwszy dostępny z biblioteki."""
+    return text("pudelko", "wykrojnik").strip()
 
 
 # --- obrazy -------------------------------------------------------------------
@@ -387,6 +419,12 @@ def back_path() -> Path:
 def front_dir() -> Path:
     """Folder AKTYWNEGO presetu teł przodu — tu żyją obrazy szablonów."""
     return preset_dir("tla_przodu")
+
+
+def box_path() -> Path:
+    """Plik podglądu pudełka = pudelko.png w folderze AKTYWNEGO presetu
+    pudełka (proof z liniami cięcia). Jedyne źródło prawdy dla GUI."""
+    return preset_dir("pudelko") / "pudelko.png"
 
 
 # --- zarządzanie presetami ----------------------------------------------------

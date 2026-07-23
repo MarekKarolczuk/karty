@@ -88,7 +88,7 @@ class FixRegionDialog(QDialog):
         self.tryb_switch.changed.connect(self._on_tryb_changed)
         layout.addWidget(self.tryb_switch)
 
-        self._canvas = _MaskCanvas(pix, maska)
+        self._canvas = _MaskCanvas(pix, maska, zoom_pan=True)
         layout.addWidget(self._canvas, stretch=1)
 
         self.prompt_edit = QPlainTextEdit()
@@ -147,6 +147,18 @@ class FixRegionDialog(QDialog):
         self.size_slider.valueChanged.connect(self._canvas.set_brush)
         tools.addWidget(self.size_slider)
         self._canvas.set_brush(_BRUSH_START_FIX)
+
+        tools.addSpacing(10)
+        fit_btn = QPushButton("🔍  Dopasuj")
+        fit_btn.setObjectName("ghostBtn")
+        fit_btn.setToolTip(
+            "Reset widoku do 100% — kółko myszy nad obrazem = zoom pod "
+            "kursorem (do 400%, Shift+kółko = przesuw poziomy), środkowy "
+            "przycisk + przeciąganie = przesuwanie widoku, klawisz 0 lub "
+            "dwuklik środkowym = reset")
+        fit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        fit_btn.clicked.connect(self._canvas.reset_view)
+        tools.addWidget(fit_btn)
 
         tools.addStretch(1)
         cancel_btn = QPushButton("Anuluj")

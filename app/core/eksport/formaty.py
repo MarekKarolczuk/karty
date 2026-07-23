@@ -14,6 +14,9 @@ from app import config
 MM_NA_CAL = 25.4
 DPI_DRUKU = 300
 SPAD_MM = 3.0          # domyślna szerokość spadu drukarskiego
+# Margines bezpieczeństwa drukarni: grafika (ramka + wszystko w środku) musi
+# zmieścić się tyle milimetrów W GŁĄB od linii cięcia (wymóg KRM).
+MARGINES_BEZPIECZENSTWA_MM = 5.0
 A4_MM = (210.0, 297.0)
 
 
@@ -30,6 +33,7 @@ class FormatKarty:
     szerokosc_mm: float
     wysokosc_mm: float
     spad_mm: float = SPAD_MM
+    margines_mm: float = MARGINES_BEZPIECZENSTWA_MM
 
     @property
     def mm(self) -> tuple[float, float]:
@@ -48,6 +52,18 @@ class FormatKarty:
     @property
     def px_300dpi_ze_spadem(self) -> tuple[int, int]:
         w, h = self.mm_ze_spadem
+        return (mm_na_px(w), mm_na_px(h))
+
+    @property
+    def mm_ramki(self) -> tuple[float, float]:
+        """Maksymalny prostokąt GRAFIKI karty: netto pomniejszone o margines
+        bezpieczeństwa z każdej strony (poker: 53 × 78 mm)."""
+        return (self.szerokosc_mm - 2 * self.margines_mm,
+                self.wysokosc_mm - 2 * self.margines_mm)
+
+    @property
+    def px_ramki_300dpi(self) -> tuple[int, int]:
+        w, h = self.mm_ramki
         return (mm_na_px(w), mm_na_px(h))
 
 

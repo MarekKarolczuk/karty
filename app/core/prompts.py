@@ -745,3 +745,242 @@ Mandatory requirements:
 - Rich ornament with no large empty areas.
 - Absolutely NO letters, numbers, text, faces or watermarks.
 """
+
+
+# --- Pudełko na karty ----------------------------------------------------------
+
+# Domyślny opis stylu grafiki pudełka (edytowalny w presecie „pudelko").
+# Bogaty, kolekcjonerski styl komiksowy — NIE ograniczony paletą kart (patrz
+# box_style_lock); bez wymuszania konkretnej sceny (uniwersalny dla talii).
+DEFAULT_BOX_STYLE = (
+    "A premium collector's playing-card box illustration in a modern comic-book "
+    "CARICATURE style: clean bold black outlines, crisp cel-shaded coloring, "
+    "polished vector-art feel, with playful big-head caricature proportions "
+    "(oversized heads, exaggerated features). The people from the deck are the "
+    "heroes, rendered as a stylish ensemble. Rich, warm, saturated palette with "
+    "deep jewel tones and "
+    "elegant gold accents. The composition is framed by an elaborate, ornate "
+    "baroque golden filigree border; a small heraldic crest with the playing-"
+    "card suits (hearts, spades, clubs, diamonds) sits as a decorative motif, "
+    "and slim playing cards bearing individual character portraits are arranged "
+    "along the edges. Premium graphic-novel cover energy — elegant yet casual, "
+    "masterpiece quality.")
+
+
+def box_style_lock() -> str:
+    """Blokada spójności DLA PUDEŁKA (osobna od kartowej style_lock): wymusza
+    JEDEN spójny styl na wszystkich panelach, ale POZWALA na bogatą, dowolną
+    paletę (jewel tones, złoto…) — pudełko nie jest ograniczone paletą kart."""
+    if style_store.cartoon_level() >= 5:
+        technika = ("flat cell-shaded color planes, bold uniform black outlines")
+    else:
+        technika = ("one consistent rendering technique (follow the STYLIZATION "
+                    "LEVEL instructions)")
+    return f"""\
+CONSISTENT BOX ART (all panels are ONE design):
+- CARICATURE STYLE: draw EVERY person as a playful caricature with a
+  noticeably OVERSIZED head — roughly 1.5-2x the normal head-to-body ratio
+  (big-head / bobblehead proportions), with gently exaggerated facial features,
+  while keeping each face clearly recognizable as that specific person.
+- Keep ONE cohesive art style across every panel — the same {technika}, line
+  weight, palette and mood, as if drawn by one artist for a single collector's
+  box.
+- Use a RICH, saturated palette freely (deep jewel tones, gold accents, warm
+  backdrops) — the box is NOT limited to the individual cards' colors."""
+
+
+def _box_portrety_klauzula(osobne_portrety: int) -> str:
+    """Klauzula o osobnych portretach scalonych w JEDEN montaż-siatkę (contact
+    sheet) na końcu contents — model ma wstawić KAŻDĄ osobę wiernie."""
+    if osobne_portrety and osobne_portrety > 0:
+        return (f"\nOne attached image is a CONTACT-SHEET GRID of "
+                f"{osobne_portrety} individual portraits — one person per cell. "
+                f"The box MUST feature EVERY one of these {osobne_portrety} "
+                "people, each with their own clearly recognizable face; never "
+                "merge, drop or invent people.")
+    return ""
+
+
+def box_generation_prompt(custom_text: str = "", liczba_osob: int | None = None,
+                          proporcja: float | None = None,
+                          osobne_portrety: int = 0) -> str:
+    """Prompt grafiki pudełka: jedna bogata scena z WSZYSTKIMI osobami talii
+    (każde zdjęcie to osobny załączony obraz). Łączy opis presetu „pudelko",
+    spójność paneli (box_style_lock — WOLNA paleta), wierność twarzy i twardy
+    wymóg „narysuj każdą osobę" + zakaz tekstu. Tryb własny → dosłownie.
+
+    proporcja = szerokość/wysokość obszaru druku (kadr); osobne_portrety = liczba
+    osobnych zdjęć-portretów (1 osoba/plik) dołączonych na końcu contents."""
+    if style_store.box_custom_mode():
+        own = (custom_text or "").strip() or style_store.box_text().strip()
+        if own:
+            return own
+    style_text = (custom_text.strip() or style_store.box_text().strip()
+                  or DEFAULT_BOX_STYLE)
+
+    if proporcja and proporcja > 1.2:
+        kadr = ("a WIDE landscape composition (the artwork wraps around the "
+                "whole box)")
+    elif proporcja and proporcja < 0.85:
+        kadr = "a TALL portrait composition"
+    else:
+        kadr = "a balanced composition"
+
+    if liczba_osob and liczba_osob > 1:
+        ludzie = (f"\nThere are exactly {liczba_osob} people across the "
+                  f"attached reference photos — the artwork MUST feature all "
+                  f"{liczba_osob} of them, each with their own recognizable "
+                  "face; never merge, drop or invent people.")
+    else:
+        ludzie = ("\nFeature every person from the attached reference photos, "
+                  "each with their own recognizable face.")
+
+    return f"""\
+Generate box-wrap artwork for a playing-card box (a single flat illustration
+that will be wrapped onto a card box), {kadr}.
+
+Each attached image is a reference PHOTO of one or more people from this deck.
+Take the facial features, face shapes, hairstyles and expressions from those
+photos.{ludzie}{_box_portrety_klauzula(osobne_portrety)}
+
+Style:
+{style_text}
+
+{box_style_lock()}
+
+{face_fidelity_clause()}
+
+Layout:
+- Compose all the people into ONE cohesive, richly decorated cover scene that
+  fills the whole frame edge to edge (no plain empty margins).
+- Frame the scene with an ornate decorative border; include tasteful collector
+  motifs (a small heraldic crest, slim portrait cards along the edges) so it
+  reads as premium card-box art.
+- Keep faces fully visible and never cut off.
+- Leave a little extra margin of background around the edges (printing bleed).
+
+{NO_TEXT_SUFFIX}"""
+
+
+def _box_ludzie_klauzula(liczba_osob: int | None) -> str:
+    if liczba_osob and liczba_osob > 1:
+        return (f"\nThere are exactly {liczba_osob} people across the attached "
+                f"reference photos — the artwork MUST feature all "
+                f"{liczba_osob} of them, each with their own recognizable "
+                "face; never merge, drop or invent people.")
+    return ("\nFeature every person from the attached reference photos, each "
+            "with their own recognizable face.")
+
+
+def _box_styl(custom_text: str) -> str:
+    return (custom_text.strip() or style_store.box_text().strip()
+            or DEFAULT_BOX_STYLE)
+
+
+def box_front_prompt(custom_text: str = "", liczba_osob: int | None = None,
+                     osobne_portrety: int = 0) -> str:
+    """Prompt FRONTU pudełka (tryb osobnych paneli): mocna scena-okładka z
+    osobami na JEDNEJ ścianie (proporcja ~karty), bogata paleta. Tryb własny →
+    dosłownie."""
+    if style_store.box_custom_mode():
+        own = (custom_text or "").strip() or style_store.box_text().strip()
+        if own:
+            return own
+    return f"""\
+Generate the FRONT panel artwork for a playing-card box, portrait orientation
+(a single upright rectangular panel, roughly playing-card proportions).
+
+Each attached image is a reference PHOTO of people from this deck. Take the
+facial features, face shapes, hairstyles and expressions from those photos.\
+{_box_ludzie_klauzula(liczba_osob)}{_box_portrety_klauzula(osobne_portrety)}
+
+Style:
+{_box_styl(custom_text)}
+
+{box_style_lock()}
+
+{face_fidelity_clause()}
+
+Layout:
+- A striking FRONT-of-package HERO scene: the people as an elegant ensemble
+  filling the panel edge to edge, framed by an ornate decorative border with a
+  small heraldic crest — premium collector card-box look.
+- Keep every face fully visible and never cut off.
+- Leave a little extra background margin around the edges (printing bleed).
+
+{NO_TEXT_SUFFIX}"""
+
+
+def box_side_prompt(custom_text: str = "", liczba_osob: int | None = None) -> str:
+    """Prompt BOKU pudełka (tryb osobnych paneli): image-to-image restyling
+    wachlarza PRAWDZIWYCH mini-kart talii (obraz wejściowy) na śmielszą,
+    bardziej KRESKÓWKOWĄ ilustrację z WIĘKSZYMI twarzami — te same osoby i
+    paleta talii. Osobny seed per bok daje różne sceny. Tryb własny →
+    dosłownie."""
+    if style_store.box_custom_mode():
+        own = (custom_text or "").strip() or style_store.box_text().strip()
+        if own:
+            return own
+    return f"""\
+The attached image is a fan/arrangement of THIS deck's playing cards (real
+generated cards) laid out for a narrow box-side panel.
+
+Redraw it as ONE bolder, more CARTOONISH illustration of the same fan of cards:
+punchy cel-shaded style, cleaner shapes, and noticeably LARGER, more expressive
+faces on the cards — keep the SAME people and their recognizable faces, and keep
+it recognizably a fan/spread of cards that fills the whole panel edge to edge.
+
+Style:
+{_box_styl(custom_text)}
+
+{box_style_lock()}
+
+{face_fidelity_clause()}
+
+Layout:
+- Keep the fan-of-cards arrangement filling the panel; no plain empty margins.
+- Bigger, clearer faces than in the input; lively, collector-poster energy.
+- Leave a little extra background margin around the edges (printing bleed).
+
+{NO_TEXT_SUFFIX}"""
+
+
+def box_back_prompt(custom_text: str = "", liczba_osob: int | None = None,
+                    z_kotwica: bool = True, osobne_portrety: int = 0) -> str:
+    """Prompt TYŁU pudełka (tryb osobnych paneli): druga scena w INNEJ scenerii/
+    kompozycji z tymi samymi osobami, spójna stylem z frontem (ostatni obraz
+    przed portretami to gotowy FRONT jako kotwica stylu)."""
+    if style_store.box_custom_mode():
+        own = (custom_text or "").strip() or style_store.box_text().strip()
+        if own:
+            return own
+    kotwica = ""
+    if z_kotwica:
+        kotwica = ("\nOne of the attached images is the finished FRONT panel of "
+                   "this same box — match its exact art style, line weight and "
+                   "palette so the two panels look like one design (but a "
+                   "DIFFERENT scene).")
+    return f"""\
+Generate the BACK panel artwork for a playing-card box, portrait orientation
+(a single upright rectangular panel, roughly playing-card proportions).
+
+Each attached image is a reference PHOTO of people from this deck. Take the
+facial features, face shapes, hairstyles and expressions from those photos.\
+{_box_ludzie_klauzula(liczba_osob)}{_box_portrety_klauzula(osobne_portrety)}{kotwica}
+
+Style:
+{_box_styl(custom_text)}
+
+{box_style_lock()}
+
+{face_fidelity_clause()}
+
+Layout:
+- A clearly DIFFERENT scene from the front: change the SETTING, backdrop and
+  the arrangement/poses of the people — a fresh composition that still fills
+  the panel edge to edge and shares the same art style. Not a copy of the front.
+- Frame it with an ornate decorative border consistent with the front.
+- Keep every face fully visible and never cut off.
+- Leave a little extra background margin around the edges (printing bleed).
+
+{NO_TEXT_SUFFIX}"""

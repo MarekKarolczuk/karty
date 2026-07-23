@@ -11,7 +11,7 @@ from app.core.eksport.formaty import (
     A4_MM, DPI_DRUKU, FormatKarty, aktywny_format, formaty, mm_na_px,
 )
 from app.core.eksport.manager import ExportManager, manager_dla_joba
-from app.core.eksport.procesor import ProcesorKarty
+from app.core.eksport.procesor import ProcesorKarty, ProcesorKRM
 from app.core.eksport.uklady import (
     CELL, CELL_SMALL, StrategiaUkladu, UkladA4, UkladAtlas, UkladPojedynczy,
     WynikUkladu, atlas_tts, sprite_13x4,
@@ -23,6 +23,7 @@ from app.core.eksport.wyjscia import (
 __all__ = [
     "A4_MM", "DPI_DRUKU", "FormatKarty", "aktywny_format", "formaty",
     "mm_na_px", "ExportManager", "manager_dla_joba", "ProcesorKarty",
+    "ProcesorKRM",
     "CELL", "CELL_SMALL", "StrategiaUkladu", "UkladA4", "UkladAtlas",
     "UkladPojedynczy", "WynikUkladu", "atlas_tts", "sprite_13x4",
     "StrategiaWyjscia", "WyjscieFolder", "WyjsciePDF", "WyjsciePNG",

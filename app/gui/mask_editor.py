@@ -32,6 +32,8 @@ from app.gui.widgets import SnapSlider
 _OVERLAY_ALPHA = 110
 # Zakres i start suwaka rozmiaru pędzla (px w skali szablonu)
 _BRUSH_MIN, _BRUSH_MAX, _BRUSH_START = 20, 400, 120
+# Zakres zoomu i mnożnik na „notch" kółka myszy (tylko canvasy z zoom_pan=True)
+_ZOOM_MIN, _ZOOM_MAX, _ZOOM_STEP = 1.0, 4.0, 1.15
 
 
 def _koloruj_strefe(strefa: np.ndarray, szer_docelowa: int,
@@ -70,11 +72,19 @@ def nakladka_strefy(suit: Suit, szer: int = 640,
 class _MaskCanvas(QWidget):
     """Płótno edytora: szablon + nakładka maski + kursor-okrąg pędzla.
     Maska trzymana w PEŁNEJ rozdzielczości szablonu (numpy 0/255); rysowanie
-    cv2.line/circle mapowane z pozycji myszy — zapis bez strat skali."""
+    cv2.line/circle mapowane z pozycji myszy — zapis bez strat skali.
+
+    `zoom_pan=True` (na razie tylko `FixRegionDialog`) włącza powiększanie
+    kółkiem myszy (zakotwiczone pod kursorem, Shift+kółko = przesuw poziomy)
+    i przesuwanie widoku środkowym przyciskiem — lewy przycisk zostaje
+    zarezerwowany dla pędzla/gumki. Przy `zoom_pan=False` (domyślnie,
+    `MaskEditorDialog`) `_zoom`/`_center_mask` nigdy się nie zmieniają, więc
+    geometria jest bit-w-bit identyczna z dawnym fit-to-view."""
 
     stroke_painted = pyqtSignal()   # dowolne pociągnięcie = maska nie-domyślna
 
-    def __init__(self, template_pix: QPixmap, mask: np.ndarray, parent=None):
+    def __init__(self, template_pix: QPixmap, mask: np.ndarray, parent=None,
+                 *, zoom_pan: bool = False):
         super().__init__(parent)
         self._pix = template_pix
         self._mask = mask
@@ -84,9 +94,17 @@ class _MaskCanvas(QWidget):
         self._cursor_pos: QPointF | None = None
         self._overlay: QImage | None = None
         self._overlay_dirty = True
+        self._zoom_pan = zoom_pan
+        self._zoom = 1.0
+        self._center_mask = QPointF(template_pix.width() / 2,
+                                     template_pix.height() / 2)
+        self._panning = False
+        self._pan_last_pos: QPointF | None = None
         self.setMouseTracking(True)
         self.setMinimumSize(360, 480)
         self.setCursor(Qt.CursorShape.BlankCursor)
+        if zoom_pan:
+            self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
     # --- API (maska/ustaw_maske — QWidget.mask()/setMask() to metody Qt) ------
     def maska(self) -> np.ndarray:
@@ -104,13 +122,66 @@ class _MaskCanvas(QWidget):
     def set_eraser(self, eraser: bool) -> None:
         self._eraser = eraser
 
+    def reset_view(self) -> None:
+        """Powrót do fit-to-view (100%, wyśrodkowany) — stan startowy."""
+        self._zoom = 1.0
+        self._center_mask = QPointF(self._pix.width() / 2,
+                                     self._pix.height() / 2)
+        self._overlay_dirty = True
+        self.update()
+
     # --- geometria -----------------------------------------------------------
-    def _target_rect(self) -> tuple[float, float, float, float]:
-        """(x, y, w, h) obrazu w widgecie z zachowaniem proporcji."""
+    def _fit_scale(self) -> float:
+        """Skala fit-to-view — obraz w całości mieści się w widgecie."""
         pw, ph = self._pix.width(), self._pix.height()
-        scale = min(self.width() / pw, self.height() / ph)
-        w, h = pw * scale, ph * scale
-        return (self.width() - w) / 2, (self.height() - h) / 2, w, h
+        if pw <= 0 or ph <= 0 or self.width() <= 0 or self.height() <= 0:
+            return 1.0
+        return min(self.width() / pw, self.height() / ph)
+
+    def _effective_scale(self) -> float:
+        return self._fit_scale() * self._zoom
+
+    def _target_rect(self) -> tuple[float, float, float, float]:
+        """(x, y, w, h) obrazu w widgecie — fit-to-view uogólniony o zoom/pan
+        (`_center_mask` = punkt obrazu widoczny na środku widgetu). Przy
+        zoom=1 i center=środek obrazu wynik jest identyczny jak dawny
+        czysty fit-to-view."""
+        pw, ph = self._pix.width(), self._pix.height()
+        s = self._effective_scale()
+        w, h = pw * s, ph * s
+        x = self.width() / 2 - self._center_mask.x() * s
+        y = self.height() / 2 - self._center_mask.y() * s
+        return x, y, w, h
+
+    def _unproject(self, pos: QPointF) -> QPointF:
+        """Punkt obrazu pod pozycją widgetu — do kotwiczenia zoomu."""
+        s = self._effective_scale()
+        if s <= 0:
+            return QPointF(self._center_mask)
+        return QPointF(
+            self._center_mask.x() + (pos.x() - self.width() / 2) / s,
+            self._center_mask.y() + (pos.y() - self.height() / 2) / s)
+
+    def _clamp_center(self) -> None:
+        """`_center_mask` zawsze na obrazie — obraz nigdy nie „ucieka"
+        całkowicie poza widok przy panie."""
+        pw, ph = self._pix.width(), self._pix.height()
+        self._center_mask.setX(max(0.0, min(self._center_mask.x(), float(pw))))
+        self._center_mask.setY(max(0.0, min(self._center_mask.y(), float(ph))))
+
+    def _zoom_at(self, anchor: QPointF, factor: float) -> None:
+        mask_pt = self._unproject(anchor)
+        new_zoom = max(_ZOOM_MIN, min(self._zoom * factor, _ZOOM_MAX))
+        if new_zoom == self._zoom:
+            return
+        self._zoom = new_zoom
+        s = self._effective_scale()
+        self._center_mask = QPointF(
+            mask_pt.x() - (anchor.x() - self.width() / 2) / s,
+            mask_pt.y() - (anchor.y() - self.height() / 2) / s)
+        self._clamp_center()
+        self._overlay_dirty = True   # szerokość docelowa nakładki się zmieniła
+        self.update()
 
     def _map_to_mask(self, pos: QPointF) -> tuple[int, int] | None:
         x, y, w, h = self._target_rect()
@@ -136,13 +207,28 @@ class _MaskCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event):  # noqa: N802 (API Qt)
-        if event.button() == Qt.MouseButton.LeftButton:
+        if (self._zoom_pan and event.button() == Qt.MouseButton.MiddleButton
+                and self._zoom > 1.0):
+            self._panning = True
+            self._pan_last_pos = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if event.button() == Qt.MouseButton.LeftButton and not self._panning:
             pt = self._map_to_mask(event.position())
             if pt is not None:
                 self._last_pt = pt
                 self._stamp(pt, pt)
 
     def mouseMoveEvent(self, event):  # noqa: N802
+        if self._panning and self._pan_last_pos is not None:
+            delta = event.position() - self._pan_last_pos
+            self._pan_last_pos = event.position()
+            s = self._effective_scale()
+            if s > 0:
+                self._center_mask -= QPointF(delta.x() / s, delta.y() / s)
+                self._clamp_center()
+            self.update()
+            return
         self._cursor_pos = event.position()
         if event.buttons() & Qt.MouseButton.LeftButton:
             pt = self._map_to_mask(event.position())
@@ -153,25 +239,62 @@ class _MaskCanvas(QWidget):
             self.update()   # sam ruch kursora — odśwież okrąg pędzla
 
     def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = False
+            self._pan_last_pos = None
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            return
         self._last_pt = None
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        if self._zoom_pan and event.button() == Qt.MouseButton.MiddleButton:
+            self.reset_view()
 
     def leaveEvent(self, event):  # noqa: N802
         self._cursor_pos = None
         self.update()
 
+    def wheelEvent(self, event):  # noqa: N802
+        if not self._zoom_pan:
+            event.ignore()
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            if self._zoom > 1.0:
+                s = self._effective_scale()
+                self._center_mask.setX(
+                    self._center_mask.x() - event.angleDelta().y() / s)
+                self._clamp_center()
+                self.update()
+            event.accept()
+            return
+        factor = _ZOOM_STEP if event.angleDelta().y() > 0 else 1 / _ZOOM_STEP
+        self._zoom_at(event.position(), factor)
+        event.accept()
+
+    def keyPressEvent(self, event):  # noqa: N802
+        if self._zoom_pan and event.key() == Qt.Key.Key_0:
+            self.reset_view()
+            return
+        super().keyPressEvent(event)
+
     # --- malowanie widgetu -------------------------------------------------------
     def paintEvent(self, event):  # noqa: N802
         painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(theme.SURFACE))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         x, y, w, h = self._target_rect()
         rect = QRectF(x, y, w, h)
         painter.drawPixmap(rect, self._pix, QRectF(self._pix.rect()))
 
         if self._overlay_dirty or self._overlay is None:
-            # nakładka w rozdzielczości WYŚWIETLANIA (nie szablonu) — tania
-            # przy każdym pociągnięciu pędzla
+            # nakładka w rozdzielczości WYŚWIETLANIA (nie szablonu), capowana
+            # do natywnej szerokości maski — powyżej niej nakładka binarna
+            # (INTER_NEAREST) nie zyskuje żadnego detalu, a przy wysokim
+            # zoomie `w` mogłoby wielokrotnie przekroczyć rozdzielczość maski
+            mw = self._mask.shape[1]
+            szer = min(max(1, int(w)), mw)
             self._overlay = _koloruj_strefe(
-                self._mask, max(1, int(w)), theme.ACCENT, _OVERLAY_ALPHA)
+                self._mask, szer, theme.ACCENT, _OVERLAY_ALPHA)
             self._overlay_dirty = False
         painter.drawImage(rect, self._overlay)
 
@@ -185,6 +308,24 @@ class _MaskCanvas(QWidget):
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(self._cursor_pos, r_view, r_view)
+
+        if self._zoom > 1.001:
+            label = f"{round(self._zoom * 100)}%"
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            pad = 6
+            badge = QRectF(
+                self.width() - fm.horizontalAdvance(label) - 2 * pad - 10, 10,
+                fm.horizontalAdvance(label) + 2 * pad, fm.height() + 6)
+            painter.setPen(Qt.PenStyle.NoPen)
+            bg = QColor(theme.SURFACE_HOVER)
+            bg.setAlpha(210)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(badge, 6, 6)
+            painter.setPen(QColor(theme.GOLD))
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
 
 
 class MaskEditorDialog(QDialog):

@@ -434,7 +434,10 @@ class WorkspaceView(QWidget):
         crop_layout.setHorizontalSpacing(8)
         crop_layout.setVerticalSpacing(4)
 
-        self.zoom_slider = self._make_slider(50, 250, 100)
+        # zoom < 100% zmniejsza postać poniżej okna — kolaż wypełnia wtedy
+        # okno rozmytą sceną zdjęcia (build_init_image), więc model dorysowuje
+        # scenerię zamiast zostawiać prostokąt; domyślna 110% wypełnia okno
+        self.zoom_slider = self._make_slider(30, 250, 110)
         self.dx_slider = self._make_slider(-100, 100, 0)
         self.dy_slider = self._make_slider(-100, 100, 0)
         self._slider_spins: dict[QSlider, NoScrollSpinBox] = {}

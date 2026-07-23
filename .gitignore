@@ -13,9 +13,16 @@ Przypisane/
 output/
 arkusz_druku.pdf
 Przykladowe_karty_fajne_ale_nie_spojne/
+karty/
+pudelko_*.pdf
 # Style/ zostaje lokalne poza tłami przodu — tła idą do repo
 Style/*
 !Style/tla_przodu/
+# do repo idzie tylko AKTYWNE tło jokera, nie każda próba generacji
+Style/tla_przodu/*/joker_* ai *.png
+!Style/tla_przodu/*/joker_czerwony ai 20260723_130123.png
+!Style/tla_przodu/*/joker_czarny ai 20260722_004335.png
+Style/tla_przodu/*/zrodla/joker_*
 
 # === Generowane / cache ===
 assets/masks/
@@ -29,7 +36,6 @@ venv/
 env/
 .idea/
 .vscode/
-.claude/
 .cursor/
 *.lnk
 

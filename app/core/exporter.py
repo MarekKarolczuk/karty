@@ -19,7 +19,7 @@ __all__ = ["ExportJob", "run_export", "ProgressCb", "CELL", "CELL_SMALL"]
 
 @dataclass
 class ExportJob:
-    kind: str                                   # "pdf" | "zip" | "files" | "atlas" | "sprite"
+    kind: str                                   # "pdf" | "zip" | "files" | "cmyk" | "krm" | "atlas" | "sprite"
     out_path: Path
     fronts: list[tuple[str, Path | None]]       # (nazwa np. "A_kier", ścieżka|None)
     back: Path | None = None

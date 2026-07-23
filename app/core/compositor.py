@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from app import config
 from app.core import masks, style_store
@@ -329,7 +329,9 @@ def build_init_image(suit: Suit, photo_path: Path,
     fill = Image.new("RGB", template.size, kolor)
     layer = Image.composite(fill, template, center)
 
-    # Docelowy prostokąt zdjęcia: centrum symbolu + przesunięcie użytkownika
+    # Docelowy prostokąt zdjęcia: centrum symbolu + przesunięcie użytkownika.
+    # Zoom < 1 świadomie zmniejsza postać poniżej okna (widać więcej sceny);
+    # obsługę „mniejszy niż okno" robi gałąź scenerii niżej.
     target_w = max(24, round(bw * t["zoom"]))
     target_h = max(24, round(bh * t["zoom"]))
     cx = (bx0 + bx1) / 2 + t["dx"] * bw
@@ -337,17 +339,80 @@ def build_init_image(suit: Suit, photo_path: Path,
 
     photo = Image.open(photo_path)
     photo = ImageOps.exif_transpose(photo).convert("RGB")
+
+    # Kadr MNIEJSZY niż okno (zoom < 1): zamiast płaskiego koloru + twardego
+    # prostokąta wypełnij OKNO rozmytym tłem zdjęcia — model dostaje scenerię
+    # do domalowania na cały symbol, a ostra postać wtapia się w nie przez
+    # feather (żadnej twardej krawędzi prostokąta). Przy zoomie ≥ 1 zdjęcie
+    # i tak pokrywa okno — ta gałąź się nie uruchamia (zero zmian dla status quo).
+    mniejszy = target_w < bw or target_h < bh
+    if mniejszy:
+        tlo = ImageOps.fit(photo, (bw, bh), method=Image.Resampling.LANCZOS,
+                           centering=(0.5, 0.42))
+        tlo = tlo.filter(ImageFilter.GaussianBlur(max(6, round(bw * 0.05))))
+        bg = layer.copy()
+        bg.paste(tlo, (bx0, by0))
+        layer = Image.composite(bg, layer, center)   # rozmyta scena tylko w oknie
+
     # centering (0.5, 0.42): przy prawie kwadratowym bboxie okna portret
     # (kadr pionowy) fitowany symetrycznie ucinał głowę — bias ku górze
     # trzyma twarze w kadrze (jak compose_card_raw)
     fitted = ImageOps.fit(photo, (target_w, target_h),
                           method=Image.Resampling.LANCZOS,
                           centering=(0.5, 0.42))
-
-    layer.paste(fitted, (round(cx - target_w / 2), round(cy - target_h / 2)))
+    poz = (round(cx - target_w / 2), round(cy - target_h / 2))
+    if mniejszy:
+        margines = max(4, round(min(target_w, target_h) * 0.10))
+        alfa = Image.new("L", (target_w, target_h), 0)
+        ImageDraw.Draw(alfa).rectangle(
+            (margines, margines, target_w - margines, target_h - margines),
+            fill=255)
+        alfa = alfa.filter(ImageFilter.GaussianBlur(margines))
+        layer.paste(fitted, poz, alfa)
+    else:
+        layer.paste(fitted, poz)
     for box in shield_boxes:
         layer.paste(template.crop(box), (box[0], box[1]))
     return layer
+
+
+def montaz_portretow(paths, *, komorka: int = 460, maks: int = 12,
+                     kolumny: int | None = None) -> Image.Image:
+    """Siatka-montaż (contact sheet) portretów: JEDEN obraz zamiast kilkunastu
+    osobnych referencji (lekki request do modelu, a twarze wciąż czytelne).
+    Komórki z biasem ku górze (twarze), cienkie ramki i odstępy — model czyta
+    odrębne osoby. Bierze pierwsze `maks` ścieżek."""
+    import math
+
+    obrazy: list[Image.Image] = []
+    for p in list(paths)[:maks]:
+        try:
+            obrazy.append(ImageOps.exif_transpose(Image.open(p)).convert("RGB"))
+        except (OSError, ValueError):
+            continue
+    if not obrazy:
+        return Image.new("RGB", (komorka, komorka), config.CREAM_HEX)
+
+    n = len(obrazy)
+    kol = kolumny or max(1, math.ceil(math.sqrt(n)))
+    wier = math.ceil(n / kol)
+    kw = komorka
+    kh = round(komorka * 1.15)          # komórka lekko pionowa (portrety)
+    odstep = max(4, komorka // 40)
+    plotno = Image.new("RGB",
+                       (kol * kw + (kol + 1) * odstep,
+                        wier * kh + (wier + 1) * odstep), config.CREAM_HEX)
+    draw = ImageDraw.Draw(plotno)
+    for i, im in enumerate(obrazy):
+        r, c = divmod(i, kol)
+        x = odstep + c * (kw + odstep)
+        y = odstep + r * (kh + odstep)
+        mini = ImageOps.fit(im, (kw, kh), method=Image.Resampling.LANCZOS,
+                            centering=(0.5, 0.35))
+        plotno.paste(mini, (x, y))
+        draw.rectangle((x, y, x + kw - 1, y + kh - 1),
+                       outline=(60, 60, 60), width=max(1, komorka // 115))
+    return plotno
 
 
 def compose_card_raw(spec: CardSpec, illustration: Image.Image) -> Image.Image:

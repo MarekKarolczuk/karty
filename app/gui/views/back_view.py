@@ -280,8 +280,10 @@ class BackView(QWidget):
             self._reload_wartosci()
 
     def reload_style_slot(self) -> None:
-        """Pełne odświeżenie wszystkich bibliotek (np. po wczytaniu projektu)."""
-        for cat in style_store.CATEGORIES:
+        """Pełne odświeżenie wszystkich bibliotek (np. po wczytaniu projektu).
+        Iteruje tylko po kategoriach zarządzanych przez ten widok (pudełko ma
+        własny widok, więc nie ma tu comba)."""
+        for cat in self._cat_combos:
             self._refresh_combo(cat)
             self._reload_editors(cat)
 
@@ -570,10 +572,22 @@ class BackView(QWidget):
         left.addWidget(self.front_set_back_check)
         self.front_set_jokers_check = QCheckBox("razem z tłami Jokerów (★)")
         self.front_set_jokers_check.setToolTip(
-            "Dwie dodatkowe generacje: tła Jokera czerwonego i czarnego "
-            "w tym samym stylu, z centralnym oknem w kształcie gwiazdy"
+            "Dodatkowe tła Jokera czerwonego i czarnego w tym samym stylu, "
+            "z centralnym oknem w kształcie gwiazdy"
         )
+        self.front_set_jokers_check.toggled.connect(self._refresh_joker_mono)
         left.addWidget(self.front_set_jokers_check)
+        self.front_set_jokers_mono_check = QCheckBox(
+            "czarny Joker = czarno-biała kopia czerwonego")
+        self.front_set_jokers_mono_check.setToolTip(
+            "Tło czarnego Jokera powstaje jako odbarwiona (grayscale) kopia "
+            "tła czerwonego — identyczny kształt/okno, bez osobnej generacji "
+            "AI. Odznacz, by generować oba jokery osobno."
+        )
+        self.front_set_jokers_mono_check.setChecked(style_store.joker_mono_mode())
+        self.front_set_jokers_mono_check.toggled.connect(self._on_joker_mono_toggled)
+        left.addWidget(self.front_set_jokers_mono_check)
+        self._refresh_joker_mono()
 
         self.front_import_btn = QPushButton("📁  Wgraj własne tło")
         self.front_import_btn.setObjectName("ghostBtn")
@@ -868,10 +882,19 @@ class BackView(QWidget):
             "count": count,
         })
 
+    def _refresh_joker_mono(self, _on: bool = False) -> None:
+        """Opcja odbarwiania czarnego jokera ma sens tylko z tłami jokerów."""
+        self.front_set_jokers_mono_check.setEnabled(
+            self.front_set_jokers_check.isChecked())
+
+    def _on_joker_mono_toggled(self, on: bool) -> None:
+        style_store.set_text("tla_przodu", "joker_mono", "1" if on else "0")
+
     def _emit_generate_front_set(self) -> None:
         self.generate_front_set_clicked.emit({
             "include_back": self.front_set_back_check.isChecked(),
             "include_jokers": self.front_set_jokers_check.isChecked(),
+            "jokery_odbarw": self.front_set_jokers_mono_check.isChecked(),
         })
 
     def _pick_front_file(self) -> None:

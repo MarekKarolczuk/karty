@@ -21,8 +21,8 @@ MODEL_DESCRIPTIONS = {
     "gemini-2.5-flash-image": "Szybki inpainting image-to-image. "
                               "Najlepsza wierność detali.",
     "gemini-3-pro-image": "Najwyższa jakość ilustracji, wolniejszy.",
-    "gemini-3.1-flash-image-preview": "Nano Banana 2 — szybki i tani następca "
-                                      "Imagen (preview).",
+    "gemini-3.1-flash-image": "Nano Banana 2 — szybki i tani model GA, dobry "
+                              "do większości kart.",
 }
 PROVIDER_TAGS = {"gemini": "Google"}
 

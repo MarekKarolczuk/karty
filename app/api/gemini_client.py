@@ -20,10 +20,22 @@ class GeminiError(RuntimeError):
 _API_KEY_SLOT = "__api__"
 _clients: dict[str, genai.Client] = {}
 
+# Ponowienie po PUSTEJ odpowiedzi (model zwrócił tekst zamiast obrazu): przy
+# każdej kolejnej próbie lekko podbijamy temperaturę i zmieniamy seed — inny
+# stan próbkowania zwykle sprawia, że model wreszcie wyemituje obraz (wzorzec
+# jak echo-retry w generator._FIX_ECHO_TEMP_BUMP).
+PUSTA_TEMP_BUMP = 0.15
+
 
 def reset_client() -> None:
     """Wymusza nowych klientów po zmianie klucza API / regionu (Ustawienia)."""
     _clients.clear()
+
+
+def _http_options() -> types.HttpOptions:
+    """Timeout per wywołanie (MS) — wiszące połączenie zrywa się zamiast wisieć
+    w nieskończoność (spinner bez końca przy generacji)."""
+    return types.HttpOptions(timeout=config.API_TIMEOUT_MS)
 
 
 def get_client(location: str | None = None) -> genai.Client:
@@ -40,13 +52,15 @@ def get_client(location: str | None = None) -> genai.Client:
                 vertexai=True,
                 project=config.GCP_PROJECT,
                 location=loc,
+                http_options=_http_options(),
             )
         return _clients[loc]
 
     if not config.GEMINI_API_KEY:
         raise GeminiError("Brak GEMINI_API_KEY — uzupełnij plik .env")
     if _API_KEY_SLOT not in _clients:
-        _clients[_API_KEY_SLOT] = genai.Client(api_key=config.GEMINI_API_KEY)
+        _clients[_API_KEY_SLOT] = genai.Client(
+            api_key=config.GEMINI_API_KEY, http_options=_http_options())
     return _clients[_API_KEY_SLOT]
 
 
@@ -59,11 +73,15 @@ def _model_name() -> str:
 
 def _generation_config(seed: int | None, poziom: int = 0,
                        temperature: float | None = None,
+                       aspect_ratio: str | None = None,
                        ) -> types.GenerateContentConfig:
     """Config stabilizujący spójność talii: niska temperatura + seed.
 
     temperature — nadpisanie per wywołanie (suwak „Siła poprawki" w poprawce
     selektywnej); None = domyślne config.GEN_TEMPERATURE.
+    aspect_ratio — twardy hint kadru dla modeli obrazowych (np. „21:9" dla
+    szerokiego pudełka), dołączany TYLKO na poziomie 0 i gdy SDK zna klasę
+    types.ImageConfig; inaczej cicho pomijany (starszy SDK / model bez pola).
 
     Dwustopniowa degradacja dla backendów odrzucających pola (INVALID_ARGUMENT):
     poziom 0 — pełny config; poziom 1 — bez response_modalities, ale SEED
@@ -73,11 +91,17 @@ def _generation_config(seed: int | None, poziom: int = 0,
         return types.GenerateContentConfig(temperature=temp)
     if poziom == 1:
         return types.GenerateContentConfig(temperature=temp, seed=seed)
-    return types.GenerateContentConfig(
+    cfg = types.GenerateContentConfig(
         temperature=temp,
         seed=seed,
         response_modalities=["TEXT", "IMAGE"],
     )
+    if aspect_ratio and hasattr(types, "ImageConfig"):
+        try:
+            cfg.image_config = types.ImageConfig(aspect_ratio=aspect_ratio)
+        except Exception:
+            pass    # SDK/model bez wsparcia proporcji — składanie i tak nie utnie
+    return cfg
 
 
 def _raise_if_fatal(exc: Exception, model: str) -> None:
@@ -109,7 +133,7 @@ def _raise_if_fatal(exc: Exception, model: str) -> None:
             "Klucz GEMINI_API_KEY jest nieprawidłowy lub bez uprawnień — "
             "popraw go w Ustawieniach."
         ) from exc
-    # model niedostępny w regionie / brak dostępu — nie retry'uj
+    # model niedostępny w regionie / brak dostępu na Vertex — nie retry'uj
     if config.USE_VERTEX and any(
         s in text for s in ("404", "NOT_FOUND", "does not have access")
     ):
@@ -119,27 +143,52 @@ def _raise_if_fatal(exc: Exception, model: str) -> None:
             f"„{region}” (lub projekt nie ma do niego dostępu). Wybierz "
             "inny model albo region w Ustawieniach."
         ) from exc
+    # model wygaszony / nieistniejący (np. Google wyłączył wersję preview) —
+    # także na AI Studio: nie ma sensu retry'ować, wytłumacz przyczynę
+    if any(s in text for s in ("404", "NOT_FOUND", "is not found",
+                               "deprecated", "has been discontinued",
+                               "no longer available")):
+        raise FatalAPIError(
+            f"Model „{model}” jest niedostępny lub został wyłączony przez "
+            "Google — wybierz inny model w Ustawieniach."
+        ) from exc
 
 
 def generate_image(contents: list, retries: int = 3,
                    seed: int | None = None,
-                   temperature: float | None = None) -> Image.Image:
+                   temperature: float | None = None,
+                   aspect_ratio: str | None = None) -> Image.Image:
     """Wysyła prompt (tekst + obrazy PIL) i zwraca pierwszy obraz z odpowiedzi.
 
     seed — deterministyczny wariant (spójność talii); None = losowo
     (tła/rewers, gdzie warianty MAJĄ się różnić).
     temperature — nadpisanie per wywołanie (siła poprawki selektywnej);
-    None = config.GEN_TEMPERATURE."""
+    None = config.GEN_TEMPERATURE.
+    aspect_ratio — hint kadru dla modeli obrazowych (np. „21:9" — pudełko);
+    przy odrzuceniu pola przez backend jest cicho pomijany (bez_aspect)."""
     last_error: Exception | None = None
     model = _model_name()
     poziom_configu = 0
+    bez_aspect = False    # backend odrzucił image_config → ponów bez proporcji
+    pusta_odpowiedz = 0   # ile razy model nie zwrócił obrazu (nudge seed/temp)
     for attempt in range(1, retries + 1):
+        # Po pustej odpowiedzi ponawiamy z INNYM seedem i lekko wyższą tempera-
+        # turą — ta sama para (prompt, seed, temp) często znów da tekst zamiast
+        # obrazu; zmiana stanu próbkowania wybija model z tej ścieżki.
+        seed_efekt = seed
+        if seed is not None and pusta_odpowiedz:
+            seed_efekt = seed + pusta_odpowiedz
+        temp_efekt = temperature
+        if pusta_odpowiedz:
+            baza = config.GEN_TEMPERATURE if temperature is None else temperature
+            temp_efekt = min(1.0, baza + PUSTA_TEMP_BUMP * pusta_odpowiedz)
         try:
             response = get_client(config.vertex_location_for(model)).models.generate_content(
                 model=model,
                 contents=contents,
-                config=_generation_config(seed, poziom=poziom_configu,
-                                          temperature=temperature),
+                config=_generation_config(
+                    seed_efekt, poziom=poziom_configu, temperature=temp_efekt,
+                    aspect_ratio=None if bez_aspect else aspect_ratio),
             )
             for candidate in response.candidates or []:
                 if candidate.content is None:
@@ -147,11 +196,18 @@ def generate_image(contents: list, retries: int = 3,
                 for part in candidate.content.parts or []:
                     if part.inline_data is not None and part.inline_data.data:
                         return Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
-            raise GeminiError(
-                f"Model nie zwrócił obrazu (odpowiedź: {getattr(response, 'text', None) or 'pusta'})"
-            )
+            # Brak obrazu = przejściowa porażka, NIE twardy błąd: model bywa
+            # zwraca tekst. Ponawiamy (z nudge seed/temp powyżej) zamiast
+            # wywalać całą generację na pojedynczej pustej odpowiedzi.
+            pusta_odpowiedz += 1
+            last_error = GeminiError(
+                f"Model nie zwrócił obrazu (odpowiedź: "
+                f"{getattr(response, 'text', None) or 'pusta'})")
+            if attempt < retries:
+                time.sleep(1 * attempt)
+                continue
         except GeminiError:
-            raise
+            raise   # np. brak klucza/projektu z get_client — nie ponawiać
         except Exception as exc:  # błędy sieci / limity API
             last_error = exc
             text = str(exc)
@@ -159,6 +215,11 @@ def generate_image(contents: list, retries: int = 3,
             # w górę, każdy poziom raz): najpierw bez response_modalities
             # (SEED ZOSTAJE — spójność talii), dopiero potem bez seeda
             if "INVALID_ARGUMENT" in text:
+                low = text.lower()
+                if (not bez_aspect
+                        and ("aspect" in low or "image_config" in low)):
+                    bez_aspect = True    # ponów bez proporcji — składanie i tak nie utnie
+                    continue
                 if "seed" in text.lower() and poziom_configu < 2:
                     poziom_configu = 2
                     continue
@@ -168,6 +229,11 @@ def generate_image(contents: list, retries: int = 3,
             _raise_if_fatal(exc, model)
             if attempt < retries:
                 time.sleep(2 * attempt)
+    if isinstance(last_error, GeminiError):
+        # wyczerpano próby na pustych odpowiedziach — komunikat akcyjny
+        raise GeminiError(
+            f"Model nie zwrócił obrazu po {retries} próbach — spróbuj ponownie, "
+            f"uprość prompt albo zmień model w Ustawieniach.")
     raise GeminiError(f"Wywołanie Gemini nie powiodło się po {retries} próbach: {last_error}")
 
 

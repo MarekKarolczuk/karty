@@ -176,12 +176,16 @@ class TemplateSetWorker(QThread):
 
     def __init__(self, suits: list[Suit] | None = None,
                  back_prompt: str | None = None, back_source=None,
-                 back_orientation: str = "portrait", parent=None):
+                 back_orientation: str = "portrait",
+                 jokery_odbarw: bool = True, parent=None):
         super().__init__(parent)
         self.suits = list(suits) if suits else Suit.kolory()
         self.back_prompt = back_prompt       # None = bez rewersu
         self.back_source = back_source
         self.back_orientation = back_orientation
+        # True = tło czarnego jokera powstaje jako czarno-biała kopia czerwonego
+        # (bez osobnej generacji AI) — identyczne tła obu jokerów
+        self.jokery_odbarw = jokery_odbarw
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -198,19 +202,29 @@ class TemplateSetWorker(QThread):
         total = len(self.suits) + (1 if self.back_prompt else 0)
         made = 0
         anchor: Path | None = None   # pierwsze tło zestawu = referencja reszty
+        joker_czerwony_path: Path | None = None   # źródło derywacji czarnego
         for suit in self.suits:
             if self._cancelled:
                 break
             try:
-                path = generator.generate_template(
-                    suit,
-                    prompts.front_set_prompt(suit, with_reference=anchor is not None),
-                    reference=anchor,
-                    use_auto_reference=False,
-                    seed=config.GEN_SEED,
-                )
+                if (self.jokery_odbarw and suit is Suit.JOKER_CZARNY
+                        and joker_czerwony_path is not None):
+                    # tło czarnego jokera = czarno-biała kopia czerwonego (bez AI)
+                    path = generator.derywuj_tlo_czarnego_jokera(
+                        joker_czerwony_path)
+                else:
+                    path = generator.generate_template(
+                        suit,
+                        prompts.front_set_prompt(
+                            suit, with_reference=anchor is not None),
+                        reference=anchor,
+                        use_auto_reference=False,
+                        seed=config.GEN_SEED,
+                    )
                 if anchor is None:
                     anchor = path
+                if suit is Suit.JOKER_CZERWONY:
+                    joker_czerwony_path = path
                 made += 1
                 self.variant_done.emit(suit, str(path))
             except Exception as exc:
@@ -260,6 +274,91 @@ class BackWorker(QThread):
             self.done.emit(str(path))
         except StabilityAborted:
             self.failed.emit("Anulowano generację rewersu")
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+
+
+class BoxWorker(QThread):
+    """Generowanie grafiki pudełka (AI) w tle — jedna scena ze wszystkich
+    zdjęć osób talii wciśnięta w wykrojnik."""
+
+    done = pyqtSignal(str)     # ścieżka proof pudełka
+    failed = pyqtSignal(str)   # komunikat błędu
+    progress = pyqtSignal(str) # etap generacji (status na zakładce Pudełko)
+
+    def __init__(self, prompt, dieline_path, foto_paths, design_mm,
+                 seed=None, tryb="scena", prompt_front=None, prompt_back=None,
+                 card_paths=None, boki_ai=False, liczba_osob=None,
+                 osobne_foto=None, parent=None):
+        super().__init__(parent)
+        self.prompt = prompt
+        self.dieline_path = dieline_path
+        self.foto_paths = foto_paths
+        self.design_mm = design_mm
+        self.seed = seed
+        self.tryb = tryb
+        self.prompt_front = prompt_front
+        self.prompt_back = prompt_back
+        self.card_paths = card_paths
+        self.boki_ai = boki_ai
+        self.liczba_osob = liczba_osob
+        self.osobne_foto = osobne_foto
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        from app.api.stability_client import StabilityAborted
+        try:
+            path = generator.generate_box(
+                self.prompt, self.dieline_path, self.foto_paths,
+                self.design_mm, seed=self.seed, tryb=self.tryb,
+                prompt_front=self.prompt_front, prompt_back=self.prompt_back,
+                card_paths=self.card_paths, boki_ai=self.boki_ai,
+                liczba_osob=self.liczba_osob, osobne_foto=self.osobne_foto,
+                postep=self.progress.emit)
+            self.done.emit(str(path))
+        except StabilityAborted:
+            self.failed.emit("Anulowano generację pudełka")
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+
+
+class BoxFixWorker(QThread):
+    """Selektywna poprawa artworku pudełka (reużyty FixRegionDialog) →
+    generator.popraw_pudelko. Wynik nadpisuje raw i proof."""
+
+    done = pyqtSignal(str)     # ścieżka proof
+    failed = pyqtSignal(str)
+
+    def __init__(self, maska, prompt_text, dieline_path, design_mm,
+                 tryb="ai", sila=3, parent=None):
+        super().__init__(parent)
+        self.maska = maska
+        self.prompt_text = prompt_text
+        self.dieline_path = dieline_path
+        self.design_mm = design_mm
+        self.tryb = tryb
+        self.sila = sila
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        try:
+            path = generator.popraw_pudelko(
+                self.maska, self.prompt_text, self.dieline_path,
+                self.design_mm, tryb=self.tryb, sila=self.sila)
+            if not self._cancelled:
+                self.done.emit(str(path))
         except Exception as exc:
             if not self._cancelled:
                 self.failed.emit(str(exc))

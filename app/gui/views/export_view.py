@@ -10,11 +10,15 @@ from PyQt6.QtWidgets import (
 
 from app import config
 from app.core import style_store
+from app.core.eksport.cmyk import SILA_DOMYSLNA, SILA_MAX, SILA_MIN
+from app.core.eksport.formaty import MARGINES_BEZPIECZENSTWA_MM, SPAD_MM
 from app.gui.views import view_header
+from app.gui.widgets import SnapSlider
 
 
 class ExportView(QWidget):
-    export_clicked = pyqtSignal(str)   # "pdf" | "files" | "zip" | "atlas" | "sprite"
+    export_clicked = pyqtSignal(str)   # "pdf" | "files" | "cmyk" | "krm" | "zip" | "atlas" | "sprite"
+    preview_boost_clicked = pyqtSignal(int)   # siła podbicia → podgląd „przed | po"
     options_changed = pyqtSignal()     # zmiana opcji → zapis do projekt.json
 
     def __init__(self, parent=None):
@@ -52,12 +56,29 @@ class ExportView(QWidget):
 
         self._print_group = QButtonGroup(self)
         self.radio_pdf = QRadioButton("Arkusz PDF (A4 · 9 kart/stronę)")
-        self.radio_files = QRadioButton("Pojedyncze pliki (300 DPI)")
+        self.radio_files = QRadioButton("Pojedyncze pliki PNG (300 DPI · RGB)")
+        self.radio_cmyk = QRadioButton("Pliki CMYK do druku (TIFF · spad 3 mm)")
+        self.radio_cmyk.setToolTip(
+            "Jeden plik TIFF na kartę: CMYK, 300 DPI, spad 3 mm — gotowe do "
+            "wysłania do drukarni. Profil ICC weź z assets/icc (można wrzucić "
+            "profil własnej drukarni)."
+        )
+        self.radio_krm = QRadioButton("Druk do KRM (PDF CMYK · jeden plik)")
+        self.radio_krm.setToolTip(
+            "Wielostronicowy PDF CMYK 300 DPI wg specyfikacji drukarni KRM:\n"
+            "• strona = pełne brutto formatu (netto + spad 3 mm)\n"
+            "• karta przeskalowana z zachowaniem proporcji tak, by zmieścić się\n"
+            "  5 mm w głąb od linii cięcia, i wyśrodkowana\n"
+            "• całe tło zalane jednolitym kolorem z krawędzi karty — bez białych\n"
+            "  rogów, przezroczystości i zaokrągleń\n"
+            "• strona 1 to rewers, kolejne to awersy\n"
+            "Spad i znaczniki cięcia nie mają tu zastosowania (geometria sztywna)."
+        )
         self.radio_pdf.setChecked(True)
-        self._print_group.addButton(self.radio_pdf)
-        self._print_group.addButton(self.radio_files)
-        print_layout.addWidget(self.radio_pdf)
-        print_layout.addWidget(self.radio_files)
+        for radio in (self.radio_pdf, self.radio_files, self.radio_cmyk,
+                      self.radio_krm):
+            self._print_group.addButton(radio)
+            print_layout.addWidget(radio)
 
         check_row = QHBoxLayout()
         self.bleed_check = QCheckBox("Spad 3 mm")
@@ -79,6 +100,40 @@ class ExportView(QWidget):
             "część drukarek tyle nie zadrukuje"
         )
         print_layout.addWidget(self.narrow_check)
+
+        # --- podbicie kolorów (dotyczy wyjść CMYK) ------------------------------------
+        boost_row = QHBoxLayout()
+        self.boost_caption = QLabel("Podbicie kolorów (druk)")
+        boost_row.addWidget(self.boost_caption)
+        self.boost_slider = SnapSlider(SILA_MIN, SILA_MAX, SILA_DOMYSLNA)
+        self.boost_slider.setFixedWidth(140)
+        self.boost_slider.setToolTip(
+            "Kompensuje węższy gamut CMYK: rozciągnięcie zakresu tonalnego, "
+            "gamma, kontrast, nasycenie i mikrokontrast.\n"
+            "1 = prawie bez ingerencji, 3 = domyślne, 5 = mocne."
+        )
+        boost_row.addWidget(self.boost_slider)
+        self.boost_value = QLabel(str(SILA_DOMYSLNA))
+        self.boost_value.setObjectName("hint")
+        boost_row.addWidget(self.boost_value)
+        self.boost_preview_btn = QPushButton("👁  Podgląd podbicia")
+        self.boost_preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.boost_preview_btn.setToolTip(
+            "Składa PNG z porównaniem przed/po na pierwszej gotowej karcie "
+            "— ocena bez drukowania całego PDF-a."
+        )
+        self.boost_preview_btn.clicked.connect(
+            lambda: self.preview_boost_clicked.emit(self.boost_level()))
+        boost_row.addWidget(self.boost_preview_btn)
+        boost_row.addStretch(1)
+        print_layout.addLayout(boost_row)
+        self.boost_slider.valueChanged.connect(self._on_boost_changed)
+
+        # bez profilu ICC konwersja CMYK jest niekalibrowana (choć z uczciwą
+        # czernią) — użytkownik ma to widzieć PRZED wysyłką do drukarni
+        self.icc_hint = QLabel()
+        self.icc_hint.setObjectName("hint")
+        print_layout.addWidget(self.icc_hint)
 
         self.format_hint = QLabel()
         self.format_hint.setObjectName("hint")
@@ -145,23 +200,58 @@ class ExportView(QWidget):
         layout.addLayout(progress_row)
 
         # każda zmiana opcji eksportu → sygnał zapisu (trwałość między sesjami)
-        for btn in (self.radio_pdf, self.radio_files, self.radio_zip,
-                    self.radio_sprite, self.radio_tts):
+        for btn in (self.radio_pdf, self.radio_files, self.radio_cmyk,
+                    self.radio_krm, self.radio_zip, self.radio_sprite,
+                    self.radio_tts):
             btn.toggled.connect(self._emit_options_changed)
         for chk in (self.bleed_check, self.marks_check, self.backs_check,
                     self.narrow_check, self.small_check):
             chk.toggled.connect(self._emit_options_changed)
 
+        # podpowiedź rozmiaru pliku zależy od trybu CMYK i spadu
+        for w in (self.radio_pdf, self.radio_files, self.radio_cmyk,
+                  self.radio_krm, self.bleed_check):
+            w.toggled.connect(lambda _c: self._refresh_format_hint())
+        for w in (self.radio_pdf, self.radio_files, self.radio_cmyk,
+                  self.radio_krm):
+            w.toggled.connect(lambda _c: self._refresh_print_options())
+
+        self._refresh_print_options()
         self._refresh_format_hint()
 
     def _emit_options_changed(self, _checked: bool = False) -> None:
         if not self._loading:
             self.options_changed.emit()
 
+    def _on_boost_changed(self, value: int) -> None:
+        self.boost_value.setText(str(value))
+        self._emit_options_changed()
+
+    def _refresh_print_options(self) -> None:
+        """Podbicie kolorów dotyczy tylko wyjść CMYK; przy KRM geometria jest
+        sztywna, więc spad i znaczniki cięcia są nieaktywne."""
+        cmyk = self.radio_cmyk.isChecked() or self.radio_krm.isChecked()
+        for w in (self.boost_caption, self.boost_slider, self.boost_value,
+                  self.boost_preview_btn):
+            w.setEnabled(cmyk)
+        profil = config.cmyk_profile_path()
+        self.icc_hint.setText(
+            f"◈  profil ICC: {profil.name}" if profil is not None
+            else "◈  brak profilu ICC — kolory niekalibrowane "
+                 "(wrzuć plik .icc od drukarni do assets/icc/)")
+        self.icc_hint.setVisible(cmyk)
+        krm = self.radio_krm.isChecked()
+        for chk in (self.bleed_check, self.marks_check):
+            chk.setEnabled(not krm)
+
     def settings(self) -> dict:
         """Stan opcji eksportu do zapisania w projekt.json."""
         return {
-            "print_kind": "files" if self.radio_files.isChecked() else "pdf",
+            "print_kind": ("krm" if self.radio_krm.isChecked()
+                           else "cmyk" if self.radio_cmyk.isChecked()
+                           else "files" if self.radio_files.isChecked()
+                           else "pdf"),
+            "boost": self.boost_level(),
             "game_kind": ("sprite" if self.radio_sprite.isChecked()
                           else "atlas" if self.radio_tts.isChecked() else "zip"),
             "bleed": self.bleed_check.isChecked(),
@@ -176,8 +266,12 @@ class ExportView(QWidget):
         if not isinstance(data, dict):
             return
         self._loading = True
-        (self.radio_files if data.get("print_kind") == "files"
+        print_kind = data.get("print_kind")
+        (self.radio_krm if print_kind == "krm"
+         else self.radio_cmyk if print_kind == "cmyk"
+         else self.radio_files if print_kind == "files"
          else self.radio_pdf).setChecked(True)
+        self.boost_slider.setValue(int(data.get("boost", SILA_DOMYSLNA)))
         game = data.get("game_kind")
         (self.radio_sprite if game == "sprite"
          else self.radio_tts if game == "atlas"
@@ -195,8 +289,27 @@ class ExportView(QWidget):
 
     def _refresh_format_hint(self) -> None:
         w, h = config.CARD_MM
-        self.format_hint.setText(f"⌗  {w:g} × {h:g} mm  ·  ◈  300 DPI  "
-                                 "(format zmienisz w Ustawieniach)")
+        if self.radio_krm.isChecked():
+            from app.core.eksport.formaty import aktywny_format
+            fmt = aktywny_format()
+            brutto_mm, brutto_px = fmt.mm_ze_spadem, fmt.px_300dpi_ze_spadem
+            # karta skalowana JEDNOLICIE do prostokąta bezpieczeństwa
+            rw, rh = fmt.mm_ramki
+            skala = min(rw / w, rh / h)
+            self.format_hint.setText(
+                f"⌗  plik {brutto_mm[0]:g} × {brutto_mm[1]:g} mm "
+                f"({brutto_px[0]} × {brutto_px[1]} px)  ·  cięcie {w:g} × {h:g}"
+                f"  ·  karta {w * skala:.0f} × {h * skala:.0f} mm "
+                f"(margines bezp. {MARGINES_BEZPIECZENSTWA_MM:g} + spad "
+                f"{SPAD_MM:g} mm)  ·  ◈  300 DPI · CMYK")
+        elif self.radio_cmyk.isChecked() and self.bleed_check.isChecked():
+            spad = 3
+            self.format_hint.setText(
+                f"⌗  plik {w + 2 * spad:g} × {h + 2 * spad:g} mm  "
+                f"(netto {w:g} × {h:g} + spad {spad} mm)  ·  ◈  300 DPI · CMYK")
+        else:
+            self.format_hint.setText(f"⌗  {w:g} × {h:g} mm  ·  ◈  300 DPI  "
+                                     "(format zmienisz w Ustawieniach)")
 
     # --- emisje -----------------------------------------------------------------------
     def _guard_ready(self) -> bool:
@@ -211,9 +324,14 @@ class ExportView(QWidget):
     def _emit_print_export(self) -> None:
         if not self._guard_ready():
             return
-        self.export_clicked.emit(
-            "pdf" if self.radio_pdf.isChecked() else "files"
-        )
+        if self.radio_krm.isChecked():
+            self.export_clicked.emit("krm")
+        elif self.radio_cmyk.isChecked():
+            self.export_clicked.emit("cmyk")
+        elif self.radio_files.isChecked():
+            self.export_clicked.emit("files")
+        else:
+            self.export_clicked.emit("pdf")
 
     def _emit_game_export(self) -> None:
         if not self._guard_ready():
@@ -228,6 +346,13 @@ class ExportView(QWidget):
     # --- API -----------------------------------------------------------------------
     def pdf_columns(self) -> int:
         return 2 if self.narrow_check.isChecked() else 3
+
+    def boost_level(self) -> int:
+        """Siła podbicia kolorów (1-5) dla wyjść CMYK."""
+        return int(self.boost_slider.value())
+
+    def krm_selected(self) -> bool:
+        return self.radio_krm.isChecked()
 
     def set_ready_info(self, done: int, total: int) -> None:
         self._ready_done = done

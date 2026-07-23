@@ -56,10 +56,14 @@ class StrategiaUkladu(ABC):
 # ------------------------------------------------------------------ pojedyncze
 class UkladPojedynczy(StrategiaUkladu):
     """Karty w postaci niezmienionej (tablica pojedynczych obrazów) + rewers
-    jako osobna pozycja; metadane = manifest talii (dla ZIP-a)."""
+    jako osobna pozycja; metadane = manifest talii (dla ZIP-a).
 
-    def __init__(self, format: FormatKarty):
+    rewers_pierwszy=True stawia rewers NA POCZĄTKU (strona 1 wielostronicowego
+    PDF-a — wymóg druku w KRM); domyślnie ląduje na końcu."""
+
+    def __init__(self, format: FormatKarty, rewers_pierwszy: bool = False):
         self.format = format
+        self.rewers_pierwszy = rewers_pierwszy
 
     def uloz(self, karty: list[Karta], rewers: Image.Image | None,
              progress: ProgressCb | None = None) -> WynikUkladu:
@@ -67,8 +71,12 @@ class UkladPojedynczy(StrategiaUkladu):
         plotna = [img for _n, img in obecne]
         nazwy = [n for n, _img in obecne]
         if rewers is not None:
-            plotna.append(rewers)
-            nazwy.append("rewers")
+            if self.rewers_pierwszy:
+                plotna.insert(0, rewers)
+                nazwy.insert(0, "rewers")
+            else:
+                plotna.append(rewers)
+                nazwy.append("rewers")
         manifest = {
             "format": f"{self.format.szerokosc_mm:g}x"
                       f"{self.format.wysokosc_mm:g} mm",

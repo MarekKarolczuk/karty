@@ -10,14 +10,15 @@ from typing import TYPE_CHECKING
 
 from app.core.eksport.formaty import aktywny_format
 from app.core.eksport.procesor import (
-    ProcesorKarty, wczytaj_karte, wczytaj_rewers,
+    Procesor, ProcesorKarty, ProcesorKRM, wczytaj_karte, wczytaj_rewers,
 )
 from app.core.eksport.uklady import (
     Karta, ProgressCb, StrategiaUkladu, UkladA4, UkladPojedynczy,
     atlas_tts, sprite_13x4,
 )
 from app.core.eksport.wyjscia import (
-    StrategiaWyjscia, WyjscieFolder, WyjsciePDF, WyjsciePNG, WyjscieZIP,
+    StrategiaWyjscia, WyjscieFolderDruk, WyjsciePDF, WyjsciePDF_CMYK,
+    WyjsciePNG, WyjscieZIP,
 )
 
 if TYPE_CHECKING:
@@ -31,7 +32,7 @@ class ExportManager:
     wymagaj_kart=False (atlas/sprite): pusta talia daje arkusz wypełniaczy
     zamiast błędu — zgodność z dotychczasowym zachowaniem.
     """
-    procesor: ProcesorKarty | None
+    procesor: Procesor | None
     uklad: StrategiaUkladu
     wyjscie: StrategiaWyjscia
     wymagaj_kart: bool = True
@@ -71,11 +72,40 @@ def manager_dla_joba(job: "ExportJob") -> ExportManager:
                           max_kolumny=job.columns),
             wyjscie=WyjsciePDF(),
         )
-    if job.kind in ("zip", "files"):
+    if job.kind == "zip":
+        # paczka do gry: czyste karty, bez spadu/znaczników
         return ExportManager(
             procesor=None,
             uklad=UkladPojedynczy(fmt),
-            wyjscie=WyjscieZIP() if job.kind == "zip" else WyjscieFolder(),
+            wyjscie=WyjscieZIP(),
+        )
+    if job.kind == "files":
+        # RGB PNG per karta do druku: spad + (opcjonalnie) znaczniki, 300 DPI
+        return ExportManager(
+            procesor=ProcesorKarty(fmt, spad=job.bleed, znaczniki=job.marks),
+            uklad=UkladPojedynczy(fmt),
+            wyjscie=WyjscieFolderDruk(fmt, spad=job.bleed),
+        )
+    if job.kind == "cmyk":
+        # JEDEN wielostronicowy PDF CMYK do druku (strona = karta ze spadem +
+        # znaczniki), podbite kolory
+        return ExportManager(
+            procesor=ProcesorKarty(fmt, spad=job.bleed, znaczniki=job.marks),
+            uklad=UkladPojedynczy(fmt),
+            wyjscie=WyjsciePDF_CMYK(fmt, spad=job.bleed,
+                                    podbicie=job.extra.get("podbicie")),
+        )
+    if job.kind == "krm":
+        # Druk w KRM: wielostronicowy PDF CMYK, strona = pełne brutto formatu
+        # (netto + spad), karta wyśrodkowana w marginesie bezpieczeństwa,
+        # reszta zalana jednolitym tłem z krawędzi. Strona 1 = rewers.
+        # Spad/znaczniki z GUI nie mają tu zastosowania — geometria sztywna.
+        return ExportManager(
+            procesor=ProcesorKRM(fmt),
+            uklad=UkladPojedynczy(fmt, rewers_pierwszy=True),
+            wyjscie=WyjsciePDF_CMYK(
+                fmt, spad=True, podbicie=job.extra.get("podbicie"),
+                tytul=f"Atelier Kart — druk KRM {fmt.etykieta}"),
         )
     if job.kind == "atlas":
         return ExportManager(procesor=None, uklad=atlas_tts(job.small_atlas),

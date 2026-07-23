@@ -8,12 +8,14 @@ Uruchomienie:  python -m scripts.test_eksport
 """
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 from app import config
@@ -177,6 +179,113 @@ def main() -> int:
     print(f"Tarot: {len(wynik.plotna)} plocien (oczekiwane 4), "
           f"strona {wynik.plotna[0].size} (oczekiwane (2480, 3508)) -> "
           f"{'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- Druk KRM: geometria strony ---------------------------------------------------
+    from app.core.eksport.cmyk import rgb_na_cmyk
+    from app.core.eksport.procesor import ProcesorKRM, kolor_krawedzi
+    fmt_poker = fmts["poker"]
+    tlo_rgb = (0x2A, 0x40, 0x70)
+    probka = Image.new("RGB", (1695, 2373), tlo_rgb)
+    # jasny prostokat w srodku - odrozni karte od tla przy pomiarze marginesow
+    probka.paste(Image.new("RGB", (1200, 1800), "#E0D8C0"), (247, 286))
+    strona = ProcesorKRM(fmt_poker).przetworz(probka)
+    arr = np.asarray(strona)
+    # bbox karty: piksele rozne od koloru tla (tlo jest jednolite)
+    rozne = np.any(arr != np.asarray(kolor_krawedzi(probka)), axis=2)
+    ys, xs = np.where(rozne)
+    lewy, prawy = int(xs.min()), strona.width - 1 - int(xs.max())
+    gora, dol = int(ys.min()), strona.height - 1 - int(ys.max())
+    szer, wys = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+    ramka = fmt_poker.px_ramki_300dpi
+    # tlo poza karta ma byc JEDNYM kolorem (bez bialych rogow i przezroczystosci)
+    pas = np.concatenate([arr[:gora].reshape(-1, 3),
+                          arr[strona.height - dol:].reshape(-1, 3)])
+    ok = (strona.size == (815, 1110) and strona.mode == "RGB"
+          and abs(lewy - prawy) <= 1 and abs(gora - dol) <= 1
+          and szer <= ramka[0] and wys <= ramka[1]
+          and len({tuple(p) for p in pas}) == 1
+          and tuple(pas[0]) == kolor_krawedzi(probka))
+    print(f"KRM geometria: strona {strona.size} (oczekiwane (815, 1110)), "
+          f"karta {szer}x{wys} px w ramce {ramka[0]}x{ramka[1]}, "
+          f"marginesy L/P {lewy}/{prawy}, G/D {gora}/{dol}, "
+          f"tlo {len({tuple(p) for p in pas})} kolor(y) -> "
+          f"{'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- Druk KRM: biale zaokraglenia narozne znikaja ---------------------------------
+    # Pliki kart maja wyciete, biale rogi; drukarnia zabrania ich wprost.
+    probka_rogi = probka.copy()
+    for poz in ((0, 0), (probka.width - 40, 0), (0, probka.height - 40),
+                (probka.width - 40, probka.height - 40)):
+        probka_rogi.paste(Image.new("RGB", (40, 40), "white"), poz)
+    strona_rogi = ProcesorKRM(fmt_poker).przetworz(probka_rogi)
+    biale = int((np.asarray(strona_rogi).min(axis=2) >= 250).sum())
+    ok = biale == 0
+    print(f"KRM biale rogi: {biale} px prawie-bialych (oczekiwane 0) -> "
+          f"{'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- Druk KRM: PDF (strona 1 = rewers, DeviceCMYK) --------------------------------
+    krm_path = tmp / "druk_krm.pdf"
+    exporter.run_export(ExportJob(kind="krm", out_path=krm_path, fronts=fronts,
+                                  back=back, extra={"podbicie": 3}))
+    try:
+        czytnik = PdfReader(str(krm_path))
+        krm_pages = len(czytnik.pages)
+        zasoby = czytnik.pages[0]["/Resources"]["/XObject"]
+        obraz = zasoby[next(iter(zasoby))]
+        przestrzen = str(obraz["/ColorSpace"])
+        rozmiar_px = (int(obraz["/Width"]), int(obraz["/Height"]))
+        strona_pt = (round(float(czytnik.pages[0].mediabox.width), 1),
+                     round(float(czytnik.pages[0].mediabox.height), 1))
+    except Exception as exc:                                  # noqa: BLE001
+        krm_pages, przestrzen, rozmiar_px, strona_pt = -1, f"?({exc})", (0, 0), (0, 0)
+    # 69x94 mm w punktach PDF (1 pt = 1/72")
+    oczekiwana_strona = (round(69 / 25.4 * 72, 1), round(94 / 25.4 * 72, 1))
+    ok = (krm_pages == present + 1 and przestrzen == "/DeviceCMYK"
+          and rozmiar_px == (815, 1110) and strona_pt == oczekiwana_strona)
+    print(f"KRM PDF: {krm_pages} stron (oczekiwane {present + 1}), "
+          f"strona {strona_pt} pt (oczekiwane {oczekiwana_strona}), "
+          f"obraz {rozmiar_px} {przestrzen} -> {'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- Druk KRM: round-trip obrazu Z PDF-a (pulapka odwroconego Adobe CMYK) ---------
+    # Pillow zapisuje JPEG CMYK z markerem Adobe (wartosci odwrocone). Gdyby
+    # reportlab osadzil go bez tej informacji, wydruk wyszedlby NEGATYWEM -
+    # test wyzej tego nie widzi, bo bada obraz PRZED zapisem. Tu czytamy piksele
+    # z PDF-a zlozonego z JEDNEJ znanej probki: rog strony to spad w kolorze tla
+    # (ciemny), srodek to jasny prostokat.
+    probka_path = tmp / "probka_krm.png"
+    probka.save(probka_path)
+    probka_pdf = tmp / "probka_krm.pdf"
+    exporter.run_export(ExportJob(kind="krm", out_path=probka_pdf,
+                                  fronts=[("probka", probka_path)], back=None,
+                                  extra={"podbicie": 3}))
+    try:
+        zasoby = PdfReader(str(probka_pdf)).pages[0]["/Resources"]["/XObject"]
+        surowy = Image.open(io.BytesIO(zasoby[next(iter(zasoby))].get_data()))
+        tryb_pdf = surowy.mode
+        rgb = surowy.convert("RGB")
+        lum = lambda px: 0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2]  # noqa: E731
+        lum_rog = lum(rgb.getpixel((6, 6)))                     # type: ignore[arg-type]
+        lum_srodek = lum(rgb.getpixel((rgb.width // 2, rgb.height // 2)))  # type: ignore[arg-type]
+    except Exception as exc:                                      # noqa: BLE001
+        tryb_pdf, lum_rog, lum_srodek = f"?({exc})", -1.0, -1.0
+    ok = tryb_pdf == "CMYK" and lum_rog < 128 and lum_srodek > 128
+    print(f"KRM round-trip: obraz z PDF-a {tryb_pdf}, luminancja rogu "
+          f"{lum_rog:.0f} (oczekiwane <128), srodka {lum_srodek:.0f} "
+          f"(oczekiwane >128) -> {'OK' if ok else 'BLAD'}")
+    failures += 0 if ok else 1
+
+    # --- CMYK: czern idzie kanalem K (kontrola inwersji i generacji czerni) -----------
+    jasny = rgb_na_cmyk(Image.new("RGB", (8, 8), "#F0EAD8"), sila=3)[0]
+    ciemny = rgb_na_cmyk(Image.new("RGB", (8, 8), "#101010"), sila=3)[0]
+    k_jasny = jasny.getpixel((4, 4))[3]      # type: ignore[index]
+    k_ciemny = ciemny.getpixel((4, 4))[3]    # type: ignore[index]
+    ok = k_ciemny > 200 and k_jasny < 40
+    print(f"CMYK czern: K jasnego={k_jasny}, K ciemnego={k_ciemny} "
+          f"(oczekiwane <40 i >200) -> {'OK' if ok else 'BLAD'}")
     failures += 0 if ok else 1
 
     print(f"\nWynik: {'WSZYSTKO OK' if failures == 0 else f'{failures} bledow'}")
