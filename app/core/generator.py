@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import time
 from collections.abc import Callable
@@ -42,9 +43,15 @@ GRUPA_OD_OSOB = 3
 # request → timeout / model zwraca tekst zamiast obrazu).
 MAKS_REF_OBRAZY = 8
 GRUPA_SIDE = 1024
-# Pudełko: mniej prób niż karty (2 zamiast 3) — porażka ciężkiego, 2-wywołaniowego
-# requestu nie ma narastać do kilkunastu minut backoffu; lepiej szybko zgłosić błąd.
-BOX_RETRIES = 2
+# Pudełko: WIĘCEJ prób niż karty — pudełko robi 3–11 wywołań AI pod rząd, a jeden
+# zryw połączenia wywalał całą (wielowywołaniową) generację. Z wykładniczym
+# backoffem klienta łączny czas pozostaje kontrolowany, a przejściowe bliki sieci
+# są przetrzymywane. Wtórne wywołania degradują łagodnie (_box_ai_opcjonalne).
+BOX_RETRIES = 4
+# Restyling POJEDYNCZEJ osoby (tryb „osoby"): umiarkowana temperatura — RÓŻNE
+# seedy per osoba (patrz _generate_box_osoby) i tak dają różne twarze i eliminują
+# duplikaty, więc temp trzymamy nisko dla SPÓJNEGO stylu między osobami.
+_BOX_OSOBA_TEMP = 0.45
 
 
 def _fake_api() -> bool:
@@ -728,19 +735,49 @@ def _zapisz_pudelko(scena: Image.Image, wykr, design_mm) -> Path:
         pudelko.zloz_pudelko(scena, wykr, design_mm, z_liniami=True))
 
 
-def _referencje_pudelka(foto_paths: list[Path],
-                        osobne_foto: list[Path] | None) -> list[Image.Image]:
-    """JEDEN montaż-siatka referencji pudełka (nie kilka osobnych zdjęć 1536 px —
-    ciężki request wisiał / model zwracał tekst zamiast obrazu). Gdy podano
-    osobne portrety — to JEDYNE źródło twarzy. Bez portretów — zdjęcia grupowe
-    przypisane kartom, też scalone w jeden montaż. Pusta lista, gdy brak zdjęć."""
-    osobne = [p for p in (osobne_foto or []) if Path(p).exists()]
-    if osobne:
-        return [compositor.montaz_portretow(osobne)]
-    grupowe = [p for p in (foto_paths or []) if Path(p).exists()]
-    if not grupowe:
+def _box_ai_opcjonalne(fn: Callable[[], Image.Image], opis: str,
+                       postep: Callable[[str], None] | None
+                       ) -> Image.Image | None:
+    """Uruchamia WTÓRNE wywołanie AI pudełka odpornie: fatalne błędy konta
+    (`FatalAPIError`) i anulowanie (`StabilityAborted`) propagują, a każdy inny
+    błąd (np. chwilowy zryw połączenia) → melduje degradację przez `postep` i
+    zwraca None. Dzięki temu jeden blip sieci nie przerywa całego pudełka —
+    element opcjonalny (tło / tył / pojedyncza osoba) po prostu odpada."""
+    from app.api.errors import FatalAPIError
+    from app.api.stability_client import StabilityAborted
+    try:
+        return fn()
+    except (FatalAPIError, StabilityAborted):
+        raise
+    except Exception as exc:
+        if postep:
+            postep(f"{opis} — pominięto po błędzie ({exc})")
+        return None
+
+
+def _referencje_twarze(osoby: list[list[Path]] | None,
+                       foto_paths: list[Path] | None) -> list[Image.Image]:
+    """JEDEN lekki montaż WYKADROWANYCH TWARZY (contact sheet) dla trybu paneli —
+    jedna komórka = jedna osoba, wyraźna twarz (mniej rozproszenia tłem/pozą →
+    lepsza wierność i łatwiej modelowi policzyć osoby). Źródło: grupy `osoby`
+    (podfoldery, najlepsza twarz/osobę) albo pojedyncze `foto_paths` (face-crop
+    każdego). Pusta lista, gdy brak zdjęć."""
+    twarze: list[Image.Image] = []
+    if osoby:
+        for grupa in osoby[:MAKS_REF_OBRAZY]:
+            im = _ref_osoby_jeden(grupa)       # najlepsza twarz osoby (face-crop)
+            if im is not None:
+                twarze.append(im)
+    else:
+        for p in [q for q in (foto_paths or []) if Path(q).exists()][:MAKS_REF_OBRAZY]:
+            try:
+                im = ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+            except (OSError, ValueError):
+                continue
+            twarze.append(pudelko.wykadruj_twarz(im))
+    if not twarze:
         return []
-    return [compositor.montaz_portretow(grupowe, maks=MAKS_REF_OBRAZY)]
+    return [compositor.montaz_obrazow(twarze, maks=MAKS_REF_OBRAZY)]
 
 
 def _kolor_z_frontu(front: Image.Image) -> str:
@@ -763,16 +800,18 @@ def _kolor_z_frontu(front: Image.Image) -> str:
 
 def _generate_box_panele(wykr, design_mm, foto_paths, prompt_front, prompt_back,
                          card_paths, seed, boki_ai=False, liczba_osob=None,
-                         osobne_foto=None,
+                         osobne_foto=None, prompt_tlo=None, osoby=None,
                          postep: Callable[[str], None] | None = None) -> Path:
-    """Tryb OSOBNYCH PANELI: 2 generacje AI (przód + tył kotwiczony frontem).
-    Boki: gdy boki_ai=True i są karty — AI-restyling wachlarza mini-kart
-    (osobna scena/bok); inaczej deterministyczna wizualizacja mini-kart.
-    osobne_foto = portrety 1 osoba/plik doklejane do referencji front/tył.
-    postep = callback etapu (GUI status: „Generuję przód/tył…")."""
+    """Tryb OSOBNYCH PANELI: 3 generacje AI (przód + tył kotwiczony frontem +
+    pełne tło spodu). Boki: gdy boki_ai=True i są karty — AI-restyling wachlarza
+    mini-kart (osobna scena/bok); inaczej deterministyczna wizualizacja mini-kart
+    na tle AI. osobne_foto = portrety 1 osoba/plik doklejane do referencji
+    front/tył. prompt_tlo = prompt pełnego tła (BEZ ludzi). postep = callback
+    etapu (GUI status: „Generuję przód/tył…")."""
     def _etap(msg: str) -> None:
         if postep:
             postep(msg)
+    tlo_ai: Image.Image | None = None
     if _fake_api():
         _etap("Generuję przód pudełka…")
         front = _fake_illustration(foto_paths[0] if foto_paths else None)
@@ -783,8 +822,11 @@ def _generate_box_panele(wykr, design_mm, foto_paths, prompt_front, prompt_back,
         front = stability_client.generate_template_image(prompt_front or "", None)
         _etap("Generuję tył pudełka…")
         back = stability_client.generate_template_image(prompt_back or "", None)
+        if prompt_tlo:
+            _etap("Generuję tło pudełka…")
+            tlo_ai = stability_client.generate_template_image(prompt_tlo, None)
     else:
-        zdjecia = _referencje_pudelka(foto_paths, osobne_foto)
+        zdjecia = _referencje_twarze(osoby, foto_paths or osobne_foto)
         # proporcja kadru per rola panelu → hint kadru dla modelu (żeby front/
         # tył wróciły w kształcie swojego panelu, nie kwadratem obcinanym przy
         # składaniu); brak panelu danej roli → None (model bez wymuszenia)
@@ -796,23 +838,249 @@ def _generate_box_panele(wykr, design_mm, foto_paths, prompt_front, prompt_back,
         front = gemini_client.generate_image(
             [prompt_front or ""] + zdjecia, seed=seed, retries=BOX_RETRIES,
             aspect_ratio=ar_rola.get("przod"))
-        # tył kotwiczony frontem (ostatni obraz = gotowy front) — spójny styl
+        # tył kotwiczony frontem (ostatni obraz = gotowy front) — spójny styl;
+        # błąd tyłu nie przerywa pudełka (kompozycja użyje frontu dla roli „tyl")
         _etap("Generuję tył pudełka…")
-        back = gemini_client.generate_image(
-            [prompt_back or ""] + zdjecia + [front], seed=seed,
-            retries=BOX_RETRIES, aspect_ratio=ar_rola.get("tyl"))
+        back = _box_ai_opcjonalne(
+            lambda: gemini_client.generate_image(
+                [prompt_back or ""] + zdjecia + [front], seed=seed,
+                retries=BOX_RETRIES, aspect_ratio=ar_rola.get("tyl")),
+            "Tył pudełka", postep) or front
+        if prompt_tlo:
+            _etap("Generuję tło pudełka…")
+            tlo_ai = _box_ai_opcjonalne(
+                lambda: gemini_client.generate_image(
+                    [prompt_tlo], seed=seed, retries=BOX_RETRIES,
+                    aspect_ratio=pudelko.najblizszy_aspect(wykr.proporcja)),
+                "Tło pudełka", postep)
     _etap("Składam panele pudełka…")
     obrazy = {"przod": front, "tyl": back}
     karty = [Path(p) for p in (card_paths or []) if Path(p).exists()]
-    # Boki ZAWSZE deterministyczne: jednolite tło w kolorze frontu + prawdziwe
-    # mini-karty (spójne). AI-restyling boków usunięty — robił niespójne tła i
-    # dokładał 6 wywołań (ryzyko zawisu). Zostają 2 wywołania AI: front + tył.
+    # Boki ZAWSZE deterministyczne: prawdziwe mini-karty na pełnym tle AI
+    # (spójny spód). AI-restyling boków usunięty — robił niespójne tła i dokładał
+    # 6 wywołań. Tło AI (prompt_tlo) zastępuje mętną medianę koloru frontu;
+    # _kolor_z_frontu zostaje fallbackiem, gdy tła nie wygenerowano.
     tlo_boku = _kolor_z_frontu(front)
     raw = pudelko.zloz_pudelko_panele(obrazy, wykr, design_mm,
                                       karty_boki=karty, tlo_boku=tlo_boku,
-                                      z_liniami=False)
+                                      tlo_ai=tlo_ai, z_liniami=False)
     proof = pudelko.zloz_pudelko_panele(obrazy, wykr, design_mm,
                                         karty_boki=karty, tlo_boku=tlo_boku,
+                                        tlo_ai=tlo_ai, z_liniami=True)
+    return _zapisz_box_pliki(raw, proof)
+
+
+# Ile zdjęć osoby skanujemy w poszukiwaniu najlepszego (największa twarz).
+_REF_OSOBY_KANDYDACI = 6
+
+
+def _ref_osoby_jeden(zdjecia: list[Path]) -> Image.Image | None:
+    """JEDNA referencja twarzy osoby: z pierwszych kilku zdjęć wybiera to z
+    NAJWIĘKSZĄ twarzą (najlepsza widoczność), przycina do twarzy i zwraca jeden
+    obraz ≤ PHOTO_REF_SIDE. JEDNO wejście = jedna osoba (model nie sklei kilku
+    zdjęć). None, gdy brak wczytywalnych plików."""
+    najlepszy: Image.Image | None = None
+    najlepsze_pole = -1
+    pierwszy: Image.Image | None = None
+    for p in zdjecia[:_REF_OSOBY_KANDYDACI]:
+        if not Path(p).exists():
+            continue
+        try:
+            im = ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+        except (OSError, ValueError):
+            continue
+        if pierwszy is None:
+            pierwszy = im
+        twarz = pudelko.wykadruj_twarz(im)
+        pole = twarz.width * twarz.height
+        if pole > najlepsze_pole:
+            najlepsze_pole, najlepszy = pole, twarz
+    wynik = najlepszy if najlepszy is not None else pierwszy
+    if wynik is None:
+        return None
+    wynik = wynik.copy()
+    wynik.thumbnail((PHOTO_REF_SIDE, PHOTO_REF_SIDE), Image.Resampling.LANCZOS)
+    return wynik
+
+
+def _fake_chroma_osoba(p: Path | None) -> Image.Image:
+    """Atrapa restylingu osoby: zdjęcie na zielonym chroma-tle — pozwala
+    przetestować cały deterministyczny potok (wycinek + układ) bez API."""
+    time.sleep(0.3)
+    kadr = Image.new("RGB", (600, 800), pudelko.CHROMA_HEX)
+    if p is not None and Path(p).exists():
+        foto = ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+        foto.thumbnail((360, 480), Image.Resampling.LANCZOS)
+        foto = ImageOps.posterize(foto, 3)
+        kadr.paste(foto, ((600 - foto.width) // 2, (800 - foto.height) // 2))
+    return kadr
+
+
+def generuj_postac(zdjecia: list[Path], styl_custom: str, seed: int | None,
+                   dopisek: str = "") -> Image.Image:
+    """Generuje JEDNĄ postać w stylu pudełka i zwraca gotowy WYCINEK RGBA
+    (`pudelko.wytnij_osobe` — chroma albo grabCut, jedna sylwetka). Reużywane
+    przez tryb osób i „Reżysera sceny" (regeneracja z `dopisek`). Może rzucić
+    wyjątkiem (obsługa u wołającego). Honoruje KARTY_FAKE_API."""
+    pierwsze = zdjecia[0] if zdjecia else None
+    if _fake_api():
+        styled = _fake_chroma_osoba(pierwsze)
+    elif _provider() == "stability":
+        styled = stability_client.generate_template_image(
+            prompts.box_person_prompt(styl_custom, dopisek), None)
+    else:
+        ref = _ref_osoby_jeden(zdjecia)
+        contents: list = [prompts.box_person_prompt(styl_custom, dopisek)]
+        if ref is not None:
+            contents.append(ref)
+        styled = gemini_client.generate_image(
+            contents, seed=seed, temperature=_BOX_OSOBA_TEMP, retries=BOX_RETRIES)
+    return pudelko.wytnij_osobe(styled)
+
+
+def placeholder_postac(zdjecie: Path | None = None) -> Image.Image:
+    """Zastępczy wycinek postaci (RGBA) BEZ API — używany, gdy generacja jednej
+    osoby padnie, żeby nie przerywać całego etapu (feralną poprawia się potem)."""
+    return pudelko.wytnij_osobe(_fake_chroma_osoba(zdjecie))
+
+
+def _generate_box_osoby(wykr, design_mm, osoby: list[list[Path]], styl_custom: str,
+                        seed: int | None, card_paths=None,
+                        postep: Callable[[str], None] | None = None) -> Path:
+    """Tryb DETERMINISTYCZNY osób („1 podfolder = 1 osoba"): dla KAŻDEJ osoby
+    (grupy zdjęć) osobny restyling AI na chromie z jej zdjęć jako referencją →
+    wycinek (`pudelko.wytnij_osobe` — 1 osoba). Model widzi tylko JEDNĄ
+    osobę naraz i nie komponuje sceny → dokładnie len(osoby) postaci, bez
+    powtórzeń. Składanie: OSOBNE PANELE (przód+tył = ta sama obsada, tył w
+    odwróconej kolejności; boki = wachlarz kart; AI-tło) gdy wykrojnik ma panele;
+    inaczej jedna zawijana scena. Honoruje KARTY_FAKE_API."""
+    def _etap(msg: str) -> None:
+        if postep:
+            postep(msg)
+    target = pudelko.target_px(design_mm)
+    # UNIKALNY seed na każdą osobę — nawet gdy wejściowy seed=None (GUI), inaczej
+    # model przy braku seeda zwracał 10 IDENTYCZNYCH obrazów. Losowa baza = różne
+    # pudełka między uruchomieniami; różnica MIĘDZY osobami zawsze zachowana.
+    baza_seed = seed if seed is not None else random.randrange(1, 1_000_000)
+    wycinki: list[Image.Image] = []
+    for i, zdjecia in enumerate(osoby):
+        pierwsze = zdjecia[0] if zdjecia else None
+        seed_osoby = baza_seed + i * 1009 + 1
+        _etap(f"Przetwarzam osobę {i + 1}/{len(osoby)}…")
+        # błąd JEDNEJ osoby (np. zryw sieci) → placeholder, continue
+        cut = _box_ai_opcjonalne(
+            lambda z=zdjecia, s=seed_osoby: generuj_postac(z, styl_custom, s),
+            f"Osoba {i + 1}", postep)
+        if cut is None:
+            cut = pudelko.wytnij_osobe(_fake_chroma_osoba(pierwsze))
+        wycinki.append(cut)
+
+    _etap("Generuję tło pudełka…")
+    tlo_ai_img: Image.Image | None
+    if _fake_api():
+        tlo_ai_img = None
+    elif _provider() == "stability":
+        tlo_ai_img = stability_client.generate_template_image(
+            prompts.box_background_prompt(styl_custom, wykr.proporcja), None)
+    else:
+        # tło opcjonalne — błąd → None → fallback jednolity krem
+        tlo_ai_img = _box_ai_opcjonalne(
+            lambda: gemini_client.generate_image(
+                [prompts.box_background_prompt(styl_custom, wykr.proporcja)],
+                seed=seed, retries=BOX_RETRIES,
+                aspect_ratio=pudelko.najblizszy_aspect(wykr.proporcja)),
+            "Tło pudełka", postep)
+    tlo_scen: Image.Image | str = tlo_ai_img or config.CREAM_HEX
+
+    _etap("Składam pudełko…")
+    # UKŁAD PANELI, gdy wykrojnik ma panele (przód/tył) — jak „Osobne panele",
+    # ale z deterministycznymi osobami: cała obsada na przodzie i na tyle (tył
+    # w odwróconej kolejności), boki = wachlarz kart, AI-tło pod spodem.
+    if pudelko.liczba_twarzy(pudelko.segmentuj_panele(wykr)) >= 2:
+        front_sz = pudelko.rozmiar_panelu(wykr, design_mm, "przod") or target
+        back_sz = pudelko.rozmiar_panelu(wykr, design_mm, "tyl") or front_sz
+        front = pudelko.zbuduj_scene_osob(wycinki, front_sz, tlo_scen)
+        back = pudelko.zbuduj_scene_osob(list(reversed(wycinki)), back_sz,
+                                         tlo_scen)
+        obrazy = {"przod": front, "tyl": back}
+        karty = [Path(p) for p in (card_paths or []) if Path(p).exists()]
+        tlo_boku = _kolor_z_frontu(front)
+        raw = pudelko.zloz_pudelko_panele(
+            obrazy, wykr, design_mm, karty_boki=karty, tlo_boku=tlo_boku,
+            tlo_ai=tlo_ai_img, z_liniami=False)
+        proof = pudelko.zloz_pudelko_panele(
+            obrazy, wykr, design_mm, karty_boki=karty, tlo_boku=tlo_boku,
+            tlo_ai=tlo_ai_img, z_liniami=True)
+        return _zapisz_box_pliki(raw, proof)
+
+    # wykrojnik bez paneli → jedna zawijana scena (fallback)
+    scena = pudelko.zbuduj_scene_osob(wycinki, target, tlo_scen)
+    return _zapisz_pudelko(scena, wykr, design_mm)
+
+
+def generate_box_scena_z_osob(wycinki_paths: list[Path], dieline_path: Path,
+                              design_mm: tuple[float, float], styl_custom: str,
+                              seed: int | None = None, card_paths=None,
+                              postep: Callable[[str], None] | None = None) -> Path:
+    """Tryb „Reżyser sceny": z zaakceptowanych, WYCIĘTYCH postaci (RGBA PNG)
+    buduje kolaż OBOK SIEBIE w losowej kolejności i zleca modelowi ułożenie ich
+    w SPÓJNEJ scenie + wygenerowanie tła (image-to-image). Przód = „at a bar",
+    tył = „around a table" (ta sama obsada, kotwiczony frontem). Składa w układ
+    paneli (boki = wachlarz kart). Honoruje KARTY_FAKE_API + `_box_ai_opcjonalne`."""
+    def _etap(msg: str) -> None:
+        if postep:
+            postep(msg)
+    wykr = pudelko.parsuj_wykrojnik(dieline_path)
+    wycinki = []
+    for p in wycinki_paths:
+        if Path(p).exists():
+            try:
+                wycinki.append(Image.open(p).convert("RGBA"))
+            except (OSError, ValueError):
+                continue
+    if not wycinki:
+        raise ValueError("Brak zaakceptowanych postaci do skomponowania sceny.")
+    n = len(wycinki)
+    target = pudelko.target_px(design_mm)
+    front_sz = pudelko.rozmiar_panelu(wykr, design_mm, "przod") or target
+    back_sz = pudelko.rozmiar_panelu(wykr, design_mm, "tyl") or front_sz
+
+    def _kolaz(rozmiar):
+        return pudelko.uloz_obok_siebie(wycinki, rozmiar, tasuj=True)
+
+    def _komponuj(rozmiar, sceneria, kotwica=None):
+        prop = rozmiar[0] / max(1, rozmiar[1])
+        prompt = prompts.box_scene_compose_prompt(n, styl_custom, prop, sceneria)
+        if _fake_api():
+            return pudelko.zbuduj_scene_osob(wycinki, rozmiar, config.CREAM_HEX)
+        if _provider() == "stability":
+            return stability_client.generate_template_image(prompt, None)
+        kolaz = _kolaz(rozmiar)
+        contents = [prompt, kolaz] + ([kotwica] if kotwica is not None else [])
+        wynik = _box_ai_opcjonalne(
+            lambda: gemini_client.generate_image(
+                contents, seed=seed, temperature=_BOX_OSOBA_TEMP,
+                retries=BOX_RETRIES,
+                aspect_ratio=pudelko.najblizszy_aspect(prop)),
+            f"Scena ({sceneria})", postep)
+        # fallback przy błędzie: deterministyczne ułożenie postaci na kremie
+        return wynik or pudelko.zbuduj_scene_osob(wycinki, rozmiar,
+                                                  config.CREAM_HEX)
+
+    _etap("Komponuję przód sceny…")
+    front = _komponuj(front_sz, "in a lively bar / lounge")
+    _etap("Komponuję tył sceny…")
+    back = _komponuj(back_sz, "seated around a table", kotwica=front)
+
+    _etap("Składam pudełko…")
+    obrazy = {"przod": front, "tyl": back}
+    karty = [Path(p) for p in (card_paths or []) if Path(p).exists()]
+    tlo_boku = _kolor_z_frontu(front)
+    raw = pudelko.zloz_pudelko_panele(obrazy, wykr, design_mm, karty_boki=karty,
+                                      tlo_boku=tlo_boku, tlo_ai=front,
+                                      z_liniami=False)
+    proof = pudelko.zloz_pudelko_panele(obrazy, wykr, design_mm, karty_boki=karty,
+                                        tlo_boku=tlo_boku, tlo_ai=front,
                                         z_liniami=True)
     return _zapisz_box_pliki(raw, proof)
 
@@ -826,21 +1094,40 @@ def generate_box(prompt: str | None = None, dieline_path: Path | None = None,
                  seed: int | None = None, boki_ai: bool = False,
                  liczba_osob: int | None = None,
                  osobne_foto: list[Path] | None = None,
+                 osoby: list[list[Path]] | None = None,
+                 prompt_tlo: str | None = None,
                  postep: Callable[[str], None] | None = None) -> Path:
-    """Generuje grafikę pudełka. tryb="scena" (domyślny): JEDNA scena AI ze
-    wszystkich zdjęć, wciśnięta w wykrojnik. tryb="panele": OSOBNE panele —
-    przód i tył to dwie sceny AI (spójne przez wspólny seed + kotwica), boki =
-    wizualizacja mini-kart talii (card_paths) albo — gdy boki_ai=True —
-    AI-restyling wachlarza mini-kart (osobna scena/bok). Fallback: gdy wykrojnik
-    nie ma ≥2 twarzy → tryb scena. Zapisuje raw (bez linii) + proof.
-    postep = callback etapu (GUI status). Honoruje KARTY_FAKE_API."""
+    """Generuje grafikę pudełka. tryb="osoby" (zalecany): DETERMINISTYCZNIE —
+    `osoby` to lista osób (każda = lista zdjęć, „1 podfolder = 1 osoba"),
+    każda restylowana osobno i wklejana po kolei (dokładnie tyle postaci ile
+    osób). tryb="scena": JEDNA scena AI. tryb="panele": OSOBNE panele (przód/tył/
+    tło + wachlarze). Zapisuje raw (bez linii) + proof. postep = callback etapu.
+    Honoruje KARTY_FAKE_API."""
     wykr = pudelko.parsuj_wykrojnik(dieline_path)
+    if tryb == "osoby":
+        # grupy zdjęć per osoba; fallback do płaskiej listy osobne_foto (1/os.)
+        grupy = [[Path(p) for p in g if Path(p).exists()]
+                 for g in (osoby or [])]
+        grupy = [g for g in grupy if g]
+        if not grupy and osobne_foto:
+            grupy = [[Path(p)] for p in osobne_foto if Path(p).exists()]
+        if not grupy:
+            raise ValueError(
+                "Tryb „Osoby po kolei” wymaga folderu z osobami "
+                "(1 podfolder = 1 osoba, albo luźne zdjęcia 1 plik = 1 osoba).")
+        return _generate_box_osoby(wykr, design_mm, grupy,
+                                   prompt or prompt_front or "", seed,
+                                   card_paths=card_paths, postep=postep)
     if tryb == "panele" and pudelko.liczba_twarzy(
             pudelko.segmentuj_panele(wykr)) >= 2:
+        grupy = [[Path(p) for p in g if Path(p).exists()]
+                 for g in (osoby or [])]
+        grupy = [g for g in grupy if g] or None
         return _generate_box_panele(wykr, design_mm, foto_paths or [],
                                     prompt_front, prompt_back, card_paths, seed,
                                     boki_ai=boki_ai, liczba_osob=liczba_osob,
-                                    osobne_foto=osobne_foto, postep=postep)
+                                    osobne_foto=osobne_foto, prompt_tlo=prompt_tlo,
+                                    osoby=grupy, postep=postep)
 
     tekst = prompt or prompt_front or ""
     if _fake_api():
@@ -851,8 +1138,11 @@ def generate_box(prompt: str | None = None, dieline_path: Path | None = None,
     else:
         if postep:
             postep("Generuję grafikę pudełka…")
+        grupy = [[Path(p) for p in g if Path(p).exists()]
+                 for g in (osoby or [])]
+        grupy = [g for g in grupy if g] or None
         scena = gemini_client.generate_image(
-            [tekst] + _referencje_pudelka(foto_paths or [], osobne_foto),
+            [tekst] + _referencje_twarze(grupy, foto_paths or osobne_foto),
             seed=seed, retries=BOX_RETRIES,
             aspect_ratio=pudelko.najblizszy_aspect(wykr.proporcja))
     return _zapisz_pudelko(scena, wykr, design_mm)
@@ -880,6 +1170,13 @@ def eksportuj_pudelko(out_path: Path, dieline_path: Path,
         raise FileNotFoundError("Brak wygenerowanego pudełka do eksportu")
     wykr = pudelko.parsuj_wykrojnik(dieline_path)
     raw = Image.open(raw_path).convert("RGB")
+    if format == "pdf_drukarnia":
+        # „Kopiuj" oryginalny wektorowy PDF drukarni i wstaw artwork bez linii
+        # (linie z wykrojnika zostają na wierzchu). Wymaga PDF-a jako źródła.
+        if dieline_path.suffix.lower() != ".pdf":
+            raise ValueError("Eksport na wykrojnik drukarni wymaga wykrojnika PDF")
+        artwork = pudelko.zloz_pudelko(raw, wykr, design_mm, z_liniami=False)
+        return pudelko.eksportuj_na_pdf_drukarni(artwork, dieline_path, out_path)
     obraz = pudelko.zloz_pudelko(raw, wykr, design_mm, z_liniami=z_liniami)
     if format == "pdf":
         return pudelko.eksportuj_pdf(obraz, out_path, design_mm)

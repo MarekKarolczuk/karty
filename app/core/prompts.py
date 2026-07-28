@@ -793,11 +793,12 @@ def _box_portrety_klauzula(osobne_portrety: int) -> str:
     """Klauzula o osobnych portretach scalonych w JEDEN montaż-siatkę (contact
     sheet) na końcu contents — model ma wstawić KAŻDĄ osobę wiernie."""
     if osobne_portrety and osobne_portrety > 0:
-        return (f"\nOne attached image is a CONTACT-SHEET GRID of "
-                f"{osobne_portrety} individual portraits — one person per cell. "
-                f"The box MUST feature EVERY one of these {osobne_portrety} "
-                "people, each with their own clearly recognizable face; never "
-                "merge, drop or invent people.")
+        return (f"\nThe attached CONTACT SHEET holds EXACTLY {osobne_portrety} "
+                f"faces — one cell per person. The scene MUST contain EXACTLY "
+                f"{osobne_portrety} people, each matching ONE of those faces; "
+                "include EVERY one; never merge, drop, invent or duplicate; and "
+                "add NO other people — no crowd, bystanders, waiters, dealers, "
+                "spectators or background figures.")
     return ""
 
 
@@ -826,22 +827,15 @@ def box_generation_prompt(custom_text: str = "", liczba_osob: int | None = None,
     else:
         kadr = "a balanced composition"
 
-    if liczba_osob and liczba_osob > 1:
-        ludzie = (f"\nThere are exactly {liczba_osob} people across the "
-                  f"attached reference photos — the artwork MUST feature all "
-                  f"{liczba_osob} of them, each with their own recognizable "
-                  "face; never merge, drop or invent people.")
-    else:
-        ludzie = ("\nFeature every person from the attached reference photos, "
-                  "each with their own recognizable face.")
+    ludzie = _box_ludzie_klauzula(liczba_osob)
 
     return f"""\
 Generate box-wrap artwork for a playing-card box (a single flat illustration
 that will be wrapped onto a card box), {kadr}.
 
-Each attached image is a reference PHOTO of one or more people from this deck.
-Take the facial features, face shapes, hairstyles and expressions from those
-photos.{ludzie}{_box_portrety_klauzula(osobne_portrety)}
+The attached image is a CONTACT SHEET of the people from this deck — one clear
+face per cell. Take the facial features, face shapes, hairstyles and expressions
+from those faces.{ludzie}{_box_portrety_klauzula(osobne_portrety)}
 
 Style:
 {style_text}
@@ -864,12 +858,14 @@ Layout:
 
 def _box_ludzie_klauzula(liczba_osob: int | None) -> str:
     if liczba_osob and liczba_osob > 1:
-        return (f"\nThere are exactly {liczba_osob} people across the attached "
-                f"reference photos — the artwork MUST feature all "
-                f"{liczba_osob} of them, each with their own recognizable "
-                "face; never merge, drop or invent people.")
-    return ("\nFeature every person from the attached reference photos, each "
-            "with their own recognizable face.")
+        return (f"\nThere are EXACTLY {liczba_osob} people — no more, no fewer. "
+                f"Draw all {liczba_osob}, each matching ONE face from the "
+                f"attached contact sheet, each with their own recognizable face; "
+                f"never merge, drop, invent or duplicate anyone. Do NOT add ANY "
+                f"background people, crowd, bystanders, waiters, dealers, "
+                f"spectators or extras — ONLY these {liczba_osob} people.")
+    return ("\nFeature the person from the attached reference, with their own "
+            "recognizable face; do NOT add any other or background people.")
 
 
 def _box_styl(custom_text: str) -> str:
@@ -982,5 +978,130 @@ Layout:
 - Frame it with an ornate decorative border consistent with the front.
 - Keep every face fully visible and never cut off.
 - Leave a little extra background margin around the edges (printing bleed).
+
+{NO_TEXT_SUFFIX}"""
+
+
+# --- tryb „osoby": restyling per osoba na chromie + osobne tło -----------------
+# Deterministyczny potok pudełka: każdą osobę przerabiamy OSOBNO (model widzi
+# tylko jedną twarz naraz → nie doda ani nie powieli postaci), na płaskim
+# chroma-tle do wycięcia, a tło generujemy BEZ ludzi. Kompozycję (kolejność,
+# liczbę, układ) robi kod (pudelko.zbuduj_scene_osob) — nie model.
+
+def box_person_prompt(custom_text: str = "", dopisek: str = "") -> str:
+    """Prompt restylingu JEDNEJ osoby na popiersie w stylu pudełka, na płaskim
+    zielonym chroma-tle (#00FF00) do deterministycznego wycięcia. `dopisek` =
+    dodatkowa instrukcja użytkownika przy regeneracji postaci (np. „uśmiech,
+    okulary")."""
+    styl = _box_styl(custom_text)
+    dop = (f"\n\nADDITIONAL INSTRUCTION for this character (apply it while "
+           f"keeping the SAME person's identity): {dopisek.strip()}"
+           if dopisek.strip() else "")
+    return f"""\
+The attached reference photo(s) ALL show the SAME single person, possibly in
+different places, angles, poses and lighting. Study them TOGETHER only to learn
+that person's lasting identity — face shape and features, hairstyle and hair
+colour, facial hair, glasses, skin tone, build and any distinctive marks — and
+redraw THAT ONE person as a single character in this style, as a waist-up (bust)
+portrait facing forward with the WHOLE face clearly visible.{dop}
+
+Style:
+{styl}
+
+{box_style_lock()}
+
+{face_fidelity_clause()}
+
+USING THE REFERENCE PHOTOS:
+- This is a SPECIFIC, real individual. Reproduce THEIR unique face and features
+  from the reference — clearly recognizable as this exact person and visibly
+  DIFFERENT from any other character. Do NOT default to a generic or previously
+  drawn face.
+- Combine the photos to capture MORE distinctive traits of this person (use the
+  extra shots to resolve the face better).
+- IGNORE and NEVER reproduce the background, surroundings, location, room,
+  lighting, props, the specific pose or crop, or any OTHER people visible in the
+  photos — they are ONLY there to teach you THIS person's face and features.
+
+STRICT OUTPUT RULES (critical):
+- Draw EXACTLY ONE person — that same person. Never add a second person, a
+  companion, a crowd, a reflection or a duplicate. If a reference shows more
+  than one face, use only the person that appears across the photos.
+- Place the character on a COMPLETELY FLAT, SOLID pure-green background
+  (#00FF00 chroma key) filling the whole frame. NO scenery, props, shadows,
+  gradients, borders or objects — only the one person on flat green, so the
+  background can be keyed out cleanly.
+- Center the character; keep a small green margin around them on all sides.
+
+{NO_TEXT_SUFFIX}"""
+
+
+def box_background_prompt(custom_text: str = "",
+                          proporcja: float | None = None) -> str:
+    """Prompt TŁA pudełka BEZ ludzi (postaci dokleja kod). Ozdobne, bogate,
+    w barwach pudełka — na nim wylądują wycięte postacie."""
+    styl = _box_styl(custom_text)
+    if proporcja and proporcja > 1.2:
+        kadr = "a WIDE landscape backdrop"
+    elif proporcja and proporcja < 0.85:
+        kadr = "a TALL portrait backdrop"
+    else:
+        kadr = "a balanced backdrop"
+    return f"""\
+Generate a decorative BACKGROUND scene for a premium playing-card box cover,
+{kadr} that fills the whole frame edge to edge.
+
+Style:
+{styl}
+
+{box_style_lock()}
+
+STRICT OUTPUT RULES:
+- ABSOLUTELY NO people, NO faces, NO characters, NO portraits, NO silhouettes,
+  NO figures of any kind — ONLY an empty ornate backdrop (rich patterns,
+  filigree/baroque border, jewel-tone scenery). People are composited on top
+  afterwards, so leave the center reasonably open.
+- Use a rich, saturated palette with gold accents; premium collector look.
+
+{NO_TEXT_SUFFIX}"""
+
+
+def box_scene_compose_prompt(liczba_osob: int, custom_text: str = "",
+                             proporcja: float | None = None,
+                             sceneria: str = "at a bar") -> str:
+    """Prompt KOMPOZYCJI SCENY (image-to-image): wejściem jest kolaż wyciętych,
+    zaakceptowanych postaci OBOK SIEBIE. Model ma ustawić TE SAME osoby w spójnej
+    scenie (np. przy barze/stole) i dogenerować tło — bez zmiany liczby/twarzy i
+    bez statystów."""
+    styl = _box_styl(custom_text)
+    if proporcja and proporcja > 1.2:
+        kadr = "a WIDE landscape composition"
+    elif proporcja and proporcja < 0.85:
+        kadr = "a TALL portrait composition"
+    else:
+        kadr = "a balanced composition"
+    return f"""\
+The attached image shows EXACTLY {liczba_osob} cut-out characters placed side by
+side on a plain background. Compose them into ONE cohesive scene, {sceneria},
+{kadr}.
+
+Keep THESE SAME {liczba_osob} people — the SAME faces, hairstyles, outfits and
+the EXACT count. Re-pose and re-arrange them so they interact naturally in the
+setting (e.g. seated around it, leaning, chatting), and GENERATE a rich, detailed
+background that fills the frame edge to edge.
+
+Style:
+{styl}
+
+{box_style_lock()}
+
+{face_fidelity_clause()}
+
+STRICT RULES:
+- EXACTLY {liczba_osob} people — never add, invent, duplicate or drop anyone.
+- Do NOT add ANY extra or background people, crowd, bystanders, waiters, dealers,
+  spectators or silhouettes — ONLY these {liczba_osob}.
+- Keep each face clearly recognizable as the matching input character.
+- The scene fills the whole frame; no plain empty margins.
 
 {NO_TEXT_SUFFIX}"""

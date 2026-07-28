@@ -74,9 +74,18 @@ class ExportView(QWidget):
             "• strona 1 to rewers, kolejne to awersy\n"
             "Spad i znaczniki cięcia nie mają tu zastosowania (geometria sztywna)."
         )
+        self.radio_jkb = QRadioButton("Druk do JKB Print (2 PDF CMYK: karty + rewers)")
+        self.radio_jkb.setToolTip(
+            "Dwa pliki PDF CMYK 300 DPI wg specyfikacji drukarni JKB Print:\n"
+            "• <nazwa>_karty.pdf — wszystkie awersy, <nazwa>_rewers.pdf — wspólny rewers\n"
+            "• strona = format netto + spad 3 mm z każdej strony (poker 69 × 94 mm)\n"
+            "• grafika full-bleed, margines bezpieczeństwa ≥ 3 mm\n"
+            "• linie cięcia opcjonalne (checkbox „Znaczniki cięcia”)\n"
+            "• kolor CMYK z profilem ICC i podbiciem."
+        )
         self.radio_pdf.setChecked(True)
         for radio in (self.radio_pdf, self.radio_files, self.radio_cmyk,
-                      self.radio_krm):
+                      self.radio_krm, self.radio_jkb):
             self._print_group.addButton(radio)
             print_layout.addWidget(radio)
 
@@ -201,8 +210,8 @@ class ExportView(QWidget):
 
         # każda zmiana opcji eksportu → sygnał zapisu (trwałość między sesjami)
         for btn in (self.radio_pdf, self.radio_files, self.radio_cmyk,
-                    self.radio_krm, self.radio_zip, self.radio_sprite,
-                    self.radio_tts):
+                    self.radio_krm, self.radio_jkb, self.radio_zip,
+                    self.radio_sprite, self.radio_tts):
             btn.toggled.connect(self._emit_options_changed)
         for chk in (self.bleed_check, self.marks_check, self.backs_check,
                     self.narrow_check, self.small_check):
@@ -210,10 +219,10 @@ class ExportView(QWidget):
 
         # podpowiedź rozmiaru pliku zależy od trybu CMYK i spadu
         for w in (self.radio_pdf, self.radio_files, self.radio_cmyk,
-                  self.radio_krm, self.bleed_check):
+                  self.radio_krm, self.radio_jkb, self.bleed_check):
             w.toggled.connect(lambda _c: self._refresh_format_hint())
         for w in (self.radio_pdf, self.radio_files, self.radio_cmyk,
-                  self.radio_krm):
+                  self.radio_krm, self.radio_jkb):
             w.toggled.connect(lambda _c: self._refresh_print_options())
 
         self._refresh_print_options()
@@ -230,7 +239,9 @@ class ExportView(QWidget):
     def _refresh_print_options(self) -> None:
         """Podbicie kolorów dotyczy tylko wyjść CMYK; przy KRM geometria jest
         sztywna, więc spad i znaczniki cięcia są nieaktywne."""
-        cmyk = self.radio_cmyk.isChecked() or self.radio_krm.isChecked()
+        krm = self.radio_krm.isChecked()
+        jkb = self.radio_jkb.isChecked()
+        cmyk = self.radio_cmyk.isChecked() or krm or jkb
         for w in (self.boost_caption, self.boost_slider, self.boost_value,
                   self.boost_preview_btn):
             w.setEnabled(cmyk)
@@ -240,14 +251,16 @@ class ExportView(QWidget):
             else "◈  brak profilu ICC — kolory niekalibrowane "
                  "(wrzuć plik .icc od drukarni do assets/icc/)")
         self.icc_hint.setVisible(cmyk)
-        krm = self.radio_krm.isChecked()
-        for chk in (self.bleed_check, self.marks_check):
-            chk.setEnabled(not krm)
+        # KRM: geometria sztywna (spad i znaczniki n/d). JKB: spad zawsze 3 mm
+        # (checkbox n/d), ale linie cięcia opcjonalne (znaczniki aktywne).
+        self.bleed_check.setEnabled(not (krm or jkb))
+        self.marks_check.setEnabled(not krm)
 
     def settings(self) -> dict:
         """Stan opcji eksportu do zapisania w projekt.json."""
         return {
             "print_kind": ("krm" if self.radio_krm.isChecked()
+                           else "jkb" if self.radio_jkb.isChecked()
                            else "cmyk" if self.radio_cmyk.isChecked()
                            else "files" if self.radio_files.isChecked()
                            else "pdf"),
@@ -268,6 +281,7 @@ class ExportView(QWidget):
         self._loading = True
         print_kind = data.get("print_kind")
         (self.radio_krm if print_kind == "krm"
+         else self.radio_jkb if print_kind == "jkb"
          else self.radio_cmyk if print_kind == "cmyk"
          else self.radio_files if print_kind == "files"
          else self.radio_pdf).setChecked(True)
@@ -289,7 +303,13 @@ class ExportView(QWidget):
 
     def _refresh_format_hint(self) -> None:
         w, h = config.CARD_MM
-        if self.radio_krm.isChecked():
+        if self.radio_jkb.isChecked():
+            spad = SPAD_MM
+            self.format_hint.setText(
+                f"⌗  plik {w + 2 * spad:g} × {h + 2 * spad:g} mm  "
+                f"(netto {w:g} × {h:g} + spad {spad:g} mm)  ·  2 pliki: "
+                f"karty + rewers  ·  margines bezp. 3 mm  ·  ◈  300 DPI · CMYK")
+        elif self.radio_krm.isChecked():
             from app.core.eksport.formaty import aktywny_format
             fmt = aktywny_format()
             brutto_mm, brutto_px = fmt.mm_ze_spadem, fmt.px_300dpi_ze_spadem
@@ -326,6 +346,8 @@ class ExportView(QWidget):
             return
         if self.radio_krm.isChecked():
             self.export_clicked.emit("krm")
+        elif self.radio_jkb.isChecked():
+            self.export_clicked.emit("jkb")
         elif self.radio_cmyk.isChecked():
             self.export_clicked.emit("cmyk")
         elif self.radio_files.isChecked():

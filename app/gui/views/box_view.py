@@ -38,6 +38,7 @@ class BoxView(QWidget):
     export_box_clicked = pyqtSignal(dict)     # {"format": "png"|"pdf", "z_liniami": bool}
     box_changed = pyqtSignal()                # opis/wykrojnik zmieniony → zapis
     set_main_variant = pyqtSignal(str)        # stempel wariantu → ustaw główny
+    resume_rezyser_clicked = pyqtSignal()     # wznów Reżysera z zapisanych postaci
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,7 +76,7 @@ class BoxView(QWidget):
         tryb_caption.setObjectName("sideCaption")
         lay.addWidget(tryb_caption)
         self.tryb_seg = SegmentedControl(
-            ["🖼 Jedna scena", "🧩 Osobne panele"])
+            ["🧑 Osoby po kolei", "🖼 Jedna scena", "🧩 Osobne panele"])
         self.tryb_seg.changed.connect(lambda _=0: self._refresh_tryb_hint())
         lay.addWidget(self.tryb_seg)
         self.tryb_hint = QLabel("")
@@ -112,17 +113,22 @@ class BoxView(QWidget):
         self.people_info.setWordWrap(True)
         lay.addWidget(self.people_info)
 
-        # osobne portrety (1 osoba/plik) — dodatkowe referencje wierności twarzy
+        # OSOBY — folder „1 podfolder = 1 osoba" (źródło trybu „Osoby po kolei")
+        osoby_caption = QLabel("OSOBY (1 PODFOLDER = 1 OSOBA)")
+        osoby_caption.setObjectName("sideCaption")
+        lay.addWidget(osoby_caption)
         self._osobne_folder = ""
-        self.osobne_check = QCheckBox("🧑 Wyślij osobne portrety osób (1 os./plik)")
+        self.osobne_check = QCheckBox("🧑 Użyj folderu osób (tryb „Osoby po kolei”)")
         self.osobne_check.setToolTip(
-            "Dodatkowo wysyła zdjęcia z folderu, gdzie KAŻDY plik to jedna "
-            "osoba — model wtedy wstawia każdego wiernie (własna twarz).")
+            "Wskaż JEDEN folder główny. Każdy PODFOLDER = jedna osoba (może mieć "
+            "kilka jej zdjęć — lepsze podobieństwo). Bez podfolderów: 1 plik = "
+            "1 osoba. Tryb „Osoby po kolei” składa dokładnie tyle postaci, ile "
+            "osób — bez powtórek.")
         self.osobne_check.toggled.connect(self._on_osobne_toggled)
         lay.addWidget(self.osobne_check)
         osobne_row = QHBoxLayout()
         osobne_row.setSpacing(6)
-        self.osobne_btn = QPushButton("📁 Folder portretów…")
+        self.osobne_btn = QPushButton("📁 Wskaż folder osób…")
         self.osobne_btn.setObjectName("ghostBtn")
         self.osobne_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.osobne_btn.clicked.connect(self._pick_osobne_folder)
@@ -133,6 +139,18 @@ class BoxView(QWidget):
         self.osobne_info.setWordWrap(True)
         lay.addWidget(self.osobne_info)
         self._refresh_osobne_info()
+
+        # „Reżyser sceny" (tylko tryb Osoby po kolei): akceptacja/poprawa
+        # postaci → AI komponuje scenę (przód/tył: bar/stół)
+        self.rezyser_check = QCheckBox("🎬 Reżyser sceny (akceptuj postacie, "
+                                       "AI komponuje scenę)")
+        self.rezyser_check.setToolTip(
+            "Tylko tryb „Osoby po kolei”. Najpierw wygeneruje każdą postać "
+            "osobno (możesz ją poprawić dopiskiem i zregenerować), a po "
+            "akceptacji AI ułoży wszystkich w scenę (bar/stół) i dogeneruje tło. "
+            "Efekt bardziej „przy stole”, ale AI może lekko zmienić układ.")
+        self.rezyser_check.toggled.connect(lambda _=False: self.box_changed.emit())
+        lay.addWidget(self.rezyser_check)
 
         opis_caption = QLabel("OPIS STYLU (zapisywany w presecie)")
         opis_caption.setObjectName("sideCaption")
@@ -251,6 +269,17 @@ class BoxView(QWidget):
         actions.addWidget(self.fix_btn)
         lay.addLayout(actions)
 
+        # wznowienie Reżysera z zapisanych postaci (po przerwanym generowaniu)
+        self.resume_btn = QPushButton("📂  Wznów postacie (Reżyser)")
+        self.resume_btn.setObjectName("ghostBtn")
+        self.resume_btn.setToolTip(
+            "Wczytuje już wygenerowane postacie z dysku i otwiera akceptację → "
+            "komponowanie sceny (bez regeneracji wszystkiego). Aktywne, gdy są "
+            "zapisane postacie z poprzedniego, przerwanego generowania.")
+        self.resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_btn.clicked.connect(self.resume_rezyser_clicked.emit)
+        lay.addWidget(self.resume_btn)
+
         self.lines_check = QCheckBox("Eksportuj z liniami cięcia (proof)")
         self.lines_check.setToolTip(
             "Włączone = plik z naniesionymi liniami cięcia/bigowania (proof "
@@ -281,6 +310,17 @@ class BoxView(QWidget):
         self.export_cmyk_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_cmyk_btn.clicked.connect(lambda: self._emit_export("cmyk"))
         lay.addWidget(self.export_cmyk_btn)
+
+        self.export_die_btn = QPushButton("⇩  Eksport na wykrojnik drukarni (PDF)")
+        self.export_die_btn.setObjectName("outlineBtn")
+        self.export_die_btn.setToolTip(
+            "Kopiuje ORYGINALNY wektorowy wykrojnik PDF z drukarni i wstawia "
+            "grafikę w obszar druku POD linie cięcia/bigowania — gotowy plik dla "
+            "drukarni. Wymaga wykrojnika w formacie PDF.")
+        self.export_die_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_die_btn.clicked.connect(
+            lambda: self._emit_export("pdf_drukarnia"))
+        lay.addWidget(self.export_die_btn)
         return panel
 
     # --- dieline ---------------------------------------------------------------
@@ -329,11 +369,20 @@ class BoxView(QWidget):
                 "Brak wymiarów — zostaniesz o nie zapytany przy generacji.")
 
     # --- opis / tryb -----------------------------------------------------------
+    _TRYBY = {0: "osoby", 1: "scena", 2: "panele"}
+
     def tryb(self) -> str:
-        return "panele" if self.tryb_seg.current() == 1 else "scena"
+        return self._TRYBY.get(self.tryb_seg.current(), "osoby")
 
     def _refresh_tryb_hint(self) -> None:
-        if self.tryb() == "panele":
+        tryb = self.tryb()
+        if tryb == "osoby":
+            self.tryb_hint.setText(
+                "Zalecany i PEWNY. Każda osoba z folderu (1 podfolder = 1 osoba) "
+                "jest OSOBNO przerabiana na styl AI i wklejana po kolei na "
+                "wygenerowane tło — dokładnie tyle postaci ile osób, bez "
+                "powtórek. Wskaż folder osób poniżej.")
+        elif tryb == "panele":
             self.tryb_hint.setText(
                 "Przód i tył = osobne sceny AI z osobami (2 generacje, spójne "
                 "przez wspólny styl). Boki = jednolite tło w kolorze frontu + "
@@ -341,7 +390,7 @@ class BoxView(QWidget):
         else:
             self.tryb_hint.setText(
                 "Jedna scena AI z wszystkimi osobami rozłożona na całym "
-                "wykrojniku.")
+                "wykrojniku (model komponuje sam — może dodać/powielić osoby).")
 
     # --- osobne portrety -------------------------------------------------------
     def _on_osobne_toggled(self, _on: bool = False) -> None:
@@ -350,7 +399,7 @@ class BoxView(QWidget):
 
     def _pick_osobne_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
-            self, "Folder z osobnymi portretami (1 osoba/plik)",
+            self, "Folder osób (1 podfolder = 1 osoba)",
             self._osobne_folder or "")
         if folder:
             self._osobne_folder = folder
@@ -359,20 +408,23 @@ class BoxView(QWidget):
             self.box_changed.emit()
 
     def _osobne_liczba(self) -> int:
-        d = Path(self._osobne_folder)
-        if not self._osobne_folder or not d.is_dir():
+        """Liczba WYKRYTYCH osób (podfoldery albo luźne pliki)."""
+        if not self._osobne_folder:
             return 0
-        return sum(1 for p in d.iterdir()
-                   if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
+        return len(pudelko.osoby_z_folderu(Path(self._osobne_folder)))
 
     def _refresh_osobne_info(self) -> None:
         aktywne = self.osobne_check.isChecked()
         self.osobne_btn.setEnabled(aktywne)
         if not self._osobne_folder:
-            self.osobne_info.setText("Wskaż folder — każdy plik to jedna osoba.")
+            self.osobne_info.setText(
+                "Wskaż folder osób — każdy podfolder to jedna osoba "
+                "(albo 1 plik = 1 osoba).")
             return
+        n = self._osobne_liczba()
         self.osobne_info.setText(
-            f"{Path(self._osobne_folder).name} · {self._osobne_liczba()} zdjęć"
+            f"{Path(self._osobne_folder).name} · wykryto {n} "
+            f"{'osobę' if n == 1 else 'osób'}"
             + ("" if aktywne else " (opcja wyłączona)"))
 
     def _apply_opis(self) -> None:
@@ -392,7 +444,8 @@ class BoxView(QWidget):
         self.generate_box_clicked.emit(
             {"custom": self.opis_edit.toPlainText(), "tryb": self.tryb(),
              "osobne_on": self.osobne_check.isChecked(),
-             "osobne_folder": self._osobne_folder})
+             "osobne_folder": self._osobne_folder,
+             "rezyser": self.rezyser_check.isChecked()})
 
     def _pick_import(self) -> None:
         if self._current_dieline() is None:
@@ -434,6 +487,7 @@ class BoxView(QWidget):
         self.gen_btn.setEnabled(not busy)
         self.import_btn.setEnabled(not busy)
         self.fix_btn.setEnabled(not busy)
+        self.resume_btn.setEnabled(not busy)
         self.spinner.setVisible(busy)
         self.gen_btn.setText("⏳  Generuję pudełko..." if busy
                              else "✨  Generuj pudełko")
@@ -463,7 +517,19 @@ class BoxView(QWidget):
         else:
             self.preview.hide()
             self.placeholder.show()
+        self._refresh_resume_btn()
         self.reload_history()
+
+    def _refresh_resume_btn(self) -> None:
+        """Przycisk „Wznów postacie" aktywny tylko, gdy są zapisane postacie."""
+        d = pudelko.postacie_dir()
+        ma = d.exists() and any(d.glob("*.png"))
+        self.resume_btn.setEnabled(ma)
+        self.resume_btn.setToolTip(
+            "Wczytuje już wygenerowane postacie i otwiera akceptację → "
+            "komponowanie sceny (bez regeneracji wszystkiego)."
+            if ma else
+            "Brak zapisanych postaci — najpierw uruchom „Reżyser sceny”.")
 
     # --- historia wariantów ----------------------------------------------------
     def reload_history(self) -> None:
@@ -510,16 +576,22 @@ class BoxView(QWidget):
     def settings(self) -> dict:
         return {"z_liniami": self.lines_check.isChecked(), "tryb": self.tryb(),
                 "osobne_on": self.osobne_check.isChecked(),
-                "osobne_folder": self._osobne_folder}
+                "osobne_folder": self._osobne_folder,
+                "rezyser": self.rezyser_check.isChecked()}
 
     def apply_settings(self, data: dict) -> None:
         self.lines_check.setChecked(bool(data.get("z_liniami", True)))
-        self.tryb_seg.set_current(1 if data.get("tryb") == "panele" else 0)
+        idx_tryb = {"osoby": 0, "scena": 1, "panele": 2}.get(
+            data.get("tryb", "osoby"), 0)
+        self.tryb_seg.set_current(idx_tryb)
         if isinstance(data.get("osobne_folder"), str):
             self._osobne_folder = data["osobne_folder"]
         self.osobne_check.blockSignals(True)
         self.osobne_check.setChecked(bool(data.get("osobne_on", False)))
         self.osobne_check.blockSignals(False)
+        self.rezyser_check.blockSignals(True)
+        self.rezyser_check.setChecked(bool(data.get("rezyser", False)))
+        self.rezyser_check.blockSignals(False)
         self._refresh_osobne_info()
         self._refresh_tryb_hint()
         self.opis_edit.blockSignals(True)

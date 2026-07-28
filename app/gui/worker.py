@@ -1,6 +1,8 @@
 """Wątki robocze — GUI pozostaje responsywne podczas wywołań API/eksportu."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from app.core import generator
@@ -290,7 +292,7 @@ class BoxWorker(QThread):
     def __init__(self, prompt, dieline_path, foto_paths, design_mm,
                  seed=None, tryb="scena", prompt_front=None, prompt_back=None,
                  card_paths=None, boki_ai=False, liczba_osob=None,
-                 osobne_foto=None, parent=None):
+                 osobne_foto=None, prompt_tlo=None, osoby=None, parent=None):
         super().__init__(parent)
         self.prompt = prompt
         self.dieline_path = dieline_path
@@ -304,6 +306,8 @@ class BoxWorker(QThread):
         self.boki_ai = boki_ai
         self.liczba_osob = liczba_osob
         self.osobne_foto = osobne_foto
+        self.prompt_tlo = prompt_tlo
+        self.osoby = osoby
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -320,10 +324,141 @@ class BoxWorker(QThread):
                 prompt_front=self.prompt_front, prompt_back=self.prompt_back,
                 card_paths=self.card_paths, boki_ai=self.boki_ai,
                 liczba_osob=self.liczba_osob, osobne_foto=self.osobne_foto,
+                prompt_tlo=self.prompt_tlo, osoby=self.osoby,
                 postep=self.progress.emit)
             self.done.emit(str(path))
         except StabilityAborted:
             self.failed.emit("Anulowano generację pudełka")
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+
+
+class BoxCharactersWorker(QThread):
+    """Reżyser sceny — etap 1: generuje N postaci (`generator.generuj_postac`)
+    i zapisuje wycinki RGBA do `pudelko.postacie_dir()`. Emituje ścieżkę każdej
+    gotowej postaci (na żywo) + komplet."""
+
+    character_done = pyqtSignal(int, str)   # indeks, ścieżka
+    progress = pyqtSignal(str)
+    done = pyqtSignal(list)                 # lista ścieżek
+    failed = pyqtSignal(str)
+
+    def __init__(self, osoby, styl, seed=None, parent=None):
+        super().__init__(parent)
+        self.osoby = osoby
+        self.styl = styl
+        self.seed = seed
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        import random
+
+        from app.api.errors import FatalAPIError
+        from app.api.stability_client import StabilityAborted
+        from app.core import pudelko
+        try:
+            baza = self.seed if self.seed is not None else random.randrange(1, 10**6)
+            d = pudelko.postacie_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            for stary in d.glob("*.png"):     # świeży komplet
+                stary.unlink()
+            sciezki = []
+            for i, zdjecia in enumerate(self.osoby):
+                if self._cancelled:
+                    break
+                self.progress.emit(f"Generuję postać {i + 1}/{len(self.osoby)}…")
+                # ODPORNOŚĆ per-osoba: billing/anulowanie przerywa, każdy inny
+                # błąd (zryw sieci) → placeholder + dalej (feralną poprawisz
+                # „Regeneruj"). Bez tego jeden błąd wywalał cały etap.
+                try:
+                    cut = generator.generuj_postac(
+                        zdjecia, self.styl, baza + i * 1009 + 1)
+                except (FatalAPIError, StabilityAborted):
+                    raise
+                except Exception as exc:
+                    self.progress.emit(f"Postać {i + 1} — błąd ({exc}); placeholder")
+                    cut = generator.placeholder_postac(
+                        zdjecia[0] if zdjecia else None)
+                out = pudelko.sciezka_postaci(
+                    i, Path(zdjecia[0]).parent.name if zdjecia else "")
+                cut.save(out)
+                sciezki.append(str(out))
+                self.character_done.emit(i, str(out))
+            self.done.emit(sciezki)
+        except StabilityAborted:
+            self.failed.emit("Anulowano generację postaci")
+        except FatalAPIError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+
+
+class BoxCharacterOneWorker(QThread):
+    """Reżyser sceny — regeneracja JEDNEJ postaci z dopiskiem (w dialogu)."""
+
+    done = pyqtSignal(int, str)             # indeks, ścieżka
+    failed = pyqtSignal(int, str)
+
+    def __init__(self, indeks, zdjecia, styl, seed, dopisek, out_path, parent=None):
+        super().__init__(parent)
+        self.indeks = indeks
+        self.zdjecia = zdjecia
+        self.styl = styl
+        self.seed = seed
+        self.dopisek = dopisek
+        self.out_path = out_path
+
+    def run(self) -> None:
+        try:
+            cut = generator.generuj_postac(self.zdjecia, self.styl, self.seed,
+                                           self.dopisek)
+            cut.save(self.out_path)
+            self.done.emit(self.indeks, str(self.out_path))
+        except Exception as exc:
+            self.failed.emit(self.indeks, str(exc))
+
+
+class BoxComposeWorker(QThread):
+    """Reżyser sceny — etap 2: z zaakceptowanych postaci komponuje scenę AI
+    (przód/tył) i składa pudełko (`generator.generate_box_scena_z_osob`)."""
+
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, wycinki_paths, dieline_path, design_mm, styl,
+                 seed=None, card_paths=None, parent=None):
+        super().__init__(parent)
+        self.wycinki_paths = [Path(p) for p in wycinki_paths]
+        self.dieline_path = dieline_path
+        self.design_mm = design_mm
+        self.styl = styl
+        self.seed = seed
+        self.card_paths = card_paths
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        from app.api import stability_client
+        stability_client.abort_active()
+
+    def run(self) -> None:
+        from app.api.stability_client import StabilityAborted
+        try:
+            path = generator.generate_box_scena_z_osob(
+                self.wycinki_paths, self.dieline_path, self.design_mm,
+                self.styl, seed=self.seed, card_paths=self.card_paths,
+                postep=self.progress.emit)
+            self.done.emit(str(path))
+        except StabilityAborted:
+            self.failed.emit("Anulowano komponowanie sceny")
         except Exception as exc:
             if not self._cancelled:
                 self.failed.emit(str(exc))
@@ -362,6 +497,42 @@ class BoxFixWorker(QThread):
         except Exception as exc:
             if not self._cancelled:
                 self.failed.emit(str(exc))
+
+
+class SyncWorker(QThread):
+    """Eksport/import paczki synchronizacyjnej w tle — bez wywołań API.
+
+    Kopiowanie kilku GB potrafi trwać minuty, a `sync.importuj` liczy sha1
+    każdego pliku, więc w wątku GUI zamroziłoby okno.
+    """
+
+    progress = pyqtSignal(int, int)
+    done = pyqtSignal(str, object)   # komunikat, Raport|None (None = eksport)
+    failed = pyqtSignal(str)
+
+    def __init__(self, akcja: str, folder: str, autor: str = "",
+                 profil: str = "pelny", sucho: bool = False, parent=None):
+        super().__init__(parent)
+        self.akcja = akcja           # "eksport" | "import"
+        self.folder = folder
+        self.autor = autor
+        self.profil = profil
+        self.sucho = sucho
+
+    def run(self) -> None:
+        try:
+            from app.core import sync
+            cb = lambda i, n: self.progress.emit(i, n)   # noqa: E731
+            if self.akcja == "eksport":
+                paczka = sync.eksportuj(Path(self.folder), self.autor,
+                                        profil=self.profil, postep=cb)
+                self.done.emit(str(paczka), None)
+            else:
+                raport = sync.importuj(Path(self.folder), sucho=self.sucho,
+                                       postep=cb)
+                self.done.emit("", raport)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class SampleWorker(QThread):

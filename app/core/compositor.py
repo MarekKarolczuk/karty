@@ -382,14 +382,22 @@ def montaz_portretow(paths, *, komorka: int = 460, maks: int = 12,
     osobnych referencji (lekki request do modelu, a twarze wciąż czytelne).
     Komórki z biasem ku górze (twarze), cienkie ramki i odstępy — model czyta
     odrębne osoby. Bierze pierwsze `maks` ścieżek."""
-    import math
-
     obrazy: list[Image.Image] = []
     for p in list(paths)[:maks]:
         try:
             obrazy.append(ImageOps.exif_transpose(Image.open(p)).convert("RGB"))
         except (OSError, ValueError):
             continue
+    return montaz_obrazow(obrazy, komorka=komorka, maks=maks, kolumny=kolumny)
+
+
+def montaz_obrazow(obrazy: list[Image.Image], *, komorka: int = 460,
+                   maks: int = 12, kolumny: int | None = None) -> Image.Image:
+    """Jak montaz_portretow, ale z gotowych obrazów PIL (np. wykadrowanych
+    twarzy) — JEDNA komórka na obraz, contact-sheet do referencji AI."""
+    import math
+
+    obrazy = [im.convert("RGB") for im in obrazy[:maks]]
     if not obrazy:
         return Image.new("RGB", (komorka, komorka), config.CREAM_HEX)
 

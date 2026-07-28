@@ -6,4 +6,6 @@ numpy>=1.26
 opencv-python>=4.9
 requests>=2.31
 reportlab>=4.0
+PyMuPDF>=1.24
 # dev (tylko do scripts/wyciagnij_fonty.py): fonttools, brotli
+# test (tylko do scripts/test_eksport.py): pypdf

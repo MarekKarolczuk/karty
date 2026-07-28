@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from app.core.eksport.formaty import aktywny_format
+from app.core.eksport.formaty import FormatKarty, aktywny_format
 from app.core.eksport.procesor import (
     Procesor, ProcesorKarty, ProcesorKRM, wczytaj_karte, wczytaj_rewers,
 )
@@ -62,9 +62,51 @@ class ExportManager:
         return self.wyjscie.zapisz(wynik, out_path, progress)
 
 
-def manager_dla_joba(job: "ExportJob") -> ExportManager:
+@dataclass
+class ManagerJKB:
+    """Druk do JKB Print: DWA pliki PDF CMYK wg specyfikacji drukarni —
+    `<nazwa>_karty.pdf` (wszystkie awersy) i `<nazwa>_rewers.pdf` (wspólny
+    rewers). Każda strona = format netto + spad 3 mm (poker 69 × 94 mm),
+    grafika full-bleed (spad z replikacji krawędzi, `ProcesorKarty`), linie
+    cięcia opcjonalne (`znaczniki`). Reużywa `ExportManager` w dwóch przebiegach.
+    Zwraca ścieżkę pliku awersów (główny wynik); brak rewersu → tylko ten plik.
+    """
+    format: FormatKarty
+    znaczniki: bool = False
+    podbicie: int | None = None
+
+    def _manager(self, tytul: str, wymagaj_kart: bool) -> ExportManager:
+        return ExportManager(
+            procesor=ProcesorKarty(self.format, spad=True,
+                                   znaczniki=self.znaczniki),
+            uklad=UkladPojedynczy(self.format),
+            wyjscie=WyjsciePDF_CMYK(self.format, spad=True,
+                                    podbicie=self.podbicie, tytul=tytul),
+            wymagaj_kart=wymagaj_kart)
+
+    def wykonaj(self, fronty: list[tuple[str, Path | None]],
+                rewers: Path | None, out_path: Path,
+                progress: ProgressCb | None = None) -> Path:
+        etykieta = self.format.etykieta
+        karty_out = out_path.with_stem(out_path.stem + "_karty")
+        wynik = self._manager(f"Atelier Kart — JKB karty {etykieta}",
+                              wymagaj_kart=True).wykonaj(
+            fronty, None, karty_out, progress)
+        if rewers is not None and rewers.exists():
+            rewers_out = out_path.with_stem(out_path.stem + "_rewers")
+            self._manager(f"Atelier Kart — JKB rewers {etykieta}",
+                          wymagaj_kart=False).wykonaj(
+                [], rewers, rewers_out, progress)
+        return wynik
+
+
+def manager_dla_joba(job: "ExportJob") -> ExportManager | ManagerJKB:
     """Fabryka: mapuje dotychczasowe rodzaje ExportJob na konfiguracje potoku."""
     fmt = aktywny_format()
+    if job.kind == "jkb":
+        # Druk do JKB Print: dwa PDF-y CMYK (karty + rewers), full-bleed 3 mm
+        return ManagerJKB(fmt, znaczniki=job.marks,
+                          podbicie=job.extra.get("podbicie"))
     if job.kind == "pdf":
         return ExportManager(
             procesor=ProcesorKarty(fmt, spad=job.bleed, znaczniki=job.marks),

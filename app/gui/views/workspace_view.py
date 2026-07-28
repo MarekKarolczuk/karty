@@ -121,6 +121,10 @@ class WorkspaceView(QWidget):
         super().__init__(parent)
         self._current_suit: Suit = Suit.KIER
         self._current_value: str = "A"
+        # ostatnia NIE-jokerowa karta — cel powrotu z Jokera (joker ma tylko
+        # „wartość" JOKER, więc jego wybór nie może zatruwać przełączania)
+        self._last_color_suit: Suit = Suit.KIER
+        self._last_color_value: str = "A"
         self._mask_preview_on = False
 
         layout = QVBoxLayout(self)
@@ -382,11 +386,7 @@ class WorkspaceView(QWidget):
             btn.setProperty("red", suit.is_red)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            # joker ma jedyną „wartość" JOKER — klik z bieżącą wartością talii
-            # (np. "A") trafiałby w nieistniejący slot
-            btn.clicked.connect(lambda _=False, s=suit: self.card_picked.emit(
-                s.nazwa, JOKER_WARTOSC if s.czy_joker else self._current_value
-            ))
+            btn.clicked.connect(lambda _=False, s=suit: self._pick_suit(s))
             suit_grid.addWidget(btn, i // 2, i % 2)
             self._suit_buttons[suit] = btn
         right_layout.addLayout(suit_grid)
@@ -670,16 +670,36 @@ class WorkspaceView(QWidget):
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self._value_group.addButton(btn)
-            btn.clicked.connect(lambda _=False, v=value: self.card_picked.emit(
-                self._current_suit.nazwa, v
-            ))
+            btn.clicked.connect(lambda _=False, v=value: self._pick_value(v))
             self.value_grid.addWidget(btn, i // columns, i % columns)
             self._value_buttons[value] = btn
+
+    # --- wybór karty przyciskami bocznymi -----------------------------------------
+    def _pick_suit(self, suit: Suit) -> None:
+        """Klik przycisku KOLOR / ZNAK. Joker → jedyna wartość JOKER; kolor →
+        bieżąca wartość, a gdy jest jokerowa (wejście z Jokera) → ostatnia
+        wartość koloru (inaczej trafiałby w nieistniejący slot)."""
+        if suit.czy_joker:
+            self.card_picked.emit(suit.nazwa, JOKER_WARTOSC)
+            return
+        wartosc = (self._current_value if self._current_value != JOKER_WARTOSC
+                   else self._last_color_value)
+        self.card_picked.emit(suit.nazwa, wartosc)
+
+    def _pick_value(self, value: str) -> None:
+        """Klik przycisku WARTOŚCI. Gdy bieżący znak to Joker (brak wartości
+        liczbowych) → wybór trafia na ostatni kolor, nie na jokera."""
+        suit = (self._current_suit if not self._current_suit.czy_joker
+                else self._last_color_suit)
+        self.card_picked.emit(suit.nazwa, value)
 
     # --- właściwości karty --------------------------------------------------------
     def show_card(self, slot: CardSlot) -> None:
         self._current_suit = slot.suit
         self._current_value = slot.value
+        if not slot.suit.czy_joker:      # zapamiętaj cel powrotu z Jokera
+            self._last_color_suit = slot.suit
+            self._last_color_value = slot.value
 
         color = theme.ACCENT_HOVER if slot.suit.is_red else theme.CREAM
         self.value_badge.setText(f"{slot.value}{slot.suit.symbol}")

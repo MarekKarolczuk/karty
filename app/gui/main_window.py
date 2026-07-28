@@ -7,6 +7,7 @@ projekt.json), widoki są warstwą UI komunikującą się sygnałami.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QUrl
@@ -39,9 +40,9 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.workspace_view import WorkspaceView
 from app.gui.widgets import show_toast
 from app.gui.worker import (
-    AnalysisWorker, BackWorker, BoxFixWorker, BoxWorker, ExportWorker,
-    FixWorker, GenerationWorker, RestampWorker, SampleWorker,
-    TemplateSetWorker, TemplateWorker,
+    AnalysisWorker, BackWorker, BoxCharactersWorker, BoxComposeWorker,
+    BoxFixWorker, BoxWorker, ExportWorker, FixWorker, GenerationWorker,
+    RestampWorker, SampleWorker, SyncWorker, TemplateSetWorker, TemplateWorker,
 )
 
 class MainWindow(QMainWindow):
@@ -83,9 +84,13 @@ class MainWindow(QMainWindow):
         self.sample_worker: SampleWorker | None = None
         self.restamp_worker: RestampWorker | None = None
         self.fix_worker: FixWorker | None = None
-        self.box_worker: BoxWorker | None = None
+        self.box_worker: BoxWorker | BoxCharactersWorker | BoxComposeWorker | None = None
         self.box_fix_worker: BoxFixWorker | None = None
         self.analysis_worker: AnalysisWorker | None = None
+        self.sync_worker: SyncWorker | None = None
+        # blokada zapisu projekt.json na czas importu paczki — inaczej dowolne
+        # zdarzenie UI nadpisałoby świeżo scalony plik stanem z pamięci
+        self._sync_w_toku = False
         # auto-przydział: edytowalne motywy kolorów + stan bieżącej sesji
         self.auto_motywy: dict[str, str] = dict(photo_analyzer.DOMYSLNE_MOTYWY)
         self._auto_dialog: AutoAssignDialog | None = None
@@ -215,6 +220,9 @@ class MainWindow(QMainWindow):
         self.settings_view.model_changed.connect(self._on_model_changed)
         self.settings_view.keys_changed.connect(self._refresh_api_status)
         self.settings_view.card_preset_changed.connect(self._on_card_preset_changed)
+        self.settings_view.sync_export_clicked.connect(self._start_sync_export)
+        self.settings_view.sync_import_clicked.connect(self._start_sync_import)
+        self.settings_view.sync_changed.connect(self._save_project)
 
         # edycja stylu postaci w zakładce „Style" → zapis + odśwież podgląd promptu
         self.back_view.character_changed.connect(self._save_project)
@@ -246,6 +254,7 @@ class MainWindow(QMainWindow):
         self.box_view.export_box_clicked.connect(self._start_box_export)
         self.box_view.box_changed.connect(self._save_project)
         self.box_view.set_main_variant.connect(self._on_box_set_main)
+        self.box_view.resume_rezyser_clicked.connect(self._resume_box_rezyser)
 
     def _build_status_bar(self) -> QWidget:
         bar = QWidget()
@@ -1850,22 +1859,41 @@ class MainWindow(QMainWindow):
             return
         die, dm = ctx
         paths = self._box_photo_paths()
-        if not paths:
+        tryb = settings.get("tryb", "osoby")
+        # osoby: „1 podfolder = 1 osoba" (źródło twarzy trybu „osoby"); ta sama
+        # lista (spłaszczona) służy też jako dodatkowe portrety w panele/scena
+        osoby = self._box_osoby(settings)
+        osobne_foto = [p for grupa in osoby for p in grupa]
+        n_portrety = len(osoby)
+        # tryb „osoby" opiera się na folderze osób; pozostałe wymagają zdjęć z kart
+        if tryb == "osoby":
+            if not osoby:
+                show_toast(self, "Tryb „Osoby po kolei” wymaga folderu osób — "
+                           "zaznacz „Użyj folderu osób” i wskaż folder "
+                           "(1 podfolder = 1 osoba).", "error")
+                return
+        elif not paths:
             show_toast(self, "Najpierw przypisz zdjęcia do kart na Ekranie "
                        "roboczym", "error")
             return
-        # osobne portrety (1 osoba/plik) — dodatkowe referencje wierności twarzy
-        osobne_foto = self._box_osobne_foto(settings)
-        n_portrety = len(osobne_foto)
         liczba_osob = n_portrety or self._box_people_count(paths)
-        tryb = settings.get("tryb", "scena")
         custom = settings.get("custom", "")
         from app.api import stability_client
         stability_client.reset_abort()
         self._gen_cancelled = False
         self.box_view.set_box_busy(True)
         self.cancel_btn.setVisible(True)
-        if tryb == "panele":
+        if tryb == "osoby":
+            karty = self._box_karty_boki()   # wachlarz na boki paneli
+            if settings.get("rezyser"):
+                self._start_box_rezyser(die, dm, osoby, custom, karty)
+                return
+            self._set_status(
+                f"Generuję pudełko — osoby po kolei ({n_portrety} os.)…")
+            worker = BoxWorker(custom, die, paths, dm, tryb="osoby",
+                               osoby=osoby, card_paths=karty,
+                               liczba_osob=n_portrety)
+        elif tryb == "panele":
             karty = self._box_karty_boki()
             boki_ai = bool(settings.get("boki_ai", False)) and bool(karty)
             if not karty:
@@ -1875,42 +1903,106 @@ class MainWindow(QMainWindow):
             status = ("osobne panele + boki AI (front, tył i do 6 scen boków)"
                       if boki_ai else "osobne panele (2 sceny AI)")
             self._set_status(f"Generuję pudełko — {status}…")
+            proporcja = pudelko.parsuj_wykrojnik(die).proporcja
             worker = BoxWorker(
                 None, die, paths, dm, tryb="panele",
                 prompt_front=prompts.box_front_prompt(
                     custom, liczba_osob, osobne_portrety=n_portrety),
                 prompt_back=prompts.box_back_prompt(
                     custom, liczba_osob, osobne_portrety=n_portrety),
+                prompt_tlo=prompts.box_background_prompt(custom, proporcja),
                 card_paths=karty, boki_ai=boki_ai, liczba_osob=liczba_osob,
-                osobne_foto=osobne_foto)
+                osobne_foto=osobne_foto, osoby=osoby)
         else:
             proporcja = pudelko.parsuj_wykrojnik(die).proporcja
             prompt = prompts.box_generation_prompt(
                 custom_text=custom, liczba_osob=liczba_osob, proporcja=proporcja,
                 osobne_portrety=n_portrety)
             self._set_status("Generuję pudełko (AI)…")
-            worker = BoxWorker(prompt, die, paths, dm, osobne_foto=osobne_foto)
+            worker = BoxWorker(prompt, die, paths, dm, osobne_foto=osobne_foto,
+                               osoby=osoby)
         worker.done.connect(self._on_box_generated)
         worker.failed.connect(self._on_box_failed)
         worker.progress.connect(self.box_view.set_box_status)
         self.box_worker = worker
         worker.start()
 
-    def _box_osobne_foto(self, settings: dict) -> list[Path]:
-        """Osobne portrety (1 osoba/plik) z folderu wskazanego w widoku pudełka
-        — dodatkowe referencje wierności twarzy. Pusta lista = opcja wyłączona
-        albo folder pusty/nieistniejący."""
+    # --- Reżyser sceny (etapowy: postacie → akceptacja → kompozycja) ----------
+    def _start_box_rezyser(self, die: Path, dm: tuple[float, float],
+                           osoby: list[list[Path]], custom: str,
+                           karty: list[Path]) -> None:
+        self._rezyser_ctx = (die, dm, osoby, custom, karty)
+        self._set_status(f"Reżyser sceny — generuję {len(osoby)} postaci…")
+        worker = BoxCharactersWorker(osoby, custom)
+        worker.progress.connect(self.box_view.set_box_status)
+        worker.done.connect(self._on_box_chars_done)
+        worker.failed.connect(self._on_box_failed)
+        self.box_worker = worker
+        worker.start()
+
+    def _on_box_chars_done(self, paths: list) -> None:
+        self.box_worker = None
+        die, dm, osoby, custom, karty = self._rezyser_ctx
+        self._review_and_compose([str(p) for p in paths], die, dm, osoby,
+                                 custom, karty)
+
+    def _review_and_compose(self, paths: list, die: Path,
+                            dm: tuple[float, float], osoby: list[list[Path]],
+                            custom: str, karty: list[Path]) -> None:
+        """Wspólny etap: dialog akceptacji postaci → kompozycja sceny AI.
+        Używane po świeżej generacji postaci i przy „Wznów postacie"."""
+        from PyQt6.QtWidgets import QDialog
+
+        from app.gui.character_review_dialog import CharacterReviewDialog
+        dlg = CharacterReviewDialog(paths, osoby, custom, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.box_view.set_box_busy(False)
+            self.cancel_btn.setVisible(False)
+            self._set_status("Reżyser sceny — anulowano")
+            return
+        wycinki = dlg.zaakceptowane()
+        self._set_status("Reżyser sceny — komponuję scenę (przód/tył)…")
+        worker = BoxComposeWorker(wycinki, die, dm, custom, card_paths=karty)
+        worker.progress.connect(self.box_view.set_box_status)
+        worker.done.connect(self._on_box_generated)
+        worker.failed.connect(self._on_box_failed)
+        self.box_worker = worker
+        worker.start()
+
+    def _resume_box_rezyser(self) -> None:
+        """Wznawia Reżysera z zapisanych na dysku postaci (po przerwanym
+        generowaniu) — bez regeneracji wszystkiego."""
+        if self.box_worker is not None:
+            show_toast(self, "Poczekaj — trwa generacja", "info")
+            return
+        paths = [str(p) for p in sorted(pudelko.postacie_dir().glob("*.png"))]
+        if not paths:
+            show_toast(self, "Brak zapisanych postaci — najpierw uruchom "
+                       "„Reżyser sceny”.", "info")
+            return
+        ctx = self._box_context()
+        if ctx is None:
+            return
+        die, dm = ctx
+        settings = self.box_view.settings()
+        osoby = self._box_osoby(settings)      # do regeneracji (może być puste)
+        custom = self.box_view.opis_edit.toPlainText()
+        karty = self._box_karty_boki()
+        self.box_view.set_box_busy(True)
+        self.cancel_btn.setVisible(True)
+        self._set_status(f"Wznawiam Reżysera — {len(paths)} zapisanych postaci…")
+        self._review_and_compose(paths, die, dm, osoby, custom, karty)
+
+    def _box_osoby(self, settings: dict) -> list[list[Path]]:
+        """Osoby ze wskazanego folderu wg „1 podfolder = 1 osoba"
+        (pudelko.osoby_z_folderu). Pusta lista = opcja wyłączona albo folder
+        pusty/nieistniejący. Każda pozycja = zdjęcia jednej osoby."""
         if not settings.get("osobne_on"):
             return []
         folder = settings.get("osobne_folder") or ""
-        d = Path(folder)
-        if not folder or not d.is_dir():
+        if not folder:
             return []
-        pliki: list[Path] = []
-        for p in sorted(d.iterdir()):
-            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-                pliki.append(p)
-        return pliki
+        return pudelko.osoby_z_folderu(Path(folder))
 
     def _box_karty_boki(self, maks: int = 6) -> list[Path]:
         """Reprezentatywna próbka wygenerowanych kart do wizualizacji boków
@@ -2024,11 +2116,17 @@ class MainWindow(QMainWindow):
             return
         die, dm = ctx
         fmt = opts.get("format", "png")
-        filtr = ("PDF do druku (*.pdf)" if fmt == "pdf"
+        if fmt == "pdf_drukarnia" and die.suffix.lower() != ".pdf":
+            show_toast(self, "Eksport na wykrojnik drukarni wymaga wykrojnika "
+                       "PDF (wybierz go w liście wykrojników).", "error")
+            return
+        filtr = ("PDF na wykrojnik drukarni (*.pdf)" if fmt == "pdf_drukarnia"
+                 else "PDF do druku (*.pdf)" if fmt == "pdf"
                  else "PDF CMYK (*.pdf)" if fmt == "cmyk"
                  else "Obraz PNG (*.png)")
-        rozsz = "pdf" if fmt in ("pdf", "cmyk") else fmt
-        sufiks = "_cmyk" if fmt == "cmyk" else ""
+        rozsz = "pdf" if fmt in ("pdf", "cmyk", "pdf_drukarnia") else fmt
+        sufiks = ("_cmyk" if fmt == "cmyk"
+                  else "_wykrojnik" if fmt == "pdf_drukarnia" else "")
         domyslna = f"pudelko_{die.stem}{sufiks}.{rozsz}"
         out, _ = QFileDialog.getSaveFileName(
             self, "Zapisz pudełko", domyslna, filtr)
@@ -2116,6 +2214,7 @@ class MainWindow(QMainWindow):
         "files": ("karty_png", ""),   # folder docelowy
         "cmyk": ("karty_cmyk.pdf", "PDF CMYK (*.pdf)"),   # jeden PDF CMYK
         "krm": ("druk_krm.pdf", "PDF CMYK (*.pdf)"),      # druk w KRM
+        "jkb": ("druk_jkb.pdf", "PDF CMYK (*.pdf)"),      # druk w JKB Print (2 pliki)
         "zip": ("talia_png.zip", "Archiwum ZIP (*.zip)"),
         "atlas": ("atlas_tts_10x7.png", "PNG (*.png)"),
         "sprite": ("sprite_13x4.png", "PNG (*.png)"),
@@ -2261,8 +2360,135 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ------------------------------------------------- synchronizacja przez pendrive
+    def _start_sync_export(self, folder: str, autor: str, profil: str) -> None:
+        """Pakuje stan projektu do folderu paczki (pendrive). Zero API."""
+        if self.sync_worker is not None:
+            return
+        self._save_project()          # paczka ma nieść AKTUALNY stan
+        self.settings_view.set_sync_busy(True)
+        self.settings_view.set_sync_status("Pakuję…")
+        self._run_sync_worker(SyncWorker("eksport", folder, autor=autor,
+                                         profil=profil, parent=self))
+
+    def _start_sync_import(self, folder: str, sucho: bool) -> None:
+        """Scala paczkę od kolegi z lokalnym stanem (nic nie kasuje)."""
+        if self.sync_worker is not None:
+            return
+        from app.core import sync
+        manifest = sync.podsumowanie_paczki(Path(folder))
+        if not manifest:
+            show_toast(self, "To nie jest paczka Atelier Kart "
+                             "(brak manifest.json)", "warn")
+            return
+        if not sucho:
+            pyt = QMessageBox(self)
+            pyt.setWindowTitle("Wczytać paczkę?")
+            pyt.setText(
+                f"Paczka od: {manifest.get('autor') or '?'}\n"
+                f"Utworzona: {manifest.get('utworzono', '?')}\n"
+                f"Plików: {len(manifest.get('pliki', []))}\n\n"
+                "Import NIC nie usunie i nie nadpisze Twojej pracy — kolidujące "
+                "karty wejdą jako nowe warianty. Kopia projekt.json trafi do "
+                "kopie_zapasowe/.")
+            pyt.setIcon(QMessageBox.Icon.Question)
+            pyt.setStandardButtons(QMessageBox.StandardButton.Yes
+                                   | QMessageBox.StandardButton.Cancel)
+            pyt.button(QMessageBox.StandardButton.Yes).setText("Wczytaj")
+            if pyt.exec() != QMessageBox.StandardButton.Yes:
+                return
+        # od tej chwili żadne zdarzenie UI nie może nadpisać scalanego projektu
+        self._sync_w_toku = not sucho
+        self.settings_view.set_sync_busy(True)
+        self.settings_view.set_sync_status(
+            "Sprawdzam (na sucho)…" if sucho else "Scalam paczkę…")
+        self._run_sync_worker(SyncWorker("import", folder, sucho=sucho,
+                                         parent=self))
+
+    def _run_sync_worker(self, worker: SyncWorker) -> None:
+        worker.progress.connect(self._on_sync_progress)
+        worker.done.connect(self._on_sync_done)
+        worker.failed.connect(self._on_sync_failed)
+        self.sync_worker = worker
+        worker.start()
+
+    def _on_sync_progress(self, i: int, n: int) -> None:
+        self.settings_view.set_sync_status(
+            f"{i} / {n} plików ({int(i * 100 / max(1, n))}%)")
+
+    def _on_sync_done(self, paczka: str, raport) -> None:
+        self.sync_worker = None
+        self.settings_view.set_sync_busy(False)
+        if raport is None:                      # eksport
+            self._sync_w_toku = False
+            self.settings_view.set_sync_status(f"Gotowe: {paczka}")
+            show_toast(self, "Paczka gotowa — skopiuj cały folder na pendrive",
+                       "ok")
+            self._open_in_folder(paczka)
+            return
+
+        # import: raport do pliku + dialog
+        plik = config.ROOT / f"raport_sync_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        try:
+            plik.write_text(raport.tekst(), encoding="utf-8")
+        except OSError:
+            plik = None
+        self.settings_view.set_sync_status(raport.krotko)
+
+        if not raport.sucho:
+            # stan wraca Z DYSKU — w pamięci mamy jeszcze wersję sprzed scalenia
+            self._przeladuj_po_imporcie()
+        self._sync_w_toku = False
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Próba importu (nic nie zapisano)" if raport.sucho
+                           else "Import zakończony")
+        box.setIcon(QMessageBox.Icon.Information)
+        tresc = raport.krotko
+        if raport.ostrzezenia:
+            tresc += f"\n\nOstrzeżeń: {len(raport.ostrzezenia)}"
+        if raport.konflikty:
+            tresc += (f"\nKonfliktów (zostawiono Twoją wersję): "
+                      f"{len(raport.konflikty)}")
+        if not raport.sucho:
+            tresc += ("\n\nZalecany restart programu — część ustawień i cache "
+                      "wczytuje się tylko przy starcie.")
+        box.setText(tresc)
+        box.setDetailedText(raport.tekst())
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        if plik is not None:
+            pokaz = box.addButton("Otwórz raport",
+                                  QMessageBox.ButtonRole.ActionRole)
+            box.exec()
+            if box.clickedButton() is pokaz:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(plik)))
+        else:
+            box.exec()
+
+    def _on_sync_failed(self, message: str) -> None:
+        self.sync_worker = None
+        self._sync_w_toku = False
+        self.settings_view.set_sync_busy(False)
+        self.settings_view.set_sync_status(f"Błąd: {message}")
+        show_toast(self, f"Synchronizacja nie powiodła się: {message}", "warn")
+
+    def _przeladuj_po_imporcie(self) -> None:
+        """Po scaleniu paczki stan w pamięci jest nieaktualny — wczytujemy go
+        ponownie z dysku i przebudowujemy siatki (bez restartu programu)."""
+        style_store.load()
+        card_grid.clear_template_cache()
+        self._load_project()
+        self._rebuild_grids(self._values())
+        self._after_assignment_change()
+        self.settings_view.sync_styles()
+        self.settings_view.refresh_prompt()
+        self.back_view.reload_style_slot()
+        self._refresh_box_info()
+
     # --------------------------------------------------------- zapis/odczyt projektu
     def _save_project(self) -> None:
+        if self._sync_w_toku:
+            return          # trwa import paczki — nie nadpisuj scalanego pliku
         data = {
             "deck_name": self.deck_name,
             "assignments": self.assignments,
@@ -2283,6 +2509,7 @@ class MainWindow(QMainWindow):
             "box": self.box_view.settings(),
             "auto_przydzial": {"motywy": self.auto_motywy},
             "import_folder": self._import_folder,
+            "sync": self.settings_view.sync_settings(),
         }
         config.PROJEKT_JSON.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -2342,6 +2569,8 @@ class MainWindow(QMainWindow):
             self.export_view.apply_settings(data["export"])
         if isinstance(data.get("box"), dict):
             self.box_view.apply_settings(data["box"])
+        if isinstance(data.get("sync"), dict):
+            self.settings_view.load_sync_settings(data["sync"])
         model = config.canonical_model(data.get("model"))  # martwe -preview → GA
         if model in config.MODELS:
             config.SELECTED_MODEL = model

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import random
 import time
 
 from google import genai
@@ -25,6 +26,19 @@ _clients: dict[str, genai.Client] = {}
 # stan próbkowania zwykle sprawia, że model wreszcie wyemituje obraz (wzorzec
 # jak echo-retry w generator._FIX_ECHO_TEMP_BUMP).
 PUSTA_TEMP_BUMP = 0.15
+
+# Backoff przy przejściowych błędach sieci (UNAVAILABLE / DEADLINE / reset / 5xx)
+# i pustych odpowiedziach — WYKŁADNICZY z jitterem, żeby chwilowy zryw połączenia
+# przetrwać kilkoma odczekaniami zamiast zrywać całą (wielowywołaniową) generację.
+_BACKOFF_BAZA = 1.0       # sekundy dla pierwszej próby
+_BACKOFF_MAX_S = 15.0     # górny limit pojedynczego odczekania
+_BACKOFF_JITTER = 0.75    # losowy dodatek [0, jitter) — rozprasza retry
+
+
+def _odczekaj(attempt: int) -> None:
+    """Wykładniczy backoff z jitterem: ~1, 2, 4, 8… s (ograniczony)."""
+    time.sleep(min(_BACKOFF_MAX_S, _BACKOFF_BAZA * 2 ** (attempt - 1))
+               + random.uniform(0, _BACKOFF_JITTER))
 
 
 def reset_client() -> None:
@@ -204,7 +218,7 @@ def generate_image(contents: list, retries: int = 3,
                 f"Model nie zwrócił obrazu (odpowiedź: "
                 f"{getattr(response, 'text', None) or 'pusta'})")
             if attempt < retries:
-                time.sleep(1 * attempt)
+                _odczekaj(attempt)
                 continue
         except GeminiError:
             raise   # np. brak klucza/projektu z get_client — nie ponawiać
@@ -228,7 +242,7 @@ def generate_image(contents: list, retries: int = 3,
                     continue
             _raise_if_fatal(exc, model)
             if attempt < retries:
-                time.sleep(2 * attempt)
+                _odczekaj(attempt)
     if isinstance(last_error, GeminiError):
         # wyczerpano próby na pustych odpowiedziach — komunikat akcyjny
         raise GeminiError(
@@ -282,7 +296,7 @@ def generate_text(contents: list, retries: int = 3) -> str:
                 continue
             _raise_if_fatal(exc, model)
             if attempt < retries:
-                time.sleep(2 * attempt)
+                _odczekaj(attempt)
     raise GeminiError(f"Analiza Gemini nie powiodła się po {retries} próbach: {last_error}")
 
 

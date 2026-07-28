@@ -6,7 +6,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QApplication, QButtonGroup, QGridLayout,
+    QApplication, QButtonGroup, QFileDialog, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
@@ -59,6 +59,10 @@ class SettingsView(QWidget):
     keys_changed = pyqtSignal()
     model_changed = pyqtSignal(str)
     card_preset_changed = pyqtSignal(str)
+    # synchronizacja przez pendrive (app/core/sync.py)
+    sync_export_clicked = pyqtSignal(str, str, str)   # katalog, autor, profil
+    sync_import_clicked = pyqtSignal(str, bool)       # folder paczki, na sucho
+    sync_changed = pyqtSignal()                       # zapis ustawień do projekt.json
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -216,6 +220,7 @@ class SettingsView(QWidget):
             row_layout.addWidget(open_btn)
             folders_layout.addWidget(row)
         left_column.addWidget(folders_panel)
+        left_column.addWidget(self._build_sync_panel())
         left_column.addStretch(1)
         columns.addLayout(left_column, stretch=1)
 
@@ -282,6 +287,156 @@ class SettingsView(QWidget):
         self.sync_styles()
         self.refresh_prompt()
         self._refresh_active_source()
+
+    # --- synchronizacja przez pendrive ------------------------------------------------
+    def _build_sync_panel(self) -> QWidget:
+        """Panel wymiany stanu z drugim komputerem BEZ sieci: eksport paczki na
+        pendrive i import paczki od kolegi. Sama logika siedzi w `core/sync.py`
+        — widok tylko zbiera parametry i emituje sygnały (jak reszta widoków)."""
+        panel = QWidget()
+        panel.setObjectName("panel")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        caption = QLabel("🔄  SYNCHRONIZACJA (pendrive)")
+        caption.setObjectName("sectionTitle")
+        lay.addWidget(caption)
+
+        hint = QLabel("Wymiana talii z drugim komputerem bez internetu. Import "
+                      "NIC NIE KASUJE: kolidująca karta wchodzi jako nowy "
+                      "wariant, a przy rozbieżnościach zostaje Twoja wersja.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        autor_row = QHBoxLayout()
+        autor_row.setSpacing(6)
+        autor_caption = QLabel("Twoje imię")
+        autor_caption.setObjectName("propKey")
+        autor_row.addWidget(autor_caption)
+        self.sync_autor_edit = QLineEdit()
+        self.sync_autor_edit.setPlaceholderText("np. Marek — trafi do nazw "
+                                                "plików przy kolizjach")
+        self.sync_autor_edit.editingFinished.connect(self.sync_changed.emit)
+        autor_row.addWidget(self.sync_autor_edit, stretch=1)
+        lay.addLayout(autor_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(6)
+        self.sync_folder_edit = QLineEdit()
+        self.sync_folder_edit.setPlaceholderText("folder pendrive'a lub paczki…")
+        self.sync_folder_edit.editingFinished.connect(self.sync_changed.emit)
+        folder_row.addWidget(self.sync_folder_edit, stretch=1)
+        wybierz = QPushButton("Wybierz…")
+        wybierz.setObjectName("ghostBtn")
+        wybierz.setCursor(Qt.CursorShape.PointingHandCursor)
+        wybierz.clicked.connect(self._pick_sync_folder)
+        folder_row.addWidget(wybierz)
+        lay.addLayout(folder_row)
+
+        profil_row = QHBoxLayout()
+        profil_row.setSpacing(6)
+        profil_caption = QLabel("Zawartość")
+        profil_caption.setObjectName("propKey")
+        profil_row.addWidget(profil_caption)
+        self.sync_profil_combo = NoScrollComboBox()
+        for etykieta, wartosc in (
+            ("Pełna (wszystko)", "pelny"),
+            ("Robocza (bez surowych PNG i historii pudełka)", "roboczy"),
+            ("Lekka (same ustawienia i maski)", "lekki"),
+        ):
+            self.sync_profil_combo.addItem(etykieta, wartosc)
+        self.sync_profil_combo.setToolTip(
+            "Pełna = dokładna kopia stanu (kilka GB, wszystko działa).\n"
+            "Robocza = bez output/_raw i historii pudełka — u odbiorcy nie "
+            "zadziała „Przestempluj” ani selektywna poprawka przywiezionych kart.\n"
+            "Lekka = same presety tekstowe i maski (kilkanaście MB).")
+        self.sync_profil_combo.currentIndexChanged.connect(
+            lambda _=0: self.sync_changed.emit())
+        profil_row.addWidget(self.sync_profil_combo, stretch=1)
+        lay.addLayout(profil_row)
+
+        akcje = QHBoxLayout()
+        akcje.setSpacing(6)
+        self.sync_spinner = Spinner(16)
+        self.sync_spinner.hide()
+        akcje.addWidget(self.sync_spinner)
+        self.sync_export_btn = QPushButton("📤  Eksportuj paczkę")
+        self.sync_export_btn.setObjectName("ghostBtn")
+        self.sync_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_export_btn.clicked.connect(self._emit_sync_export)
+        akcje.addWidget(self.sync_export_btn, stretch=1)
+        lay.addLayout(akcje)
+
+        akcje2 = QHBoxLayout()
+        akcje2.setSpacing(6)
+        self.sync_dry_btn = QPushButton("🔍  Próbnie")
+        self.sync_dry_btn.setObjectName("ghostBtn")
+        self.sync_dry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_dry_btn.setToolTip("Pokazuje, co wejdzie, bez zapisywania "
+                                     "czegokolwiek — rób to przed importem.")
+        self.sync_dry_btn.clicked.connect(
+            lambda: self._emit_sync_import(True))
+        akcje2.addWidget(self.sync_dry_btn)
+        self.sync_import_btn = QPushButton("📥  Wczytaj paczkę")
+        self.sync_import_btn.setObjectName("ghostBtn")
+        self.sync_import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_import_btn.clicked.connect(
+            lambda: self._emit_sync_import(False))
+        akcje2.addWidget(self.sync_import_btn, stretch=1)
+        lay.addLayout(akcje2)
+
+        self.sync_status = QLabel("")
+        self.sync_status.setObjectName("hint")
+        self.sync_status.setWordWrap(True)
+        lay.addWidget(self.sync_status)
+        return panel
+
+    def _pick_sync_folder(self) -> None:
+        start = self.sync_folder_edit.text().strip() or str(config.ROOT.parent)
+        wybrany = QFileDialog.getExistingDirectory(
+            self, "Folder pendrive'a (eksport) albo folder paczki (import)",
+            start)
+        if wybrany:
+            self.sync_folder_edit.setText(wybrany)
+            self.sync_changed.emit()
+
+    def _emit_sync_export(self) -> None:
+        folder = self.sync_folder_edit.text().strip()
+        if not folder:
+            show_toast(self, "Wskaż folder, w którym powstanie paczka", "warn")
+            return
+        self.sync_export_clicked.emit(
+            folder, self.sync_autor_edit.text().strip(),
+            self.sync_profil_combo.currentData() or "pelny")
+
+    def _emit_sync_import(self, sucho: bool) -> None:
+        folder = self.sync_folder_edit.text().strip()
+        if not folder:
+            show_toast(self, "Wskaż folder paczki (AtelierKart_paczka_…)", "warn")
+            return
+        self.sync_import_clicked.emit(folder, sucho)
+
+    def set_sync_busy(self, busy: bool) -> None:
+        for btn in (self.sync_export_btn, self.sync_import_btn, self.sync_dry_btn):
+            btn.setEnabled(not busy)
+        self.sync_spinner.setVisible(busy)
+
+    def set_sync_status(self, tekst: str) -> None:
+        self.sync_status.setText(tekst)
+
+    def sync_settings(self) -> dict:
+        return {"autor": self.sync_autor_edit.text().strip(),
+                "folder": self.sync_folder_edit.text().strip(),
+                "profil": self.sync_profil_combo.currentData() or "pelny"}
+
+    def load_sync_settings(self, data: dict) -> None:
+        self.sync_autor_edit.setText(str(data.get("autor", "")))
+        self.sync_folder_edit.setText(str(data.get("folder", "")))
+        idx = self.sync_profil_combo.findData(data.get("profil", "pelny"))
+        if idx >= 0:
+            self.sync_profil_combo.setCurrentIndex(idx)
 
     # --- pomocnicze -----------------------------------------------------------------
     def _key_row(self, parent_layout: QVBoxLayout, label: str,
