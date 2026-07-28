@@ -19,9 +19,8 @@ pudelko_*.pdf
 Style/*
 !Style/tla_przodu/
 # do repo idzie tylko AKTYWNE tło jokera, nie każda próba generacji
+# (aktywne są teraz tła „wlasne …" — próby AI zostają lokalnie)
 Style/tla_przodu/*/joker_* ai *.png
-!Style/tla_przodu/*/joker_czerwony ai 20260723_130123.png
-!Style/tla_przodu/*/joker_czarny ai 20260722_004335.png
 Style/tla_przodu/*/zrodla/joker_*
 
 # === Synchronizacja przez pendrive (app/core/sync.py) ===
