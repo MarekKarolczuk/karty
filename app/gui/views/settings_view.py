@@ -344,6 +344,7 @@ class SettingsView(QWidget):
         for etykieta, wartosc in (
             ("Pełna (wszystko)", "pelny"),
             ("Robocza (bez surowych PNG i historii pudełka)", "roboczy"),
+            ("Przypisane (użyte zdjęcia + gotowe karty + style)", "przypisane"),
             ("Lekka (same ustawienia i maski)", "lekki"),
         ):
             self.sync_profil_combo.addItem(etykieta, wartosc)
@@ -351,6 +352,9 @@ class SettingsView(QWidget):
             "Pełna = dokładna kopia stanu (kilka GB, wszystko działa).\n"
             "Robocza = bez output/_raw i historii pudełka — u odbiorcy nie "
             "zadziała „Przestempluj” ani selektywna poprawka przywiezionych kart.\n"
+            "Przypisane = tylko zdjęcia realnie użyte w talii (bez archiwum "
+            "odrzutów z folderu zdjęć) + gotowe karty + presety stylu; jak "
+            "Robocza, ale zwykle kilkakrotnie mniejsza.\n"
             "Lekka = same presety tekstowe i maski (kilkanaście MB).")
         self.sync_profil_combo.currentIndexChanged.connect(
             lambda _=0: self.sync_changed.emit())

@@ -15,6 +15,8 @@ sprawdza twarde niezmienniki, na których stoi cała funkcja:
   TEST 6 — BEZ SEKRETÓW: w paczce nie ma `.env` ani cache `assets/masks/`.
   TEST 7 — MÓJ STAN WYGRYWA: rozbieżne przypisanie zostaje odbiorcy i ląduje
     w konfliktach raportu.
+  TEST 8 — PROFIL „PRZYPISANE": paczka bierze zdjęcia realnie użyte w talii
+    (nie cały folder zdjęć), gotowe karty i presety — bez surowych PNG.
 
 Uruchomienie: python -m scripts.test_sync
 Kod wyjścia ≠ 0 przy dowolnym FAIL.
@@ -59,6 +61,7 @@ def zbuduj_marka(root: Path, zewnetrzne: Path) -> None:
     """Repo autora: 2 karty (jedna z wariantem), zdjęcie w projekcie, zdjęcie
     SPOZA projektu, preset tła z maską i polem tekstowym."""
     foto = _zapisz(root / "zdjecia" / "Patryk.jpg", b"FOTO-PATRYK-MAREK")
+    _zapisz(root / "zdjecia" / "Odrzut.jpg", b"FOTO-NIEPRZYPISANE")
     zew = _zapisz(zewnetrzne / "Kier_8.jpg", b"FOTO-SPOZA-PROJEKTU")
     _zapisz(root / "output" / "A_kier.jpg", b"KARTA-A-KIER-MAREK")
     _zapisz(root / "output" / "_raw" / "A_kier.png", b"RAW-A-KIER-MAREK")
@@ -130,6 +133,27 @@ def main() -> int:
         sprawdz("TEST 6c — zdjęcie spoza ROOT dołączone do paczki",
                 any(s.startswith("dane/_zewnetrzne/") for s in w_paczce),
                 f"{sorted(s for s in w_paczce if '_zewnetrzne' in s)}")
+
+        # TEST 8 — profil „przypisane": użyte zdjęcia + gotowe karty + style,
+        # bez archiwum odrzutów z folderu zdjęć i bez surowych PNG
+        paczka_p = sync.eksportuj(pendrive, "Marek", root=marek,
+                                  profil="przypisane")
+        w_przypisane = {p.relative_to(paczka_p).as_posix()
+                        for p in paczka_p.rglob("*") if p.is_file()}
+        sprawdz("TEST 8 — przypisane zdjęcie w paczce",
+                "dane/zdjecia/Patryk.jpg" in w_przypisane,
+                f"{sorted(s for s in w_przypisane if 'zdjecia' in s)}")
+        sprawdz("TEST 8b — nieużywane zdjęcie pominięte",
+                "dane/zdjecia/Odrzut.jpg" not in w_przypisane)
+        sprawdz("TEST 8c — gotowe karty i presety w paczce",
+                "dane/output/A_kier.jpg" in w_przypisane
+                and any(s.startswith("dane/Style/") for s in w_przypisane))
+        sprawdz("TEST 8d — bez surowych PNG (output/_raw)",
+                not any(s.startswith("dane/output/_raw/") for s in w_przypisane))
+        sprawdz("TEST 8e — zdjęcie spoza ROOT nadal dołączone",
+                any(s.startswith("dane/_zewnetrzne/") for s in w_przypisane))
+        sprawdz("TEST 8f — stan projektu w paczce",
+                "stan/projekt.json" in w_przypisane)
 
         przed = _migawka(kolega)
         raport = sync.importuj(paczka, root=kolega)

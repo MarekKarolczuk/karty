@@ -9,6 +9,7 @@ Uruchomienie:
     # u siebie — spakuj stan na pendrive (E:\\)
     python -m scripts.sync_paczka eksport E:\\ --autor Marek
     python -m scripts.sync_paczka eksport E:\\ --autor Marek --profil roboczy
+    python -m scripts.sync_paczka eksport E:\\ --autor Marek --profil przypisane
     python -m scripts.sync_paczka eksport E:\\ --autor Marek --od-ostatniej
 
     # u kolegi — najpierw PRÓBNIE, potem naprawdę

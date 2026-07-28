@@ -295,8 +295,10 @@ internetu i bez GitHuba. Paczka to zwykły folder.
 | **Twoje imię** | Trafia do nazw plików przy kolizjach (`… (od Marka).png`). |
 | **Zawartość: Pełna** | Dokładna kopia stanu — nawet kilka GB. |
 | **Zawartość: Robocza** | Bez surowych PNG i historii pudełka. U odbiorcy nie zadziała „Przestempluj" ani selektywna poprawka **przywiezionych** kart. |
+| **Zawartość: Przypisane** | Jak Robocza, ale z folderu zdjęć bierze **tylko zdjęcia realnie użyte w talii** (plus osoby pudełka), bez archiwum odrzutów i bez oryginałów teł z `zrodla/`. Zdjęcia przypisane spoza folderu projektu jadą jak zawsze. W tym projekcie: ~0,9 GB zamiast 2,2 GB (roboczy) i 6,5 GB (pełny). |
 | **Zawartość: Lekka** | Same presety tekstowe i maski — kilkanaście MB. |
-| **📤 Eksportuj paczkę / 🔍 Próbnie** | Próbnie = pokazuje, co weszłoby do paczki, nic nie zapisując. |
+| **📤 Eksportuj paczkę** | Buduje folder `AtelierKart_paczka_<autor>_<data>` we wskazanym miejscu. |
+| **🔍 Próbnie** | Próbny **import**: pokazuje, co weszłoby do Twojego projektu, nie zapisując ani jednego pliku. Rób to przed „Wczytaj paczkę". |
 | **📥 Wczytaj paczkę** | **Import niczego nie kasuje.** Kolidująca karta wchodzi jako nowy wariant `_vN`, przy rozbieżnych przypisaniach domyślnie wygrywa wersja lokalna, `projekt.json` jest scalany per klucz (a nie podmieniany), przed zapisem powstaje kopia w `kopie_zapasowe/`. |
 
 ### 5. ⇲ Eksport
@@ -376,6 +378,7 @@ python -m scripts.druk_krm karty\ --format poker --rewers Style\rewers\Domyślny
 
 # synchronizacja przez pendrive
 python -m scripts.sync_paczka eksport E:\paczka --autor Marek --profil roboczy --od-ostatniej
+python -m scripts.sync_paczka eksport E:\paczka --autor Marek --profil przypisane
 python -m scripts.sync_paczka import E:\AtelierKart_paczka_2026-07-28 --sucho
 
 # testy / narzędzia diagnostyczne (offline)

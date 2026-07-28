@@ -39,7 +39,7 @@ FORMAT_PACZKI = 1
 TOKEN_ROOT = "<ROOT>"
 TOKEN_ZEW = "<ZEW>"
 
-PROFILE = ("pelny", "roboczy", "lekki")
+PROFILE = ("pelny", "roboczy", "przypisane", "lekki")
 
 # Foldery danych wchodzące do paczki (profil pełny).
 _FOLDERY_DANYCH = ("zdjecia", "Przypisane", "output", "Style")
@@ -150,15 +150,51 @@ def _wykluczony(rel: str) -> bool:
     return Path(rel).name.lower() in _WYKLUCZONE_NAZWY
 
 
-def _dozwolony_w_profilu(rel: str, profil: str) -> bool:
+def _uzywane_zdjecia(root: Path) -> set[str]:
+    """Ścieżki (względne, POSIX) zdjęć REALNIE użytych w projekcie: przypisanych
+    do kart oraz z folderu osób pudełka. Profil `przypisane` pakuje tylko je,
+    zamiast całej `zdjecia/` (folder puchnie od odrzutów i duplikatów).
+    Zdjęcia spoza ROOT nie wchodzą tutaj — te i tak jadą osobno, jako
+    `dane/_zewnetrzne/` przy tokenizacji `projekt.json`."""
+    projekt = _wczytaj_json(root / "projekt.json")
+    kandydaci: list[str] = []
+    przypisania = projekt.get("assignments")
+    if isinstance(przypisania, dict):
+        kandydaci += [v for v in przypisania.values() if isinstance(v, str)]
+    box = projekt.get("box")
+    if isinstance(box, dict) and isinstance(box.get("osobne_folder"), str) \
+            and box["osobne_folder"]:
+        folder = Path(box["osobne_folder"])
+        if folder.is_dir():
+            kandydaci += [str(p) for p in folder.rglob("*") if p.is_file()]
+    uzywane: set[str] = set()
+    for sciezka in kandydaci:
+        try:
+            uzywane.add(Path(sciezka).resolve()
+                        .relative_to(root.resolve()).as_posix())
+        except (ValueError, OSError):
+            continue                       # spoza ROOT albo ścieżka nie istnieje
+    return uzywane
+
+
+def _dozwolony_w_profilu(rel: str, profil: str,
+                         uzywane: set[str] | None = None) -> bool:
     """Filtr rozmiaru paczki. `pelny` = wszystko; `roboczy` bez surowych wyjść
-    AI i historii pudełka (~2,5 GB zamiast ~9 GB); `lekki` = same presety
-    tekstowe i maski (kilkanaście MB, do szybkiej wymiany ustawień)."""
+    AI i historii pudełka (~2,5 GB zamiast ~9 GB); `przypisane` = tylko zdjęcia
+    użyte w talii + gotowe karty + presety (~1 GB — do przeniesienia projektu
+    bez archiwum odrzutów); `lekki` = same presety tekstowe i maski
+    (kilkanaście MB, do szybkiej wymiany ustawień)."""
     if profil == "pelny":
         return True
     ciezkie = rel.startswith("output/_raw/") or "/historia/" in f"/{rel}"
     if profil == "roboczy":
         return not ciezkie
+    if profil == "przypisane":
+        if ciezkie or "/zrodla/" in f"/{rel}":
+            return False                   # surowe PNG, historia pudełka, oryginały teł
+        if rel.startswith("zdjecia/") or rel.startswith("Przypisane/"):
+            return rel in (uzywane or set())
+        return True                        # gotowe karty + całe Style (tła, rewers, maski)
     # lekki
     if not rel.startswith("Style/"):
         return False
@@ -167,6 +203,7 @@ def _dozwolony_w_profilu(rel: str, profil: str) -> bool:
 
 def _pliki_danych(root: Path, profil: str) -> Iterator[tuple[Path, str]]:
     """(ścieżka absolutna, ścieżka względna POSIX) plików danych do paczki."""
+    uzywane = _uzywane_zdjecia(root) if profil == "przypisane" else None
     for folder in _FOLDERY_DANYCH:
         baza = root / folder
         if not baza.is_dir():
@@ -175,7 +212,7 @@ def _pliki_danych(root: Path, profil: str) -> Iterator[tuple[Path, str]]:
             if not p.is_file():
                 continue
             rel = p.relative_to(root).as_posix()
-            if _wykluczony(rel) or not _dozwolony_w_profilu(rel, profil):
+            if _wykluczony(rel) or not _dozwolony_w_profilu(rel, profil, uzywane):
                 continue
             yield p, rel
 
@@ -357,6 +394,12 @@ def eksportuj(cel: Path, autor: str, *, root: Path | None = None,
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     bezpieczny_autor = re.sub(r"[^\w\- ]", "", autor).strip() or "uzytkownik"
     paczka = Path(cel) / f"AtelierKart_paczka_{bezpieczny_autor}_{stamp}"
+    # Stempel ma dokładność minuty — druga paczka w tej samej minucie (np. inny
+    # profil) nie może dosypać się do poprzedniej i rozjechać jej manifestu.
+    nr = 2
+    while paczka.exists() and any(paczka.iterdir()):
+        paczka = Path(cel) / f"AtelierKart_paczka_{bezpieczny_autor}_{stamp}_{nr}"
+        nr += 1
     paczka.mkdir(parents=True, exist_ok=True)
 
     wyslane_path = _sync_dir(r) / f"wyslane_{bezpieczny_autor}.json"
