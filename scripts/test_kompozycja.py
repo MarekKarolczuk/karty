@@ -66,10 +66,28 @@ for suit in Suit:
             "kier: wcięcie serca niedomknięte w masce pop-out"
 
 # 2. Kompozycja próbnej karty (surowe zdjęcie zamiast ilustracji AI)
-photo = Path(sys.argv[1]) if len(sys.argv) > 1 else next(
-    p for p in sorted(config.ZDJECIA_DIR.iterdir())
-    if p.suffix.lower() in config.IMAGE_EXTS
-)
+
+
+def _zdjecie_probne() -> Path:
+    """Pierwsze zdjęcie z `zdjecia/`, a na świeżym klonie — zastępcze syntetyczne."""
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1])
+    if config.ZDJECIA_DIR.is_dir():
+        for p in sorted(config.ZDJECIA_DIR.iterdir()):
+            if p.suffix.lower() in config.IMAGE_EXTS:
+                return p
+    zastepcze = out_dir / "_zdjecie_probne.jpg"
+    img = Image.new("RGB", (900, 1200), (58, 74, 110))
+    d = ImageDraw.Draw(img)
+    d.ellipse((330, 250, 570, 520), fill=(232, 200, 170))       # „głowa"
+    d.rectangle((300, 540, 600, 1100), fill=(150, 52, 52))      # „tors"
+    img.save(zastepcze, quality=92)
+    print(f"[uwaga] brak zdjęć w {config.ZDJECIA_DIR} — używam zastępczego "
+          f"{zastepcze.name}")
+    return zastepcze
+
+
+photo = _zdjecie_probne()
 for suit in (Suit.KIER, Suit.PIK):
     spec = CardSpec(value="K", suit=suit, photo_path=photo)
     card = compositor.compose_card(spec, Image.open(photo).convert("RGB"))
@@ -109,13 +127,25 @@ for suit, oczekiwany in ((Suit.KIER, _hex_rgb(_styl.kolor_czerwony)),
         if punkt is not None:
             break
     assert punkt is not None, f"{suit.nazwa}: nie znaleziono sondy w oknie"
-    assert init.getpixel(punkt) == oczekiwany, \
-        f"{suit.nazwa}: okno kolażu bez deterministycznego wypełnienia {punkt}"
+    # (a) BAZA kolażu jest deterministyczna: okno wypełnione kolorem karty
+    baza = compositor.wypelnij_okno(tpl_img, suit)
+    assert baza.getpixel(punkt) == oczekiwany, \
+        f"{suit.nazwa}: okno bazy bez deterministycznego wypełnienia {punkt}"
+    # (b) w gotowym kolażu okno nie prześwituje kremem szablonu — przy zoomie < 1
+    #     wypełnienie przykrywa rozmyta sceneria ze zdjęcia (compositor: gałąź
+    #     „kadr mniejszy niż okno"), więc płaskiego koloru tam już nie ma
+    d_okno = ImageChops.difference(init.crop((punkt[0], punkt[1],
+                                              punkt[0] + 1, punkt[1] + 1)),
+                                   tpl_img.crop((punkt[0], punkt[1],
+                                                 punkt[0] + 1, punkt[1] + 1)))
+    assert d_okno.getbbox() is not None, \
+        f"{suit.nazwa}: okno kolażu zostało kremem szablonu {punkt}"
     for box in (tm.tl_box, tm.br_box):
         d_t = ImageChops.difference(init.crop(box), tpl_img.crop(box))
         assert d_t.getbbox() is None, \
             f"{suit.nazwa}: tarcza {box} w kolażu różni się od szablonu"
-    print(f"Kolaż {suit.nazwa}: wypełnienie okna {oczekiwany}, tarcze czyste")
+    print(f"Kolaż {suit.nazwa}: baza wypełniona {oczekiwany}, okno zamalowane, "
+          f"tarcze czyste")
 
 # 2c. (t1) wypełnij_okno: fill sięga KONTURU ramy (center_full) — erodowana
 # maska center zostawiała kremową szczelinę ~5 px („biały ślad" symbolu).

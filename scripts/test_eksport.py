@@ -22,6 +22,11 @@ from app import config
 from app.core import exporter
 from app.core.exporter import CELL, ExportJob
 
+try:                       # pypdf jest OPCJONALNY (nie ma go w requirements.txt) —
+    from pypdf import PdfReader   # bez niego pomijamy kontrole czytające gotowy PDF
+except ImportError:
+    PdfReader = None
+
 
 def _make_fake_card(path: Path, color: str) -> None:
     Image.new("RGB", (744, 1039), color).save(path, quality=90)
@@ -75,9 +80,8 @@ def main() -> int:
     job = ExportJob(kind="pdf", out_path=pdf_path, fronts=fronts, back=back,
                     columns=3, bleed=True, marks=True, backs=True)
     exporter.run_export(job)
-    from pypdf import PdfReader   # opcjonalny — jeśli brak, liczymy inaczej
     try:
-        pages = len(PdfReader(str(pdf_path)).pages)
+        pages = len(PdfReader(str(pdf_path)).pages) if PdfReader else -1
     except Exception:
         pages = -1
     expected_pages = -(-present // 9) * 2   # fronty + rewersy
@@ -231,6 +235,8 @@ def main() -> int:
     exporter.run_export(ExportJob(kind="krm", out_path=krm_path, fronts=fronts,
                                   back=back, extra={"podbicie": 3}))
     try:
+        if PdfReader is None:
+            raise RuntimeError("brak pypdf")
         czytnik = PdfReader(str(krm_path))
         krm_pages = len(czytnik.pages)
         zasoby = czytnik.pages[0]["/Resources"]["/XObject"]
@@ -245,10 +251,14 @@ def main() -> int:
     oczekiwana_strona = (round(69 / 25.4 * 72, 1), round(94 / 25.4 * 72, 1))
     ok = (krm_pages == present + 1 and przestrzen == "/DeviceCMYK"
           and rozmiar_px == (815, 1110) and strona_pt == oczekiwana_strona)
-    print(f"KRM PDF: {krm_pages} stron (oczekiwane {present + 1}), "
-          f"strona {strona_pt} pt (oczekiwane {oczekiwana_strona}), "
-          f"obraz {rozmiar_px} {przestrzen} -> {'OK' if ok else 'BLAD'}")
-    failures += 0 if ok else 1
+    if PdfReader is None:
+        print("KRM PDF: POMINIETO (brak pypdf — pip install pypdf), "
+              f"plik zapisany: {krm_path.stat().st_size // 1024} KB")
+    else:
+        print(f"KRM PDF: {krm_pages} stron (oczekiwane {present + 1}), "
+              f"strona {strona_pt} pt (oczekiwane {oczekiwana_strona}), "
+              f"obraz {rozmiar_px} {przestrzen} -> {'OK' if ok else 'BLAD'}")
+        failures += 0 if ok else 1
 
     # --- Druk KRM: round-trip obrazu Z PDF-a (pulapka odwroconego Adobe CMYK) ---------
     # Pillow zapisuje JPEG CMYK z markerem Adobe (wartosci odwrocone). Gdyby
@@ -263,6 +273,8 @@ def main() -> int:
                                   fronts=[("probka", probka_path)], back=None,
                                   extra={"podbicie": 3}))
     try:
+        if PdfReader is None:
+            raise RuntimeError("brak pypdf")
         zasoby = PdfReader(str(probka_pdf)).pages[0]["/Resources"]["/XObject"]
         surowy = Image.open(io.BytesIO(zasoby[next(iter(zasoby))].get_data()))
         tryb_pdf = surowy.mode
@@ -273,10 +285,13 @@ def main() -> int:
     except Exception as exc:                                      # noqa: BLE001
         tryb_pdf, lum_rog, lum_srodek = f"?({exc})", -1.0, -1.0
     ok = tryb_pdf == "CMYK" and lum_rog < 128 and lum_srodek > 128
-    print(f"KRM round-trip: obraz z PDF-a {tryb_pdf}, luminancja rogu "
-          f"{lum_rog:.0f} (oczekiwane <128), srodka {lum_srodek:.0f} "
-          f"(oczekiwane >128) -> {'OK' if ok else 'BLAD'}")
-    failures += 0 if ok else 1
+    if PdfReader is None:
+        print("KRM round-trip: POMINIETO (brak pypdf — pip install pypdf)")
+    else:
+        print(f"KRM round-trip: obraz z PDF-a {tryb_pdf}, luminancja rogu "
+              f"{lum_rog:.0f} (oczekiwane <128), srodka {lum_srodek:.0f} "
+              f"(oczekiwane >128) -> {'OK' if ok else 'BLAD'}")
+        failures += 0 if ok else 1
 
     # --- CMYK: czern idzie kanalem K (kontrola inwersji i generacji czerni) -----------
     jasny = rgb_na_cmyk(Image.new("RGB", (8, 8), "#F0EAD8"), sila=3)[0]

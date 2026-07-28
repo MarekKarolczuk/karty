@@ -82,8 +82,10 @@ def _odsetek_prostych(lines_mask: np.ndarray, bok: int) -> tuple[float, int]:
                            minLineLength=bok // 6, maxLineGap=bok // 40)
     if segs is None:
         return 1.0, 0
+    # OpenCV 4.x zwraca kształt (N, 1, 4), OpenCV 5.x (N, 4) — spłaszczamy oba
+    segs = np.asarray(segs).reshape(-1, 4)
     proste = 0
-    for x1, y1, x2, y2 in segs[:, 0]:
+    for x1, y1, x2, y2 in segs:
         kat = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1))) % 180.0
         odchyl = min(kat, abs(kat - 90.0), abs(kat - 180.0))
         if odchyl <= KAT_TOL_DEG:

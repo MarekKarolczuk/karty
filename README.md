@@ -382,11 +382,16 @@ python -m scripts.sync_paczka import E:\AtelierKart_paczka_2026-07-28 --sucho
 python -m scripts.test_kompozycja      # maski szablonów + kompozycja próbnej karty
 python -m scripts.test_klamp           # maska klampu na output/_raw/api/*.png + podglądy
 python -m scripts.test_symbol          # asercje: proste linie ramki + nietknięty symbol
-python -m scripts.test_eksport         # eksportery (wymaga: pip install pypdf)
+python -m scripts.test_eksport         # eksportery (pypdf opcjonalnie — bez niego 2 kontrole pominięte)
 python -m scripts.test_sync            # niezmienniki synchronizacji na mini-repo w TEMP
 ```
 
 Sanity check składni po zmianach w kodzie: `python -m compileall -q app scripts`.
+
+> **Znany stan:** `test_kompozycja` przechodzi maski, kolaż i narożniki, ale kończy
+> się FAIL-em na asercji „kandydat teksturowy nie uratował płaskiej plamy" — to
+> otwarte strojenie heurystyki klampu, **nie objaw zepsutego klonu**. `test_symbol`,
+> `test_eksport` i `test_sync` przechodzą w całości.
 
 ---
 
